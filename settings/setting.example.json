@@ -1,0 +1,29 @@
+{
+  "parent_ids": [
+    111111111111111111
+  ],
+  "allow_channel_ids": [
+    222222222222222222
+  ],
+  "gemini_model": "models/gemini-2.5-flash",
+  "assess_keyword": "査定し金額を変更します。",
+  "force_assess_test_keyword": "FORCE_ASSESS_TEST-REPLACE_ME",
+  "chat": {
+    "natural_chat_enabled": true,
+    "require_mention": false
+  },
+  "allowance_reminder": {
+    "enabled": true,
+    "channel_id": 222222222222222222,
+    "payday_day": 1,
+    "notify_offset": "-7day",
+    "notify_time": "20:00"
+  },
+  "wallet_audit": {
+    "enabled": true,
+    "channel_id": 222222222222222222,
+    "check_day": 1,
+    "check_time": "20:00",
+    "penalty_rate": 1.0
+  }
+}

@@ -73,8 +73,13 @@ GEMINI_API_KEY=xxxxxxxx
 
 3. 設定ファイル確認
 - `settings/setting.json`
-- `settings/system.json`
 - `settings/users/*.json`
+
+初回はテンプレートからコピーして作成:
+```bash
+cp settings/setting.example.json settings/setting.json
+cp settings/users/user.example.json settings/users/<your_user_key>.json
+```
 
 ## 起動
 
@@ -93,7 +98,7 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
 ### `settings/users/*.json`（例）
 ```json
 {
-  "name": "あきら",
+  "name": "たろう",
   "discord_user_id": 111111111111111111,
   "age": 12,
   "gender": "male",
@@ -108,6 +113,9 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
   }
 }
 ```
+
+テンプレート:
+- `settings/users/user.example.json`
 
 `gender` の推奨値:
 - `male`
@@ -127,10 +135,16 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
 - `wallet_audit`: 月次残高監査設定
   - `enabled`, `channel_id`, `check_day`, `check_time`, `penalty_rate`
 
+テンプレート:
+- `settings/setting.example.json`
+
 ### `settings/system.json`
 - `currency`
 - `log_dir`
 - `default_reply_format`
+
+テンプレート:
+- `settings/system.example.json`
 
 ## Discordでの使い方
 
@@ -143,7 +157,7 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
 
 ### 2. 親による代理投稿
 ```text
-@compass-bot りひとの代理 参考書を買いたい
+@compass-bot たろうの代理 参考書を買いたい
 ```
 
 ### 3. 使い方の説明
@@ -214,3 +228,4 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
 - `chat.require_mention=true` の場合はメンション必須です。
 - `allow_channel_ids` を設定している場合、対象チャンネル以外では反応しません。
 - Bot文面や査定ルールは `app/prompts.py` で調整できます。
+- 個人情報を含む実設定（`settings/*.json`, `settings/users/*.json`）は `.gitignore` で除外し、テンプレート（`*.example.json`）のみ共有する運用を推奨します。
