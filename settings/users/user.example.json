@@ -1,0 +1,25 @@
+{
+  "name": "たろう",
+  "discord_user_id": 333333333333333333,
+  "age": 12,
+  "gender": "unspecified",
+  "fixed_allowance": 500,
+  "temporary_max": 3000,
+  "fixed_increase_cap": 100,
+  "penalty_cap": 100,
+  "keywords": {
+    "investment": [
+      "検定",
+      "英語",
+      "参考書"
+    ],
+    "fun": [
+      "漫画",
+      "ゲーム"
+    ],
+    "danger": [
+      "高額ガチャ",
+      "課金"
+    ]
+  }
+}

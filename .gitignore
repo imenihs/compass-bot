@@ -1,6 +1,9 @@
 /app/__pycache__
 /.venv
 .env
-/settings/users/
-/data
+/settings/users/*.json
 /settings/setting.json
+/settings/system.json
+/data
+!/settings/*.example.json
+!/settings/users/*.example.json
