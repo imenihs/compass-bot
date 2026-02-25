@@ -1,0 +1,6 @@
+/app/__pycache__
+/.venv
+.env
+/settings/users/
+/data
+/settings/setting.json
