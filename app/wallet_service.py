@@ -28,6 +28,10 @@ class WalletService:
         with open(self.wallet_state_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
 
+    def has_wallet(self, user_name: str) -> bool:
+        state = self._load_wallet_state()
+        return user_name in state.get("users", {})
+
     def get_balance(self, user_name: str) -> int:
         state = self._load_wallet_state()
         users = state.get("users", {})

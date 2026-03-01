@@ -104,17 +104,27 @@ def get_allowance_reminder_setting() -> dict:
     if not re.match(r"^\d{2}:\d{2}$", notify_time):
         notify_time = "20:00"
 
-    notify_offset = str(rem.get("notify_offset", "-7day")).strip().lower()
-    m = re.match(r"^-(\d+)day$", notify_offset)
-    before_days = int(m.group(1)) if m else 7
+    # notify_offset は文字列（単一 or カンマ区切り）または配列を受け付ける
+    raw_offset = rem.get("notify_offset", "-7day")
+    if isinstance(raw_offset, list):
+        raw_offsets = raw_offset
+    else:
+        raw_offsets = [s.strip() for s in str(raw_offset).split(",") if s.strip()]
+
+    before_days_list = []
+    for o in raw_offsets:
+        mo = re.match(r"^-?(\d+)day$", o.lower())
+        if mo:
+            before_days_list.append(int(mo.group(1)))
+    if not before_days_list:
+        before_days_list = [7]
 
     return {
         "enabled": enabled,
         "channel_id": channel_id,
         "payday_day": payday_day,
         "notify_time": notify_time,
-        "notify_offset": notify_offset,
-        "before_days": before_days,
+        "before_days_list": before_days_list,
     }
 
 def get_wallet_audit_setting() -> dict:
@@ -185,6 +195,62 @@ def get_force_assess_test_keyword() -> str:
     """
     setting = load_setting()
     return str(setting.get("force_assess_test_keyword", "")).strip() if isinstance(setting, dict) else ""
+
+def get_monthly_summary_setting() -> dict:
+    """
+    月次サマリーレポートの設定を返す。
+    setting.json の "monthly_summary": {"enabled": true, "channel_id": ..., "send_time": "09:00"}
+    """
+    setting = load_setting()
+    ms = setting.get("monthly_summary", {}) if isinstance(setting, dict) else {}
+    if not isinstance(ms, dict):
+        ms = {}
+
+    enabled = bool(ms.get("enabled", False))
+    channel_id = ms.get("channel_id")
+    if channel_id in ("", None):
+        channel_id = None
+    elif channel_id is not None:
+        channel_id = int(channel_id)
+
+    send_time = str(ms.get("send_time", "09:00")).strip()
+    if not re.match(r"^\d{2}:\d{2}$", send_time):
+        send_time = "09:00"
+
+    return {
+        "enabled": enabled,
+        "channel_id": channel_id,
+        "send_time": send_time,
+    }
+
+
+def get_low_balance_alert_setting() -> dict:
+    """
+    低残高アラート設定を返す。
+    setting.json の "low_balance_alert": {"enabled": true, "threshold": 500, "channel_id": ...}
+    """
+    setting = load_setting()
+    alert = setting.get("low_balance_alert", {}) if isinstance(setting, dict) else {}
+    if not isinstance(alert, dict):
+        alert = {}
+
+    enabled = bool(alert.get("enabled", False))
+    channel_id = alert.get("channel_id")
+    if channel_id in ("", None):
+        channel_id = None
+    elif channel_id is not None:
+        channel_id = int(channel_id)
+
+    threshold = int(alert.get("threshold", 500))
+    if threshold < 0:
+        threshold = 0
+
+    return {
+        "enabled": enabled,
+        "channel_id": channel_id,
+        "threshold": threshold,
+    }
+
 
 def get_log_dir(system_conf: dict) -> Path:
     rel = system_conf.get("log_dir", "data/logs")
