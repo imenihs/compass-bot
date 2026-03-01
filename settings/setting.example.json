@@ -16,7 +16,7 @@
     "enabled": true,
     "channel_id": 222222222222222222,
     "payday_day": 1,
-    "notify_offset": "-7day",
+    "notify_offset": "-7day,-3day,-1day",
     "notify_time": "20:00"
   },
   "wallet_audit": {
@@ -25,5 +25,15 @@
     "check_day": 1,
     "check_time": "20:00",
     "penalty_rate": 1.0
+  },
+  "low_balance_alert": {
+    "enabled": false,
+    "threshold": 500,
+    "channel_id": null
+  },
+  "monthly_summary": {
+    "enabled": false,
+    "channel_id": null,
+    "send_time": "09:00"
   }
 }

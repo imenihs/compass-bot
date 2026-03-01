@@ -26,7 +26,7 @@
 
 4. 定期運用
 - 毎月支給前に固定お小遣いリマインド
-- 毎月指定時刻に残高報告依頼
+- 毎月指定時刻に `allow_channel_ids` の各チャンネルへ残高報告依頼（ウォレット未設定のユーザーには初期設定案内を送信）
 
 ## ディレクトリ構成
 
@@ -131,9 +131,11 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
 - `chat`: 会話モード
   - `natural_chat_enabled`, `require_mention`
 - `allowance_reminder`: 支給前リマインド設定
-  - `enabled`, `channel_id`, `payday_day`, `notify_offset`（例: `-7day`）, `notify_time`（`HH:MM`）
+  - `enabled`, `channel_id`, `payday_day`, `notify_time`（`HH:MM`）
+  - `notify_offset`: カンマ区切り文字列または配列で複数日指定可（例: `"-7day,-1day,0day"` または `["-7day", "-1day", "0day"]`）。`0day` は支給日当日を意味する
 - `wallet_audit`: 月次残高監査設定
-  - `enabled`, `channel_id`, `check_day`, `check_time`, `penalty_rate`
+  - `enabled`, `check_day`, `check_time`, `penalty_rate`
+  - 送信先は `allow_channel_ids` を使用（`channel_id` は不要）
 
 テンプレート:
 - `settings/setting.example.json`
@@ -205,7 +207,18 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
 使い方の説明と初期設定
 ```
 
-### 9. リマインダーテスト（親のみ）
+### 9. 残高チェック案内の即時送信（親のみ）
+`allow_channel_ids` の各チャンネルに今月の残高チェック案内を即時送信する。ウォレット未設定のユーザーには初期設定案内を送信:
+```text
+@compass-bot 残高チェック送信
+```
+
+または:
+```text
+@compass-bot 月頭案内送信
+```
+
+### 10. リマインダーテスト（親のみ）
 ```text
 @compass-bot reminder test
 ```
