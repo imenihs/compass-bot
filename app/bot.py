@@ -7,6 +7,7 @@ from datetime import datetime
 
 from app.bot_utils import (
     _build_goal_achieved_message,
+    _child_review_message,
     _contains_any_keyword,
     _contains_force_assess_keyword,
     _extract_keyword_hits,
@@ -381,6 +382,45 @@ async def maybe_handle_savings_goal(
         return True
 
     return False
+
+
+async def maybe_handle_child_review(
+    message: discord.Message,
+    user_conf: dict,
+    system_conf: dict,
+    input_block: str,
+) -> bool:
+    """子供向け今月の振り返りコマンドを処理する（Feature 6）。
+    「振り返り」「今月の振り返り」などで起動し、当月の支出記録サマリーを返す。"""
+    # 対応キーワードを列挙する（ひらがな表記も受け付ける）
+    review_keywords = ["振り返り", "ふりかえり", "今月の振り返り", "こんげつのふりかえり"]
+    if not _contains_any_keyword(input_block, review_keywords):
+        return False
+
+    user_name = str(user_conf.get("name", ""))
+    if not user_name:
+        return False
+
+    now = datetime.now(JST)
+    log_dir = get_log_dir(system_conf)
+    # 当月の pocket_journal を読み込んでフィルタリングする
+    journal_path = log_dir / f"{user_name}_pocket_journal.jsonl"
+    all_rows = _load_jsonl(journal_path)
+    month_rows = [
+        r for r in all_rows
+        if _is_same_month(r.get("ts"), now.year, now.month)
+    ]
+    # ウォレット残高を取得して振り返りメッセージに添える
+    balance = wallet_service.get_balance(user_name)
+    msg = _child_review_message(
+        user_conf=user_conf,
+        month_rows=month_rows,
+        balance=balance,
+        year=now.year,
+        month=now.month,
+    )
+    await message.channel.send(msg)
+    return True
 
 
 async def maybe_handle_parent_dashboard(message: discord.Message, content: str) -> bool:
@@ -843,6 +883,14 @@ async def on_message(message: discord.Message):
     if await maybe_handle_savings_goal(
         message=message,
         user_conf=user_conf,
+        input_block=input_block,
+    ):
+        return
+
+    if await maybe_handle_child_review(
+        message=message,
+        user_conf=user_conf,
+        system_conf=system_conf,
         input_block=input_block,
     ):
         return
