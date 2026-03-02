@@ -252,6 +252,34 @@ def get_low_balance_alert_setting() -> dict:
     }
 
 
+def get_pocket_journal_reminder_setting() -> dict:
+    """
+    週次支出記録リマインドの設定を返す。
+    setting.json の "pocket_journal_reminder" セクションを読み込む。
+    day_of_week は Python の weekday() 準拠（0=月曜〜6=日曜）。
+    """
+    setting = load_setting()
+    pjr = setting.get("pocket_journal_reminder", {}) if isinstance(setting, dict) else {}
+    if not isinstance(pjr, dict):
+        pjr = {}
+
+    enabled = bool(pjr.get("enabled", False))
+
+    # 0〜6 の範囲にクランプする
+    day_of_week = int(pjr.get("day_of_week", 0))
+    day_of_week = max(0, min(6, day_of_week))
+
+    notify_time = str(pjr.get("notify_time", "19:00")).strip()
+    if not re.match(r"^\d{2}:\d{2}$", notify_time):
+        notify_time = "19:00"
+
+    return {
+        "enabled": enabled,
+        "day_of_week": day_of_week,
+        "notify_time": notify_time,
+    }
+
+
 def get_log_dir(system_conf: dict) -> Path:
     rel = system_conf.get("log_dir", "data/logs")
     return ROOT / rel
