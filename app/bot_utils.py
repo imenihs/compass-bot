@@ -356,6 +356,73 @@ def _spending_analysis_for_user(log_dir: Path, user_name: str, now_dt: datetime)
     return "\n".join(lines)
 
 
+def _child_review_message(
+    user_conf: dict,
+    month_rows: list[dict],
+    balance: int,
+    year: int,
+    month: int,
+) -> str:
+    """子供向けの今月の支出振り返りメッセージを年齢に応じて生成する。
+    pocket_journal の当月レコードと現在残高を受け取り、まとめ文字列を返す。"""
+    name = user_conf.get("name", "")
+    raw_age = user_conf.get("age")
+    # 年齢を int に正規化する（文字列数字も変換する）
+    if isinstance(raw_age, int):
+        age = raw_age
+    elif isinstance(raw_age, str) and raw_age.strip().isdigit():
+        age = int(raw_age.strip())
+    else:
+        age = None
+
+    count = len(month_rows)
+    # 記録ゼロ月は記録を促すメッセージを返す
+    if count == 0:
+        if age is not None and age <= 9:
+            return (
+                f"{name}さん、{month}月のきろくはまだないよ！\n"
+                "なにかかったら「支出記録」でおしえてね。"
+            )
+        return (
+            f"{name}さん、{month}月の支出記録はまだないよ！\n"
+            "買ったものがあれば「支出記録」で記録してみてね。"
+        )
+
+    # 満足度の平均を算出する（0〜10 の整数が入っている前提）
+    avg_sat = sum(int(r.get("satisfaction", 0)) for r in month_rows) / count
+    # 品目の出現頻度を集計して Top3 を取得する
+    item_counts = Counter(str(r.get("item", "")).strip() for r in month_rows if r.get("item"))
+    top3 = [item for item, _ in item_counts.most_common(3)]
+    top3_str = "・".join(top3) if top3 else "なし"
+
+    if age is not None and age <= 9:
+        # 低学年向け — ひらがな多め、シンプルな構成にする
+        return (
+            f"【{name}さんの{month}月のきろく】\n"
+            f"かいたもの: {count}回\n"
+            f"まんぞくど: {avg_sat:.1f}/10\n"
+            f"かったもの: {top3_str}\n"
+            f"いまのざんだか: {balance:,}円"
+        )
+    if age is not None and age <= 12:
+        # 小学高学年向け — 数字と品目をわかりやすく並べる
+        return (
+            f"【{name}さんの{month}月の振り返り】\n"
+            f"支出件数: {count}件\n"
+            f"満足度平均: {avg_sat:.1f}/10\n"
+            f"使ったもの: {top3_str}\n"
+            f"現在残高: {balance:,}円"
+        )
+    # 中学生以上 — 端的にまとめる
+    return (
+        f"【{name}さんの{month}月の支出まとめ】\n"
+        f"件数: {count}件\n"
+        f"満足度平均: {avg_sat:.1f}/10\n"
+        f"主な支出: {top3_str}\n"
+        f"現在残高: {balance:,}円"
+    )
+
+
 def _build_goal_achieved_message(user_conf: dict, goal: dict) -> str:
     """目標達成時の祝福メッセージを年齢に応じて生成する。
     低学年ほどひらがな・感嘆符を多用し、達成感が伝わる文体にする。"""
