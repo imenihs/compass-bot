@@ -93,6 +93,31 @@ class WalletService:
         with open(self.wallet_audit_state_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
 
+    def get_savings_goal(self, user_name: str) -> dict | None:
+        """貯金目標を取得する。未設定なら None を返す。"""
+        state = self._load_wallet_state()
+        u = state.get("users", {}).get(user_name, {})
+        goal = u.get("savings_goal")
+        if not isinstance(goal, dict):
+            return None
+        return goal
+
+    def set_savings_goal(self, user_name: str, title: str, target_amount: int) -> None:
+        """貯金目標を設定する。"""
+        state = self._load_wallet_state()
+        users = state.setdefault("users", {})
+        u = users.setdefault(user_name, {})
+        u["savings_goal"] = {"title": title, "target_amount": int(target_amount)}
+        self._save_wallet_state(state)
+
+    def clear_savings_goal(self, user_name: str) -> None:
+        """貯金目標を削除する。"""
+        state = self._load_wallet_state()
+        users = state.get("users", {})
+        if user_name in users:
+            users[user_name].pop("savings_goal", None)
+            self._save_wallet_state(state)
+
     def apply_penalty(self, user_conf: dict, system_conf: dict, diff: int, wallet_audit_conf: dict) -> int:
         penalty = int(abs(diff) * float(wallet_audit_conf.get("penalty_rate", 1.0)))
         cap = user_conf.get("penalty_cap")
