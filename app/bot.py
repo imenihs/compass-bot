@@ -5,6 +5,26 @@ import re
 import discord
 from datetime import datetime
 
+from app.bot_utils import (
+    _contains_any_keyword,
+    _contains_force_assess_keyword,
+    _extract_keyword_hits,
+    _is_same_month,
+    _latest_assessed_amount,
+    _load_jsonl,
+    _monthly_increase_stats,
+    _normalize_assessed_amounts,
+    _normalize_japanese_command,
+    _normalize_keyword,
+    _parse_fixed_delta_request,
+    _parse_yen_amount,
+    _progress_bar,
+    _recent_conversation_history,
+    _rough_word_count,
+    _self_compare_message,
+    _spending_analysis_for_user,
+    _usage_guide_text,
+)
 from app.config import (
     find_user_by_discord_id,
     find_user_by_name,
@@ -89,231 +109,8 @@ reminder_service = ReminderService(
 
 
 def is_parent(user_id: int) -> bool:
+    """ユーザーIDが親（管理者）かどうかを判定する"""
     return user_id in PARENT_IDS
-
-def _usage_guide_text() -> str:
-    return (
-        "【Compass つかいかた】\n"
-        "・お小遣い金額相談: `@compass-bot 相談内容`\n"
-        "・支出の記録: `支出記録` と送ると入力案内が出る\n"
-        "・現在のお小遣いの金額確認: `残高確認` で確認できる\n\n"
-        "【初期設定】\n"
-        "1. `初期設定` と送る\n"
-        "2. 続けて現在の所持金を `1234円` の形で送る\n"
-        "3. ウォレットに現在所持金を反映する"
-    )
-
-def _rough_word_count(text: str) -> int:
-    tokens = [t for t in re.split(r"[\s、。,.!?！？]+", (text or "").strip()) if t]
-    return len(tokens)
-
-def _load_jsonl(path) -> list[dict]:
-    if not path.exists():
-        return []
-    rows: list[dict] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict):
-                    rows.append(obj)
-            except json.JSONDecodeError:
-                continue
-    return rows
-
-def _self_compare_message(log_dir, user_name: str, current_score: int) -> str:
-    path = log_dir / f"{user_name}_pocket_journal.jsonl"
-    rows = _load_jsonl(path)
-    if len(rows) <= 1:
-        return "初回記録だよ。これから過去の自分との比較を作っていこう。"
-    prev = [int(r.get("satisfaction", 0)) for r in rows[:-1] if isinstance(r.get("satisfaction"), int)]
-    if not prev:
-        return "比較データがまだ少ないので、記録を続けてみよう。"
-    avg = sum(prev) / len(prev)
-    diff = current_score - avg
-    sign = "+" if diff >= 0 else ""
-    return f"過去の自分平均は {avg:.1f}/10、今回は {current_score}/10（差分 {sign}{diff:.1f}）。"
-
-def _recent_conversation_history(log_dir, user_name: str, limit: int = 6) -> list[dict]:
-    path = log_dir / f"{user_name}_events.jsonl"
-    rows = _load_jsonl(path)
-    picked: list[dict] = []
-    for r in rows[-limit:]:
-        picked.append(
-            {
-                "ts": r.get("ts"),
-                "user": r.get("input"),
-                "assistant": r.get("reply"),
-            }
-        )
-    return picked
-
-def _monthly_increase_stats(log_dir, user_name: str, base_dt: datetime) -> dict:
-    path = log_dir / f"{user_name}_allowance_amounts.jsonl"
-    rows = _load_jsonl(path)
-    monthly_rows: list[dict] = []
-    all_rows: list[dict] = []
-    last_total: int | None = None
-    last_fixed: int | None = None
-
-    for r in rows:
-        ts = r.get("ts")
-        try:
-            dt = datetime.fromisoformat(str(ts))
-        except Exception:
-            continue
-        total = r.get("total")
-        fixed = r.get("fixed")
-        if not isinstance(total, int) or not isinstance(fixed, int):
-            continue
-        all_rows.append({"ts": dt, "total": total, "fixed": fixed})
-        if dt.year == base_dt.year and dt.month == base_dt.month:
-            monthly_rows.append({"ts": dt, "total": total, "fixed": fixed})
-        last_total = total
-        last_fixed = fixed
-
-    monthly_rows.sort(key=lambda x: x["ts"])
-    total_increase_count = 0
-    fixed_increase_count = 0
-    prev_total: int | None = None
-    prev_fixed: int | None = None
-    for r in monthly_rows:
-        if prev_total is not None and r["total"] > prev_total:
-            total_increase_count += 1
-        if prev_fixed is not None and r["fixed"] > prev_fixed:
-            fixed_increase_count += 1
-        prev_total = r["total"]
-        prev_fixed = r["fixed"]
-
-    all_rows.sort(key=lambda x: x["ts"])
-    fixed_increase_count_this_year = 0
-    last_fixed_increase_ts: datetime | None = None
-    prev_fixed_all: int | None = None
-    for r in all_rows:
-        if prev_fixed_all is not None and r["fixed"] > prev_fixed_all:
-            if r["ts"].year == base_dt.year:
-                fixed_increase_count_this_year += 1
-            last_fixed_increase_ts = r["ts"]
-        prev_fixed_all = r["fixed"]
-
-    months_since_last_fixed_increase: int | None = None
-    if last_fixed_increase_ts is not None:
-        months_since_last_fixed_increase = (
-            (base_dt.year - last_fixed_increase_ts.year) * 12
-            + (base_dt.month - last_fixed_increase_ts.month)
-        )
-
-    return {
-        "total_increase_count": total_increase_count,
-        "last_total": last_total,
-        "last_fixed": last_fixed,
-        "fixed_increase_count_month": fixed_increase_count,
-        "fixed_increase_count_this_year": fixed_increase_count_this_year,
-        "months_since_last_fixed_increase": months_since_last_fixed_increase,
-    }
-
-def _latest_assessed_amount(log_dir, user_name: str) -> dict:
-    path = log_dir / f"{user_name}_allowance_amounts.jsonl"
-    rows = _load_jsonl(path)
-    for r in reversed(rows):
-        fixed = r.get("fixed")
-        temporary = r.get("temporary")
-        total = r.get("total")
-        if isinstance(fixed, int) and isinstance(temporary, int) and isinstance(total, int):
-            return {"fixed": fixed, "temporary": temporary, "total": total}
-    return {}
-
-def _normalize_assessed_amounts(user_conf: dict, assessed: dict | None, previous_assessed: dict | None) -> dict | None:
-    if assessed is None:
-        return None
-
-    prev = previous_assessed or {}
-    fixed = assessed.get("fixed")
-    temporary = assessed.get("temporary")
-    total = assessed.get("total")
-
-    if not isinstance(fixed, int):
-        prev_fixed = prev.get("fixed")
-        if isinstance(prev_fixed, int):
-            fixed = prev_fixed
-        else:
-            fixed = int(user_conf.get("fixed_allowance", 0))
-
-    if not isinstance(temporary, int):
-        prev_tmp = prev.get("temporary")
-        if isinstance(prev_tmp, int):
-            temporary = prev_tmp
-        else:
-            temporary = 0
-
-    if not isinstance(total, int):
-        total = int(fixed) + int(temporary)
-
-    return {"fixed": int(fixed), "temporary": int(temporary), "total": int(total)}
-
-def _extract_keyword_hits(user_conf: dict, input_text: str) -> dict:
-    text = (input_text or "").lower()
-    kw = user_conf.get("keywords", {}) if isinstance(user_conf, dict) else {}
-    if not isinstance(kw, dict):
-        kw = {}
-
-    def _hits(bucket: str) -> list[str]:
-        items = kw.get(bucket, [])
-        if not isinstance(items, list):
-            return []
-        matched: list[str] = []
-        for x in items:
-            token = str(x).strip()
-            if token and token.lower() in text:
-                matched.append(token)
-        return matched
-
-    return {
-        "investment": _hits("investment"),
-        "fun": _hits("fun"),
-        "danger": _hits("danger"),
-    }
-
-def _normalize_keyword(text: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
-
-def _contains_force_assess_keyword(input_text: str, keyword: str) -> bool:
-    if not keyword:
-        return False
-    return _normalize_keyword(keyword) in _normalize_keyword(input_text)
-
-def _parse_fixed_delta_request(input_text: str) -> int | None:
-    text = (input_text or "").strip()
-    m = re.search(r"固定(?:を|は)?\s*([+-]\d+)\s*円", text)
-    if m:
-        return int(m.group(1))
-    m2 = re.search(r"([+-]\d+)\s*円", text)
-    if m2:
-        return int(m2.group(1))
-    return None
-
-def _contains_any_keyword(text: str, keywords: list[str]) -> bool:
-    body = (text or "").strip().lower()
-    return any(k.lower() in body for k in keywords if k)
-
-def _normalize_japanese_command(text: str) -> str:
-    body = (text or "").strip().lower()
-    body = re.sub(r"\s+", "", body)
-    body = re.sub(r"[、。,.!！?？:：`'\"「」『』\(\)\[\]【】]", "", body)
-    return body
-
-def _parse_yen_amount(text: str) -> int | None:
-    body = (text or "").strip()
-    m = re.search(r"(\d[\d,]*)\s*円?", body)
-    if not m:
-        return None
-    try:
-        return int(m.group(1).replace(",", ""))
-    except ValueError:
-        return None
 
 def _is_initial_setup_pending(user_name: str) -> bool:
     state = wallet_service.load_audit_state()
@@ -507,17 +304,6 @@ async def maybe_handle_spending_record_flow(
     )
     return True
 
-def _progress_bar(current: int, target: int, width: int = 10) -> str:
-    """ASCII プログレスバーを返す。例: [████░░░░░░] 50%"""
-    if target <= 0:
-        return "[----------] 0%"
-    ratio = min(current / target, 1.0)
-    filled = int(ratio * width)
-    bar = "█" * filled + "░" * (width - filled)
-    pct = int(ratio * 100)
-    return f"[{bar}] {pct}%"
-
-
 async def maybe_handle_savings_goal(
     message: discord.Message,
     user_conf: dict,
@@ -626,57 +412,6 @@ async def maybe_handle_parent_dashboard(message: discord.Message, content: str) 
 
     await message.channel.send("\n".join(lines))
     return True
-
-
-def _spending_analysis_for_user(log_dir, user_name: str, now_dt: datetime) -> str:
-    """過去3ヶ月の支出傾向を文字列で返す"""
-    from collections import Counter
-    path = log_dir / f"{user_name}_pocket_journal.jsonl"
-    rows = _load_jsonl(path)
-
-    # 過去3ヶ月の範囲を計算する
-    months = []
-    y, m = now_dt.year, now_dt.month
-    for _ in range(3):
-        months.append((y, m))
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
-    months.reverse()
-
-    monthly_stats: list[str] = []
-    all_items: list[str] = []
-    for (yr, mo) in months:
-        month_rows = [
-            r for r in rows
-            if _is_same_month(r.get("ts"), yr, mo)
-        ]
-        count = len(month_rows)
-        avg_sat = (
-            sum(int(r.get("satisfaction", 0)) for r in month_rows) / count
-            if count > 0 else 0
-        )
-        monthly_stats.append(f"{mo}月: {count}件 / 満足度{avg_sat:.1f}")
-        all_items.extend(str(r.get("item", "")).strip() for r in month_rows if r.get("item"))
-
-    top5 = [item for item, _ in Counter(all_items).most_common(5)]
-    top5_str = "・".join(top5) if top5 else "なし"
-
-    lines = [f"【{user_name}の支出傾向（過去3ヶ月）】"]
-    lines.extend(f"  {s}" for s in monthly_stats)
-    lines.append(f"  よく使う品目: {top5_str}")
-    return "\n".join(lines)
-
-
-def _is_same_month(ts_str, year: int, month: int) -> bool:
-    if not ts_str:
-        return False
-    try:
-        dt = datetime.fromisoformat(str(ts_str))
-        return dt.year == year and dt.month == month
-    except Exception:
-        return False
 
 
 async def maybe_handle_spending_analysis(message: discord.Message, content: str) -> bool:
