@@ -21,7 +21,6 @@
   },
   "wallet_audit": {
     "enabled": true,
-    "channel_id": 222222222222222222,
     "check_day": 1,
     "check_time": "20:00",
     "penalty_rate": 1.0

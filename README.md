@@ -159,7 +159,7 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
   - `notify_offset`: カンマ区切り文字列または配列で複数日指定可（例: `"-7day,-1day,0day"` または `["-7day", "-1day", "0day"]`）。`0day` は支給日当日を意味する
 - `wallet_audit`: 月次残高監査設定
   - `enabled`, `check_day`, `check_time`, `penalty_rate`
-  - 送信先は `allow_channel_ids` を使用（`channel_id` は不要）
+  - 送信先は `allow_channel_ids` を使用（`channel_id` 設定は不要・無視される）
 - `low_balance_alert`: 低残高アラート設定
   - `enabled`: true で有効化
   - `threshold`: 残高がこの値を下回ったときに通知（円）
