@@ -634,7 +634,7 @@ def _spending_analysis_for_user(log_dir, user_name: str, now_dt: datetime) -> st
     path = log_dir / f"{user_name}_pocket_journal.jsonl"
     rows = _load_jsonl(path)
 
-    # 過去3ヶ月の範囲を計算
+    # 過去3ヶ月の範囲を計算する
     months = []
     y, m = now_dt.year, now_dt.month
     for _ in range(3):
