@@ -51,17 +51,20 @@
 
 ## ディレクトリ構成
 
-- `app/bot.py`: Discordイベントのエントリポイント
-- `app/gemini_service.py`: Gemini呼び出し・査定抽出
-- `app/message_parser.py`: メッセージ解析
-- `app/reminder_service.py`: 月次リマインド/監査ループ
-- `app/wallet_service.py`: 残高・台帳・監査状態
-- `app/prompts.py`: Geminiプロンプト
-- `app/config.py`: 設定読み込み
-- `settings/system.json`: 共通設定
-- `settings/setting.json`: 実運用設定
-- `settings/users/*.json`: ユーザー設定
-- `data/logs/*.jsonl`: 監査/台帳/イベントログ
+- `app/bot.py`: Discordイベント（on_message/on_ready）・コマンドハンドラ
+- `app/bot_utils.py`: グローバル状態不使用の純粋ユーティリティ関数群（bot.py から分離）
+- `app/gemini_service.py`: Gemini API 呼び出し・査定抽出（call_silent / call_with_progress）
+- `app/message_parser.py`: メッセージ解析（メンション除去・入力パース）
+- `app/reminder_service.py`: 月次リマインド・残高監査・月次サマリーの定期処理ループ
+- `app/wallet_service.py`: 残高管理・台帳・監査状態・目標貯金（wallet_state.json）
+- `app/prompts.py`: Gemini へ渡すプロンプトのビルド関数
+- `app/config.py`: 設定ファイル読み込み（users / setting / system）
+- `app/storage.py`: JSONL 追記・JST タイムスタンプなど共通I/Oユーティリティ
+- `app/server.py`: ヘルスチェック用 FastAPI サーバー
+- `settings/system.json`: 共通設定（currency / log_dir 等）
+- `settings/setting.json`: 実運用設定（親ID / チャンネル / 各機能設定）
+- `settings/users/*.json`: ユーザー個別設定（名前・年齢・固定お小遣い・キーワード等）
+- `data/logs/*.jsonl`: 監査/台帳/イベント/お小遣い帳ログ
 
 ## 必要環境
 
