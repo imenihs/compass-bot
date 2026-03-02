@@ -315,71 +315,100 @@ async def maybe_handle_savings_goal(
     user_conf: dict,
     input_block: str,
 ) -> bool:
-    """貯金目標の設定・確認・削除コマンドを処理する（Feature 5）"""
+    """貯金目標の追加・確認・削除コマンドを処理する（Feature 5 複数目標対応版）"""
     user_name = str(user_conf.get("name", ""))
     # ユーザー名が取得できない場合は処理不可のためスキップする
     if not user_name:
         return False
 
-    # コマンド種別を判定する（3パターン: 設定・確認・削除）
-    # 「貯金目標 タイトル 金額円」パターン — タイトルと金額を正規表現で取得する
+    # 「貯金目標 タイトル 金額円」パターン — 追加または同名タイトルの金額更新
     set_match = re.match(r"^貯金目標\s+(.+?)\s+(\d[\d,]*)\s*円?$", input_block.strip())
-    # 「目標確認」パターン — ひらがな表記にも対応する
-    check_keywords = ["目標確認", "もくひょうかくにん"]
-    is_check = _contains_any_keyword(input_block, check_keywords)
-    # 「目標削除」パターン — 設定済み目標をリセットする操作
-    clear_keywords = ["目標削除", "もくひょうさくじょ"]
-    is_clear = _contains_any_keyword(input_block, clear_keywords)
+    # 「目標確認」パターン — 全目標をリスト表示する
+    is_check = _contains_any_keyword(input_block, ["目標確認", "もくひょうかくにん"])
+    # 「目標全削除」パターン — 全目標を一括削除する
+    is_clear_all = _contains_any_keyword(input_block, ["目標全削除", "もくひょうぜんさくじょ"])
+    # 「目標削除 タイトル」パターン — タイトル指定で1件削除する
+    clear_title_match = re.match(r"^目標削除\s+(.+)$", input_block.strip())
+    # 「目標削除」のみ（引数なし）— どれを削除するか案内する
+    is_clear_bare = bool(re.match(r"^目標削除\s*$", input_block.strip()))
 
-    # いずれのパターンにも該当しない場合は次のハンドラへ委譲する
-    if not set_match and not is_check and not is_clear:
+    # いずれにも該当しなければ次のハンドラへ委譲する
+    if not set_match and not is_check and not is_clear_all and not clear_title_match and not is_clear_bare:
         return False
 
-    # 目標設定: wallet_state.json に保存してプログレスバーを表示する
+    current = wallet_service.get_balance(user_name)
+
+    # 目標追加・更新: add_savings_goal は同名なら金額更新、新規なら追加する
     if set_match:
         title = set_match.group(1).strip()
         target_amount = int(set_match.group(2).replace(",", ""))
-        wallet_service.set_savings_goal(user_name, title, target_amount)
-        # 設定直後の現在残高で進捗を計算して表示する
-        current = wallet_service.get_balance(user_name)
+        success, result = wallet_service.add_savings_goal(user_name, title, target_amount)
+        # 上限超過の場合は result にエラーメッセージが入っている
+        if not success:
+            await message.channel.send(result)
+            return True
         bar = _progress_bar(current, target_amount)
+        action_word = "更新" if result == "updated" else "追加"
         await message.channel.send(
-            f"貯金目標を設定したよ。\n"
-            f"・目標: {title} {target_amount}円\n"
-            f"・現在残高: {current}円\n"
+            f"貯金目標を{action_word}したよ。\n"
+            f"・目標: {title} {target_amount:,}円\n"
+            f"・現在残高: {current:,}円\n"
             f"・進捗: {bar}"
         )
         return True
 
-    # 目標削除: 保存データから savings_goal キーを除去する
-    if is_clear:
-        wallet_service.clear_savings_goal(user_name)
-        await message.channel.send(f"{user_name}の貯金目標を削除したよ。")
+    # 全削除
+    if is_clear_all:
+        wallet_service.clear_all_savings_goals(user_name)
+        await message.channel.send(f"{user_name}の貯金目標を全て削除したよ。")
         return True
 
-    # 目標確認: 現在の残高と目標を比較してプログレスバー付きで表示する
+    # タイトル指定削除
+    if clear_title_match:
+        title = clear_title_match.group(1).strip()
+        found = wallet_service.remove_savings_goal(user_name, title)
+        if found:
+            await message.channel.send(f"目標「{title}」を削除したよ。")
+        else:
+            await message.channel.send(f"目標「{title}」は見つからなかったよ。")
+        return True
+
+    # 引数なし削除 — 一覧を見せてタイトル指定を促す
+    if is_clear_bare:
+        goals = wallet_service.get_savings_goals(user_name)
+        if not goals:
+            await message.channel.send("削除する目標がないよ。")
+        else:
+            goal_list = "\n".join(f"・{g['title']}" for g in goals)
+            await message.channel.send(
+                "どの目標を削除する？\n"
+                f"{goal_list}\n"
+                "「目標削除 タイトル」で削除できるよ。全部消す場合は「目標全削除」ね。"
+            )
+        return True
+
+    # 目標確認: 全目標をプログレスバー付きで一覧表示する
     if is_check:
-        goal = wallet_service.get_savings_goal(user_name)
-        # 目標が未設定の場合は設定方法を案内する
-        if goal is None:
+        goals = wallet_service.get_savings_goals(user_name)
+        if not goals:
             await message.channel.send(
                 "貯金目標がまだ設定されてないよ。\n"
                 "`貯金目標 ゲーム機 30000円` の形で設定してね。"
             )
             return True
-        current = wallet_service.get_balance(user_name)
-        target_amount = int(goal.get("target_amount", 0))
-        title = str(goal.get("title", ""))
-        bar = _progress_bar(current, target_amount)
-        # 残り金額が負にならないよう 0 でクランプする
-        remaining = max(target_amount - current, 0)
-        await message.channel.send(
-            f"【貯金目標: {title}】\n"
-            f"・目標金額: {target_amount}円\n"
-            f"・現在残高: {current}円\n"
-            f"・あと: {remaining}円\n"
-            f"・進捗: {bar}"
-        )
+        lines = [f"【{user_name}の貯金目標（残高: {current:,}円）】"]
+        for g in goals:
+            title = str(g.get("title", ""))
+            target_amount = int(g.get("target_amount", 0))
+            bar = _progress_bar(current, target_amount)
+            # 残り金額が負にならないよう 0 でクランプする
+            remaining = max(target_amount - current, 0)
+            lines.append(
+                f"\n・{title}: {target_amount:,}円\n"
+                f"  進捗: {bar}\n"
+                f"  あと: {remaining:,}円"
+            )
+        await message.channel.send("\n".join(lines))
         return True
 
     return False
@@ -717,32 +746,32 @@ async def _handle_detected_intent(
             await message.channel.send(reply)
         return True
 
-    # --- goal_check: 目標確認 ---
+    # --- goal_check: 目標確認（複数対応）---
     if intent_name == "goal_check":
         user_name = str(user_conf.get("name", ""))
-        goal = wallet_service.get_savings_goal(user_name)
+        goals = wallet_service.get_savings_goals(user_name)
+        current = wallet_service.get_balance(user_name)
         # 目標未設定の場合は設定方法を案内する
-        if goal is None:
+        if not goals:
             await message.channel.send(
                 "貯金目標がまだ設定されてないよ。\n`貯金目標 ゲーム機 30000円` の形で設定してね。"
             )
         else:
-            current = wallet_service.get_balance(user_name)
-            target_amount = int(goal.get("target_amount", 0))
-            title = str(goal.get("title", ""))
-            bar = _progress_bar(current, target_amount)
-            # 残り金額が負にならないようクランプする
-            remaining = max(target_amount - current, 0)
-            await message.channel.send(
-                f"【貯金目標: {title}】\n"
-                f"・目標金額: {target_amount}円\n"
-                f"・現在残高: {current}円\n"
-                f"・あと: {remaining}円\n"
-                f"・進捗: {bar}"
-            )
+            lines = [f"【{user_name}の貯金目標（残高: {current:,}円）】"]
+            for g in goals:
+                title = str(g.get("title", ""))
+                target_amount = int(g.get("target_amount", 0))
+                bar = _progress_bar(current, target_amount)
+                remaining = max(target_amount - current, 0)
+                lines.append(
+                    f"\n・{title}: {target_amount:,}円\n"
+                    f"  進捗: {bar}\n"
+                    f"  あと: {remaining:,}円"
+                )
+            await message.channel.send("\n".join(lines))
         return True
 
-    # --- goal_set: 目標設定（Geminiが title と amount を抽出する）---
+    # --- goal_set: 目標追加（Gemini が title と amount を抽出する）---
     if intent_name == "goal_set":
         user_name = str(user_conf.get("name", ""))
         goal_title = str(intent.get("goal_title") or "").strip()
@@ -754,22 +783,26 @@ async def _handle_detected_intent(
             )
             return True
         target_amount = int(goal_amount)
-        wallet_service.set_savings_goal(user_name, goal_title, target_amount)
+        success, result = wallet_service.add_savings_goal(user_name, goal_title, target_amount)
+        if not success:
+            await message.channel.send(result)
+            return True
         current = wallet_service.get_balance(user_name)
         bar = _progress_bar(current, target_amount)
+        action_word = "更新" if result == "updated" else "追加"
         await message.channel.send(
-            f"貯金目標を設定したよ。\n"
-            f"・目標: {goal_title} {target_amount}円\n"
-            f"・現在残高: {current}円\n"
+            f"貯金目標を{action_word}したよ。\n"
+            f"・目標: {goal_title} {target_amount:,}円\n"
+            f"・現在残高: {current:,}円\n"
             f"・進捗: {bar}"
         )
         return True
 
-    # --- goal_clear: 目標削除 ---
+    # --- goal_clear: 全目標削除（Gemini検知は曖昧なケース → 全削除が妥当）---
     if intent_name == "goal_clear":
         user_name = str(user_conf.get("name", ""))
-        wallet_service.clear_savings_goal(user_name)
-        await message.channel.send(f"{user_name}の貯金目標を削除したよ。")
+        wallet_service.clear_all_savings_goals(user_name)
+        await message.channel.send(f"{user_name}の貯金目標を全て削除したよ。")
         return True
 
     # 上記のいずれにも該当しない intent は処理しない
@@ -1092,7 +1125,7 @@ async def on_message(message: discord.Message):
             await message.channel.send(f"査定変更通知の送信に失敗したよ。原因: {type(e).__name__}: {e}")
         if assessed.get("total") is not None:
             # tuple で (更新後残高, 達成した目標 or None) が返る
-            new_balance, goal_achieved = wallet_service.update_balance(
+            new_balance, achieved_goals = wallet_service.update_balance(
                 user_conf=user_conf,
                 system_conf=system_conf,
                 delta=int(assessed["total"]),
@@ -1101,10 +1134,10 @@ async def on_message(message: discord.Message):
                 extra={"discord_user_id": int(message.author.id)},
             )
             await _maybe_send_low_balance_alert(user_conf=user_conf, new_balance=new_balance)
-            # 目標達成通知 — 今回の査定で初めて目標額に到達した場合のみ送信する
-            if goal_achieved:
+            # 達成した目標ごとに祝福メッセージを送信する（複数同時達成もあり得る）
+            for achieved_goal in achieved_goals:
                 await message.channel.send(
-                    _build_goal_achieved_message(user_conf=user_conf, goal=goal_achieved)
+                    _build_goal_achieved_message(user_conf=user_conf, goal=achieved_goal)
                 )
 
     if len(reply) > 1900:
