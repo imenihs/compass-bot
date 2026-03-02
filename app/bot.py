@@ -309,27 +309,32 @@ async def maybe_handle_savings_goal(
     user_conf: dict,
     input_block: str,
 ) -> bool:
-    """貯金目標の設定・確認コマンドを処理する"""
+    """貯金目標の設定・確認・削除コマンドを処理する（Feature 5）"""
     user_name = str(user_conf.get("name", ""))
+    # ユーザー名が取得できない場合は処理不可のためスキップする
     if not user_name:
         return False
 
-    # 「貯金目標 タイトル 金額円」パターン
+    # コマンド種別を判定する（3パターン: 設定・確認・削除）
+    # 「貯金目標 タイトル 金額円」パターン — タイトルと金額を正規表現で取得する
     set_match = re.match(r"^貯金目標\s+(.+?)\s+(\d[\d,]*)\s*円?$", input_block.strip())
-    # 「目標確認」パターン
+    # 「目標確認」パターン — ひらがな表記にも対応する
     check_keywords = ["目標確認", "もくひょうかくにん"]
     is_check = _contains_any_keyword(input_block, check_keywords)
-    # 「目標削除」パターン
+    # 「目標削除」パターン — 設定済み目標をリセットする操作
     clear_keywords = ["目標削除", "もくひょうさくじょ"]
     is_clear = _contains_any_keyword(input_block, clear_keywords)
 
+    # いずれのパターンにも該当しない場合は次のハンドラへ委譲する
     if not set_match and not is_check and not is_clear:
         return False
 
+    # 目標設定: wallet_state.json に保存してプログレスバーを表示する
     if set_match:
         title = set_match.group(1).strip()
         target_amount = int(set_match.group(2).replace(",", ""))
         wallet_service.set_savings_goal(user_name, title, target_amount)
+        # 設定直後の現在残高で進捗を計算して表示する
         current = wallet_service.get_balance(user_name)
         bar = _progress_bar(current, target_amount)
         await message.channel.send(
@@ -340,13 +345,16 @@ async def maybe_handle_savings_goal(
         )
         return True
 
+    # 目標削除: 保存データから savings_goal キーを除去する
     if is_clear:
         wallet_service.clear_savings_goal(user_name)
         await message.channel.send(f"{user_name}の貯金目標を削除したよ。")
         return True
 
+    # 目標確認: 現在の残高と目標を比較してプログレスバー付きで表示する
     if is_check:
         goal = wallet_service.get_savings_goal(user_name)
+        # 目標が未設定の場合は設定方法を案内する
         if goal is None:
             await message.channel.send(
                 "貯金目標がまだ設定されてないよ。\n"
@@ -357,6 +365,7 @@ async def maybe_handle_savings_goal(
         target_amount = int(goal.get("target_amount", 0))
         title = str(goal.get("title", ""))
         bar = _progress_bar(current, target_amount)
+        # 残り金額が負にならないよう 0 でクランプする
         remaining = max(target_amount - current, 0)
         await message.channel.send(
             f"【貯金目標: {title}】\n"
@@ -371,20 +380,26 @@ async def maybe_handle_savings_goal(
 
 
 async def maybe_handle_parent_dashboard(message: discord.Message, content: str) -> bool:
-    """親向けダッシュボード: 全ユーザーの残高・状況を一覧表示"""
+    """親向けダッシュボード: 全ユーザーの残高・状況を一覧表示する（Feature 1）"""
+    # 親以外はこのコマンドを使えない
     if not is_parent(message.author.id):
         return False
 
+    # メンション部分を除去してコマンド本文を取得する
     mention_body = extract_input_from_mention((content or "").strip(), client.user)
     body = mention_body if mention_body is not None else (content or "")
     normalized = _normalize_japanese_command(body)
+    # 「全体確認」「ぜんたいかくにん」のどちらでも反応する
     if "全体確認" not in normalized and "ぜんたいかくにん" not in normalized:
         return False
 
+    # ユーザー一覧・残高監査状態・ログディレクトリを取得する
     system_conf = load_system()
     log_dir = get_log_dir(system_conf)
+    # ユーザーを名前順にソートして表示順を安定させる
     users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
     audit_state = wallet_service.load_audit_state()
+    # pending_by_user に名前があれば残高報告が未完了である
     pending_by_user = audit_state.get("pending_by_user", {})
 
     lines = ["【全体確認ダッシュボード】"]
@@ -392,8 +407,10 @@ async def maybe_handle_parent_dashboard(message: discord.Message, content: str) 
         name = str(u.get("name", ""))
         fixed = int(u.get("fixed_allowance", 0))
         balance = wallet_service.get_balance(name)
+        # 監査の pending 状態で報告済/未報告を判定する
         report_status = "未報告" if name in pending_by_user else "報告済"
 
+        # 支出記録JSONL の末尾レコードから最終支出日を取得する
         journal_path = log_dir / f"{name}_pocket_journal.jsonl"
         journal_rows = _load_jsonl(journal_path)
         last_spending_date = "なし"
@@ -402,6 +419,7 @@ async def maybe_handle_parent_dashboard(message: discord.Message, content: str) 
             if last_ts:
                 try:
                     dt = datetime.fromisoformat(str(last_ts))
+                    # 月/日の形式で表示する（年は省略）
                     last_spending_date = dt.strftime("%m/%d")
                 except Exception:
                     pass
@@ -415,34 +433,41 @@ async def maybe_handle_parent_dashboard(message: discord.Message, content: str) 
 
 
 async def maybe_handle_spending_analysis(message: discord.Message, content: str) -> bool:
-    """支出傾向分析コマンド: 「[name]の分析」または「全員の分析」(親専用)"""
+    """支出傾向分析コマンドを処理する: 「[name]の分析」または「全員の分析」（Feature 4、親専用）"""
+    # 親以外のアクセスは無視する
     if not is_parent(message.author.id):
         return False
 
+    # メンション除去後の本文を取得する
     mention_body = extract_input_from_mention((content or "").strip(), client.user)
     body = mention_body if mention_body is not None else (content or "")
     body_stripped = body.strip()
 
-    # 「全員の分析」パターン
+    # 「全員の分析」パターン — 正規化後の表記でも反応する
     all_match = "全員の分析" in body_stripped or "ぜんいんのぶんせき" in _normalize_japanese_command(body_stripped)
-    # 「[name]の分析」パターン
+    # 「[name]の分析」パターン — 名前部分を正規表現で抽出する
     name_match = re.search(r"(.+)の分析", body_stripped)
 
+    # いずれのパターンにも該当しない場合は次のハンドラへ委譲する
     if not all_match and not name_match:
         return False
 
     system_conf = load_system()
     log_dir = get_log_dir(system_conf)
+    # 過去3ヶ月の集計基準日として現在時刻を使用する
     now_dt = datetime.now(JST)
 
     if all_match:
+        # 全ユーザーの分析テキストをまとめて生成する
         users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
         parts = [_spending_analysis_for_user(log_dir, str(u.get("name", "")), now_dt) for u in users]
         reply = "\n\n".join(parts) if parts else "ユーザーが見つからないよ。"
     else:
+        # 特定ユーザー名を正規表現グループから取得する
         target_name = name_match.group(1).strip()
         reply = _spending_analysis_for_user(log_dir, target_name, now_dt)
 
+    # Discord の1メッセージ文字数上限（2000文字）を超えないよう 1900 文字で分割する
     if len(reply) > 1900:
         for i in range(0, len(reply), 1900):
             await message.channel.send(reply[i: i + 1900])
@@ -496,19 +521,23 @@ async def maybe_handle_reminder_test(message: discord.Message, content: str) -> 
     return True
 
 async def _maybe_send_low_balance_alert(user_conf: dict, new_balance: int) -> None:
-    """残高が閾値を下回ったとき親チャンネルへアラートを送信する"""
+    """残高が閾値を下回ったとき親チャンネルへアラートを送信する（Feature 2）"""
     cfg = LOW_BALANCE_ALERT
+    # 機能が無効化されていれば何もしない
     if not cfg.get("enabled"):
         return
     channel_id = cfg.get("channel_id")
+    # 送信先チャンネルが未設定の場合はスキップする
     if not channel_id:
         return
     threshold = int(cfg.get("threshold", 500))
+    # 新残高が閾値以上であればアラート不要
     if new_balance >= threshold:
         return
 
     name = str(user_conf.get("name", ""))
     try:
+        # キャッシュにチャンネルがない場合は API で取得する
         channel = client.get_channel(int(channel_id))
         if channel is None:
             channel = await client.fetch_channel(int(channel_id))
@@ -516,27 +545,33 @@ async def _maybe_send_low_balance_alert(user_conf: dict, new_balance: int) -> No
             f"【低残高アラート】{name}さんの残高が{new_balance}円になりました（閾値:{threshold}円）。"
         )
     except Exception as e:
+        # アラート失敗はボット動作を止めないためログ出力のみとする
         print(f"Low balance alert error: {e}")
 
 
 async def _detect_command_intent(input_block: str) -> dict | None:
     """
     自然語メッセージからコマンド意図をGeminiで判定する（案② ハイブリッド方式）。
-    40文字超の場合はお小遣い相談の可能性が高いためスキップ。
+    40文字超の場合はお小遣い相談の可能性が高いためスキップする。
     戻り値: {"intent": "...", "target_name": ..., "goal_title": ..., "goal_amount": ...} or None
     """
+    # 長文はコマンドではなく相談と判断してAPI呼び出しをスキップする（コスト節約）
     if len(input_block) > 40:
         return None
 
     prompt = _INTENT_PROMPT_TEMPLATE.format(message=input_block)
     try:
+        # call_silent は「考え中...」を表示しない軽量呼び出しである
         raw = await gemini_service.call_silent(prompt)
+        # Geminiの返答からJSONブロックだけを正規表現で抽出する
         m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
         if m:
             result = json.loads(m.group())
+            # intent フィールドが存在する場合のみ有効な結果として返す
             if isinstance(result, dict) and result.get("intent"):
                 return result
     except Exception as e:
+        # intent検知の失敗はボット動作を止めないためログ出力のみとする
         print(f"Intent detection error: {e}")
     return None
 
@@ -547,12 +582,15 @@ async def _handle_detected_intent(
     system_conf: dict,
     intent: dict,
 ) -> bool:
-    """Gemini が検出したコマンド意図に応じて処理を実行する"""
+    """Gemini が検出したコマンド意図に応じて適切なハンドラを呼び出す（案②）"""
     intent_name = str(intent.get("intent", "none")).strip()
 
+    # --- dashboard: 全体確認ダッシュボード（親専用）---
     if intent_name == "dashboard":
+        # 親以外からのアクセスは無視する
         if not is_parent(message.author.id):
             return False
+        # maybe_handle_parent_dashboard と同じロジックでダッシュボードを構築する
         system_conf_l = load_system()
         log_dir = get_log_dir(system_conf_l)
         users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
@@ -564,6 +602,7 @@ async def _handle_detected_intent(
             fixed = int(u.get("fixed_allowance", 0))
             balance = wallet_service.get_balance(name)
             report_status = "未報告" if name in pending_by_user else "報告済"
+            # 支出記録の末尾レコードから最終支出日を取得する
             journal_rows = _load_jsonl(log_dir / f"{name}_pocket_journal.jsonl")
             last_spending_date = "なし"
             if journal_rows:
@@ -580,21 +619,25 @@ async def _handle_detected_intent(
         await message.channel.send("\n".join(lines))
         return True
 
+    # --- analysis_all / analysis_user: 支出傾向分析（親専用）---
     if intent_name in ("analysis_all", "analysis_user"):
         if not is_parent(message.author.id):
             return False
         log_dir = get_log_dir(load_system())
         now_dt = datetime.now(JST)
         if intent_name == "analysis_all":
+            # 全ユーザー分の分析テキストを結合して返す
             users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
             parts = [_spending_analysis_for_user(log_dir, str(u.get("name", "")), now_dt) for u in users]
             reply = "\n\n".join(parts) if parts else "ユーザーが見つからないよ。"
         else:
+            # Gemini が抽出した target_name が空の場合はエラーを返す
             target_name = str(intent.get("target_name") or "").strip()
             if not target_name:
                 await message.channel.send("分析対象のユーザー名が分からなかったよ。`[名前]の分析` と送ってね。")
                 return True
             reply = _spending_analysis_for_user(log_dir, target_name, now_dt)
+        # 1900文字を超える場合は分割して送信する
         if len(reply) > 1900:
             for i in range(0, len(reply), 1900):
                 await message.channel.send(reply[i: i + 1900])
@@ -602,9 +645,11 @@ async def _handle_detected_intent(
             await message.channel.send(reply)
         return True
 
+    # --- goal_check: 目標確認 ---
     if intent_name == "goal_check":
         user_name = str(user_conf.get("name", ""))
         goal = wallet_service.get_savings_goal(user_name)
+        # 目標未設定の場合は設定方法を案内する
         if goal is None:
             await message.channel.send(
                 "貯金目標がまだ設定されてないよ。\n`貯金目標 ゲーム機 30000円` の形で設定してね。"
@@ -614,6 +659,7 @@ async def _handle_detected_intent(
             target_amount = int(goal.get("target_amount", 0))
             title = str(goal.get("title", ""))
             bar = _progress_bar(current, target_amount)
+            # 残り金額が負にならないようクランプする
             remaining = max(target_amount - current, 0)
             await message.channel.send(
                 f"【貯金目標: {title}】\n"
@@ -624,10 +670,12 @@ async def _handle_detected_intent(
             )
         return True
 
+    # --- goal_set: 目標設定（Geminiが title と amount を抽出する）---
     if intent_name == "goal_set":
         user_name = str(user_conf.get("name", ""))
         goal_title = str(intent.get("goal_title") or "").strip()
         goal_amount = intent.get("goal_amount")
+        # タイトルまたは金額が取得できない場合は再入力を促す
         if not goal_title or not isinstance(goal_amount, (int, float)) or goal_amount <= 0:
             await message.channel.send(
                 "目標のタイトルと金額が分からなかったよ。\n`貯金目標 ゲーム機 30000円` の形で送ってね。"
@@ -645,12 +693,14 @@ async def _handle_detected_intent(
         )
         return True
 
+    # --- goal_clear: 目標削除 ---
     if intent_name == "goal_clear":
         user_name = str(user_conf.get("name", ""))
         wallet_service.clear_savings_goal(user_name)
         await message.channel.send(f"{user_name}の貯金目標を削除したよ。")
         return True
 
+    # 上記のいずれにも該当しない intent は処理しない
     return False
 
 
