@@ -23,6 +23,10 @@ class GeminiService:
         )
         return resp.text or "ごめん、空の応答だったよ。"
 
+    async def call_silent(self, prompt: str) -> str:
+        """「考え中...」を表示せずに非同期でGeminiを呼び出す（コマンド判定等の軽量用途）"""
+        return await asyncio.to_thread(self.call, prompt)
+
     async def call_with_progress(self, channel: discord.abc.Messageable, prompt: str) -> str:
         task = asyncio.create_task(asyncio.to_thread(self.call, prompt))
         while True:
