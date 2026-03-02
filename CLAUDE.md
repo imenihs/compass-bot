@@ -83,7 +83,7 @@ programming_log.txt   # 作業ログ（commitID必須記録）
 ```
 
 ### データファイル（実行時生成）
-- `wallet_state.json` — 残高・目標貯金 (`users[name]["savings_goal"]`)
+- `wallet_state.json` — 残高・目標貯金 (`users[name]["savings_goals"]` リスト形式、最大5件)
 - `{name}_pocket_journal.jsonl` — 支出記録ログ
 - `{name}_wallet_ledger.jsonl` — 残高変動ログ (`action=allowance_grant` 等)
 - `reminder_state.json` — リマインダー送信済み管理
@@ -126,6 +126,7 @@ programming_log.txt   # 作業ログ（commitID必須記録）
 | Phase 1-A | 週次支出記録リマインド | 2e481d2 | ✅ コミット済（NAS未反映） |
 | Phase 1-C | 子供向け振り返りコマンド | cd52f99 | ✅ コミット済（NAS未反映） |
 | Tier 2-E | 査定履歴確認コマンド | dd489f4 | ✅ コミット済（NAS未反映） |
+| Tier 2-D | 複数目標貯金（最大5件・旧データ自動移行） | f938aee | ✅ コミット済（NAS未反映） |
 
 ---
 
