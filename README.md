@@ -168,6 +168,11 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
   - `enabled`: true で有効化
   - `channel_id`: 送信先チャンネルID
   - `send_time`: 送信時刻（`HH:MM` 形式、毎月1日に実行）
+- `pocket_journal_reminder`: 週次支出記録リマインド設定
+  - `enabled`: true で有効化
+  - `day_of_week`: 送信曜日（0=月曜〜6=日曜、Python weekday() 準拠）
+  - `notify_time`: 送信時刻（`HH:MM` 形式）
+  - 過去7日間に支出記録がないユーザーにのみ送信する。`allow_channel_ids` を使用
 
 テンプレート:
 - `settings/setting.example.json`
