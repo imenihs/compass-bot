@@ -34,5 +34,10 @@
     "enabled": false,
     "channel_id": null,
     "send_time": "09:00"
+  },
+  "pocket_journal_reminder": {
+    "enabled": false,
+    "day_of_week": 0,
+    "notify_time": "19:00"
   }
 }

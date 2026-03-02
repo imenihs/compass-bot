@@ -39,6 +39,7 @@ from app.config import (
     get_low_balance_alert_setting,
     get_monthly_summary_setting,
     get_parent_ids,
+    get_pocket_journal_reminder_setting,
     get_wallet_audit_setting,
     load_all_users,
     load_system,
@@ -68,6 +69,7 @@ ASSESS_KEYWORD = get_assess_keyword()
 FORCE_ASSESS_TEST_KEYWORD = get_force_assess_test_keyword()
 LOW_BALANCE_ALERT = get_low_balance_alert_setting()
 MONTHLY_SUMMARY = get_monthly_summary_setting()
+POCKET_JOURNAL_REMINDER = get_pocket_journal_reminder_setting()
 
 # Geminiによる自然語コマンド意図判定プロンプト（案② ハイブリッド方式）
 _INTENT_PROMPT_TEMPLATE = """\
@@ -106,6 +108,7 @@ reminder_service = ReminderService(
     wallet_service=wallet_service,
     allow_channel_ids=ALLOW_CHANNEL_IDS,
     monthly_summary_conf=MONTHLY_SUMMARY,
+    pocket_journal_reminder_conf=POCKET_JOURNAL_REMINDER,
 )
 
 

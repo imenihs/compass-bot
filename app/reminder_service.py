@@ -11,6 +11,39 @@ import discord
 from app.storage import JST
 
 
+def _build_pocket_journal_reminder_message(user_conf: dict) -> str:
+    """週次支出記録リマインドのメッセージを年齢に応じて生成する。
+    強制感を出さず、やさしく記録を促す文体にする。"""
+    name = user_conf.get("name", "")
+    raw_age = user_conf.get("age")
+    # 年齢を int に正規化する（文字列数字も変換する）
+    if isinstance(raw_age, int):
+        age = raw_age
+    elif isinstance(raw_age, str) and raw_age.strip().isdigit():
+        age = int(raw_age.strip())
+    else:
+        age = None
+
+    if age is not None and age <= 9:
+        # 低学年向け — ひらがな多め・語りかけるような文体にする
+        return (
+            f"{name}さん、こんにちは！\n"
+            "今週つかったお金はあったかな？\n"
+            "あったら「支出記録」ってなげかけてみてね！"
+        )
+    if age is not None and age <= 12:
+        # 小学高学年向け — 記録のメリットを一言添えて促す
+        return (
+            f"{name}さん、今週使ったお金があれば記録してみよう！\n"
+            "「支出記録」と送ると案内が届くよ。"
+        )
+    # 中学生以上 — 端的に伝える
+    return (
+        f"{name}さん、今週お金を使ったなら記録しておこう。\n"
+        "「支出記録」で記録できるよ。"
+    )
+
+
 class ReminderService:
     def __init__(
         self,
@@ -21,6 +54,7 @@ class ReminderService:
         wallet_service,
         allow_channel_ids: set[int] | None = None,
         monthly_summary_conf: dict | None = None,
+        pocket_journal_reminder_conf: dict | None = None,
     ):
         self.client = client
         self.allowance_reminder_conf = allowance_reminder_conf
@@ -30,6 +64,8 @@ class ReminderService:
         self.allow_channel_ids = allow_channel_ids or set()
 
         self.monthly_summary_conf = monthly_summary_conf or {}
+        # 週次支出記録リマインドの設定（未指定は無効扱いとする）
+        self.pocket_journal_reminder_conf = pocket_journal_reminder_conf or {}
 
         root = Path(__file__).resolve().parents[1]
         self.reminder_state_path = root / "data" / "reminder_state.json"
@@ -310,12 +346,92 @@ class ReminderService:
         state["sent_monthly_summary_keys"] = sent_keys
         self._save_reminder_state(state)
 
+    def _has_recent_journal_entry(self, user_name: str, log_dir: Path, days: int = 7) -> bool:
+        """過去N日間に支出記録（pocket_journal）があるかチェックする。
+        記録が1件でもあれば True を返し、リマインドは送信しない。"""
+        path = log_dir / f"{user_name}_pocket_journal.jsonl"
+        rows = self._load_jsonl(path)
+        # 基準日時（now - days）より新しいエントリがあれば記録済みとみなす
+        cutoff = datetime.now(JST) - timedelta(days=days)
+        for r in rows:
+            ts_str = r.get("ts")
+            if not ts_str:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(ts_str))
+                if dt >= cutoff:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def maybe_send_pocket_journal_reminder(self) -> None:
+        """週次支出記録リマインドを送信する。
+        設定された曜日・時刻に、過去7日間の記録がないユーザーにのみ送信する。"""
+        cfg = self.pocket_journal_reminder_conf
+        if not cfg.get("enabled"):
+            return
+
+        now = datetime.now(JST)
+        # 設定曜日（Python weekday: 0=月〜6=日）と現在の曜日が一致する場合のみ処理する
+        if now.weekday() != int(cfg["day_of_week"]):
+            return
+        hh, mm = [int(x) for x in cfg["notify_time"].split(":")]
+        if now.hour != hh or now.minute != mm:
+            return
+
+        # ISO週番号をキーにして同一週の二重送信を防ぐ
+        week_key = now.strftime("%Y-W%W")
+        state = self._load_reminder_state()
+        sent_keys: list = state.get("sent_pocket_journal_reminder_keys") or []
+
+        from app.config import get_log_dir, load_system
+        log_dir = get_log_dir(load_system())
+
+        users = self.load_all_users()
+        # discord_user_id をキーにして channel メンバーと突合する
+        user_by_discord_id = {
+            int(u["discord_user_id"]): u
+            for u in users
+            if u.get("discord_user_id")
+        }
+
+        for channel_id in self.allow_channel_ids:
+            channel = self.client.get_channel(channel_id)
+            if channel is None:
+                channel = await self.client.fetch_channel(channel_id)
+
+            member_ids = {m.id for m in getattr(channel, "members", [])}
+            channel_users = [
+                user_by_discord_id[mid]
+                for mid in member_ids
+                if mid in user_by_discord_id
+            ]
+
+            for u in channel_users:
+                user_name = str(u.get("name", ""))
+                # ユーザー×週のキーで重複チェックをする
+                send_key = f"pocket_journal_reminder_{user_name}_{week_key}"
+                if send_key in sent_keys:
+                    continue
+                # 今週すでに記録がある場合はリマインドを省略する
+                if not self._has_recent_journal_entry(user_name, log_dir, days=7):
+                    await channel.send(
+                        _build_pocket_journal_reminder_message(u)
+                    )
+                # 記録あり・なし問わず今週分は処理済みとしてマークする
+                sent_keys.append(send_key)
+
+        state["sent_pocket_journal_reminder_keys"] = sent_keys
+        self._save_reminder_state(state)
+
     async def loop(self) -> None:
         while not self.client.is_closed():
             try:
                 await self.maybe_send_allowance_reminder()
                 await self.maybe_request_wallet_audit()
                 await self.maybe_send_monthly_summary()
+                await self.maybe_send_pocket_journal_reminder()
             except Exception as e:
                 print("Reminder loop error:", e)
             await asyncio.sleep(20)
