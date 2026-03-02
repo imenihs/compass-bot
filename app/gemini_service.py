@@ -51,15 +51,11 @@ class GeminiService:
 
         fixed = _pick(r"固定\s*[：:]?\s*\+?(\d+)\s*円")
         temporary = _pick(r"臨時\s*[：:]?\s*\+?(\d+)\s*円")
-        legacy_purpose = _pick(r"目的\s*[：:]\s*\+?(\d+)\s*円")
-        legacy_discretionary = _pick(r"裁量\s*[：:]\s*\+?(\d+)\s*円")
         total = _pick(r"合計\s*[：:]\s*(\d+)\s*円")
 
-        if fixed is None and temporary is None and legacy_purpose is None and legacy_discretionary is None and total is None:
+        # 3フィールドすべて取得できなかった場合は査定なしと判断する
+        if fixed is None and temporary is None and total is None:
             return None
-
-        if temporary is None and (legacy_purpose is not None or legacy_discretionary is not None):
-            temporary = int(legacy_purpose or 0) + int(legacy_discretionary or 0)
 
         parsed = {
             "fixed": fixed,

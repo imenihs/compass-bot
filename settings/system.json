@@ -1,5 +1,4 @@
 {
   "currency": "JPY",
-  "log_dir": "data/logs",
-  "default_reply_format": "SH_REPLY_V1"
+  "log_dir": "data/logs"
 }
