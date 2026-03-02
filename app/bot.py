@@ -6,6 +6,7 @@ import discord
 from datetime import datetime
 
 from app.bot_utils import (
+    _assessment_history_message,
     _build_goal_achieved_message,
     _child_review_message,
     _contains_any_keyword,
@@ -419,6 +420,33 @@ async def maybe_handle_child_review(
         year=now.year,
         month=now.month,
     )
+    await message.channel.send(msg)
+    return True
+
+
+async def maybe_handle_assessment_history(
+    message: discord.Message,
+    user_conf: dict,
+    system_conf: dict,
+    input_block: str,
+) -> bool:
+    """査定履歴確認コマンドを処理する（Tier 2-E）。
+    「査定履歴」で直近5件の査定金額（固定・臨時・合計）を一覧表示する。"""
+    history_keywords = ["査定履歴", "さていれきし"]
+    if not _contains_any_keyword(input_block, history_keywords):
+        return False
+
+    user_name = str(user_conf.get("name", ""))
+    if not user_name:
+        return False
+
+    log_dir = get_log_dir(system_conf)
+    # allowance_amounts.jsonl から全件読み込んで末尾5件を取得する
+    amounts_path = log_dir / f"{user_name}_allowance_amounts.jsonl"
+    all_rows = _load_jsonl(amounts_path)
+    # 新しい順に並べるため末尾から取得し、表示は新→旧の順にする
+    recent = list(reversed(all_rows[-5:]))
+    msg = _assessment_history_message(user_conf=user_conf, rows=recent)
     await message.channel.send(msg)
     return True
 
@@ -888,6 +916,14 @@ async def on_message(message: discord.Message):
         return
 
     if await maybe_handle_child_review(
+        message=message,
+        user_conf=user_conf,
+        system_conf=system_conf,
+        input_block=input_block,
+    ):
+        return
+
+    if await maybe_handle_assessment_history(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
