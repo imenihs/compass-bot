@@ -354,3 +354,38 @@ def _spending_analysis_for_user(log_dir: Path, user_name: str, now_dt: datetime)
     lines.extend(f"  {s}" for s in monthly_stats)
     lines.append(f"  よく使う品目: {top5_str}")
     return "\n".join(lines)
+
+
+def _build_goal_achieved_message(user_conf: dict, goal: dict) -> str:
+    """目標達成時の祝福メッセージを年齢に応じて生成する。
+    低学年ほどひらがな・感嘆符を多用し、達成感が伝わる文体にする。"""
+    name = user_conf.get("name", "")
+    title = goal.get("title", "目標")
+    target = int(goal.get("target_amount", 0))
+
+    # age を int に正規化する（未設定は None、文字列数字も変換する）
+    raw_age = user_conf.get("age")
+    if isinstance(raw_age, int):
+        age = raw_age
+    elif isinstance(raw_age, str) and raw_age.strip().isdigit():
+        age = int(raw_age.strip())
+    else:
+        age = None
+
+    if age is not None and age <= 9:
+        # 低学年向け — ひらがな多め・感嘆符で達成感を強く伝える
+        return (
+            f"やったー！{name}さん、「{title}」の めざす きんがく {target:,}円 に とどいたよ！\n"
+            "よくがんばったね！"
+        )
+    if age is not None and age <= 12:
+        # 小学高学年向け — 達成の事実と称賛を簡潔に伝える
+        return (
+            f"{name}さん、目標「{title}」達成おめでとう！\n"
+            f"目標額 {target:,}円 に到達したよ。よく続けたね！"
+        )
+    # 中学生以上 — 対等なトーンで端的に祝福する
+    return (
+        f"{name}さん、目標「{title}」達成！\n"
+        f"目標額 {target:,}円 に到達したよ。お疲れさま。"
+    )

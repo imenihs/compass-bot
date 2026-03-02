@@ -53,8 +53,9 @@ class WalletService:
         action: str,
         note: str = "",
         extra: dict | None = None,
-    ) -> int:
+    ) -> tuple[int, dict | None]:
         user_name = str(user_conf.get("name", "unknown"))
+        # 更新前の残高を記録しておく（目標達成の前後比較に使う）
         before = self.get_balance(user_name)
         after = before + int(delta)
         self.set_balance(user_name, after)
@@ -73,7 +74,17 @@ class WalletService:
         if extra:
             record["extra"] = extra
         append_jsonl(ledger_path, record)
-        return after
+
+        # 貯金目標の達成チェックをする
+        # 残高が増加した場合のみ判定し、今回の更新で初めて目標を超えたときのみ通知する
+        goal = self.get_savings_goal(user_name)
+        if goal and delta > 0:
+            target = int(goal.get("target_amount", 0))
+            # 更新前は未達成（before < target）かつ更新後に到達（after >= target）の瞬間が達成
+            if before < target <= after:
+                return after, goal
+
+        return after, None
 
     def load_audit_state(self) -> dict:
         if not self.wallet_audit_state_path.exists():

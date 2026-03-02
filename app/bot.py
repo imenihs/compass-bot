@@ -6,6 +6,7 @@ import discord
 from datetime import datetime
 
 from app.bot_utils import (
+    _build_goal_achieved_message,
     _contains_any_keyword,
     _contains_force_assess_keyword,
     _extract_keyword_hits,
@@ -1003,7 +1004,8 @@ async def on_message(message: discord.Message):
             print("assessment change notify error:", e)
             await message.channel.send(f"査定変更通知の送信に失敗したよ。原因: {type(e).__name__}: {e}")
         if assessed.get("total") is not None:
-            new_balance = wallet_service.update_balance(
+            # tuple で (更新後残高, 達成した目標 or None) が返る
+            new_balance, goal_achieved = wallet_service.update_balance(
                 user_conf=user_conf,
                 system_conf=system_conf,
                 delta=int(assessed["total"]),
@@ -1012,6 +1014,11 @@ async def on_message(message: discord.Message):
                 extra={"discord_user_id": int(message.author.id)},
             )
             await _maybe_send_low_balance_alert(user_conf=user_conf, new_balance=new_balance)
+            # 目標達成通知 — 今回の査定で初めて目標額に到達した場合のみ送信する
+            if goal_achieved:
+                await message.channel.send(
+                    _build_goal_achieved_message(user_conf=user_conf, goal=goal_achieved)
+                )
 
     if len(reply) > 1900:
         for i in range(0, len(reply), 1900):
