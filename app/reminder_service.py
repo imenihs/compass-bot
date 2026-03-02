@@ -220,7 +220,7 @@ class ReminderService:
 
             balance = self.wallet_service.get_balance(name)
 
-            # 支出記録集計
+            # 支出記録を集計する
             journal_path = log_dir / f"{name}_pocket_journal.jsonl"
             journal_rows = self._load_jsonl(journal_path)
             month_journals = [
@@ -239,7 +239,7 @@ class ReminderService:
             )
             top5 = [item for item, _ in item_counter.most_common(5)]
 
-            # お小遣い支給合計(allowance_grant)
+            # お小遣い支給合計を集計する（action=allowance_grant）
             ledger_path = log_dir / f"{name}_wallet_ledger.jsonl"
             ledger_rows = self._load_jsonl(ledger_path)
             grant_total = sum(
@@ -286,7 +286,7 @@ class ReminderService:
         if now.hour != hh or now.minute != mm:
             return
 
-        # 前月を計算
+        # 前月を計算する
         if now.month == 1:
             target_year, target_month = now.year - 1, 12
         else:
