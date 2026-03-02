@@ -423,6 +423,53 @@ def _child_review_message(
     )
 
 
+def _assessment_history_message(user_conf: dict, rows: list[dict]) -> str:
+    """直近の査定履歴を一覧形式でまとめて返す。
+    rows は allowance_amounts.jsonl の直近N件（新しい順）を想定する。"""
+    name = user_conf.get("name", "")
+    raw_age = user_conf.get("age")
+    # 年齢を int に正規化する
+    if isinstance(raw_age, int):
+        age = raw_age
+    elif isinstance(raw_age, str) and raw_age.strip().isdigit():
+        age = int(raw_age.strip())
+    else:
+        age = None
+
+    # 記録がない場合は記録を促すメッセージを返す
+    if not rows:
+        if age is not None and age <= 9:
+            return f"{name}さん、まだ査定のきろくはないよ！"
+        return f"{name}さん、まだ査定の記録はないよ。"
+
+    lines = []
+    for r in rows:
+        # タイムスタンプを「月/日」に整形する
+        ts_str = r.get("ts", "")
+        try:
+            dt = datetime.fromisoformat(str(ts_str))
+            date_label = f"{dt.month}/{dt.day}"
+        except Exception:
+            date_label = "?"
+
+        fixed = r.get("fixed")
+        temporary = r.get("temporary")
+        total = r.get("total")
+        # None が入っている項目は「-」で表示して行を崩さない
+        fixed_str = f"{fixed}円" if fixed is not None else "-"
+        tmp_str = f"+{temporary}円" if temporary is not None else "-"
+        total_str = f"{total}円" if total is not None else "-"
+        lines.append(f"  {date_label}  固定{fixed_str} / 臨時{tmp_str} / 合計{total_str}")
+
+    # 低学年のみひらがなヘッダーにする。それ以外は共通フォーマット
+    if age is not None and age <= 9:
+        header = f"【{name}さんのさていのきろく（さいきん{len(rows)}かい）】"
+    else:
+        header = f"【{name}さんの査定履歴（直近{len(rows)}件）】"
+
+    return header + "\n" + "\n".join(lines)
+
+
 def _build_goal_achieved_message(user_conf: dict, goal: dict) -> str:
     """目標達成時の祝福メッセージを年齢に応じて生成する。
     低学年ほどひらがな・感嘆符を多用し、達成感が伝わる文体にする。"""
