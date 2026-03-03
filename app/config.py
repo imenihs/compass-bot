@@ -25,6 +25,9 @@ def load_setting() -> dict:
 def load_all_users() -> list[dict]:
     users = []
     for p in USERS_DIR.glob("*.json"):
+        # .example.json はサンプルファイルのため実ユーザーとして読み込まない
+        if p.name.endswith(".example.json"):
+            continue
         users.append(_load_json(p))
     return users
 
@@ -291,6 +294,9 @@ def find_user_json_path_by_name(name: str) -> Path | None:
         return None
     # 全ユーザーファイルを走査して name フィールドが一致するパスを返す
     for p in USERS_DIR.glob("*.json"):
+        # .example.json はサンプルファイルのためスキップする
+        if p.name.endswith(".example.json"):
+            continue
         try:
             data = _load_json(p)
             if str(data.get("name", "")).strip() == target:
