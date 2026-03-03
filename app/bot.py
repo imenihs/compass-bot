@@ -27,6 +27,7 @@ from app.bot_utils import (
     _self_compare_message,
     _spending_analysis_for_user,
     _usage_guide_text,
+    _usage_guide_text_parent,
 )
 from app.config import (
     find_user_by_discord_id,
@@ -185,7 +186,11 @@ async def maybe_handle_help_and_initial_setup(
         return True
 
     if is_usage:
+        # 子供向けガイドを送信する
         await message.channel.send(_usage_guide_text())
+        # 親の場合は親専用コマンド一覧も追加で送信する
+        if is_parent(message.author.id):
+            await message.channel.send(_usage_guide_text_parent())
         return True
 
     if is_balance_check:
