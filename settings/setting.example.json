@@ -16,8 +16,9 @@
     "enabled": true,
     "channel_id": 222222222222222222,
     "payday_day": 1,
-    "notify_offset": "-7day,-3day,-1day",
-    "notify_time": "20:00"
+    "notify_offset": "-7day,-3day,-1day,0day",
+    "notify_time": "20:00",
+    "auto_grant_on_payday": false
   },
   "wallet_audit": {
     "enabled": true,
