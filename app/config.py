@@ -119,12 +119,16 @@ def get_allowance_reminder_setting() -> dict:
     if not before_days_list:
         before_days_list = [7]
 
+    # 支給日当日（before_days=0）に全ユーザーの固定額を自動加算するか否かのフラグ
+    auto_grant_on_payday = bool(rem.get("auto_grant_on_payday", False))
+
     return {
         "enabled": enabled,
         "channel_id": channel_id,
         "payday_day": payday_day,
         "notify_time": notify_time,
         "before_days_list": before_days_list,
+        "auto_grant_on_payday": auto_grant_on_payday,
     }
 
 def get_wallet_audit_setting() -> dict:

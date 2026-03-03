@@ -120,6 +120,29 @@ class ReminderService:
             channel = await self.client.fetch_channel(int(channel_id))
         await channel.send("\n".join(lines))
 
+    async def _grant_fixed_allowance_all(self) -> str:
+        """全ユーザーの固定お小遣いを残高に自動加算して結果サマリーを返す。
+        支給日当日の自動加算（B-1）で呼び出す。"""
+        from app.config import get_log_dir, load_all_users, load_system
+        system_conf = load_system()
+        users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
+        lines = []
+        for u in users:
+            name = str(u.get("name", ""))
+            amount = int(u.get("fixed_allowance", 0))
+            # 固定額が未設定のユーザーはスキップする
+            if amount <= 0:
+                continue
+            new_balance, _ = self.wallet_service.update_balance(
+                user_conf=u,
+                system_conf=system_conf,
+                delta=amount,
+                action="allowance_monthly_auto_grant",
+                note="auto_grant_on_payday",
+            )
+            lines.append(f"・{name}: +{amount}円 → {new_balance}円")
+        return "\n".join(lines) if lines else "対象ユーザーなし"
+
     async def maybe_send_allowance_reminder(self) -> None:
         cfg = self.allowance_reminder_conf
         if not cfg.get("enabled"):
@@ -147,6 +170,13 @@ class ReminderService:
             if remind_key in sent_keys:
                 continue
             await self.send_allowance_reminder(payday=payday, channel_id=int(channel_id), is_test=False)
+            # before_days=0（支給日当日）かつ auto_grant_on_payday=true の場合に自動加算する
+            if before_days == 0 and cfg.get("auto_grant_on_payday"):
+                grant_summary = await self._grant_fixed_allowance_all()
+                channel = self.client.get_channel(int(channel_id))
+                if channel is None:
+                    channel = await self.client.fetch_channel(int(channel_id))
+                await channel.send(f"【固定お小遣い自動支給】\n{grant_summary}")
             sent_keys.append(remind_key)
             state["sent_remind_keys"] = sent_keys
             self._save_reminder_state(state)
