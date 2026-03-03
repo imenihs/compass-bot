@@ -759,6 +759,93 @@ async def maybe_handle_user_setting_change(message: discord.Message, content: st
     return True
 
 
+async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> bool:
+    """親が全ユーザーに固定お小遣いを一括支給するコマンドを処理する（親のみ）。
+    全ユーザーの fixed_allowance を残高に加算し、結果を一覧表示する。"""
+    if not is_parent(message.author.id):
+        return False
+    # 誤作動を防ぐため完全一致で判定する
+    if (content or "").strip() != "一括支給":
+        return False
+
+    users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
+    if not users:
+        await message.channel.send("ユーザーが設定されていないよ。")
+        return True
+
+    system_conf = load_system()
+    lines = ["【一括支給完了】"]
+    # 全ユーザーを走査して fixed_allowance を残高に加算する
+    for u in users:
+        name = str(u.get("name", ""))
+        amount = int(u.get("fixed_allowance", 0))
+        # 固定お小遣いが設定されていないユーザーはスキップする
+        if amount <= 0:
+            lines.append(f"・{name}: スキップ（固定額未設定）")
+            continue
+        new_balance, achieved_goals = wallet_service.update_balance(
+            user_conf=u,
+            system_conf=system_conf,
+            delta=amount,
+            action="allowance_monthly_auto_grant",
+            note="bulk_grant_by_parent",
+            extra={"granted_by": str(message.author.id)},
+        )
+        lines.append(f"・{name}: +{amount}円 → {new_balance}円")
+        # 支給により目標が達成された場合は祝福メッセージを送る
+        for achieved_goal in achieved_goals:
+            await message.channel.send(
+                _build_goal_achieved_message(user_conf=u, goal=achieved_goal)
+            )
+
+    await message.channel.send("\n".join(lines))
+    return True
+
+
+async def maybe_handle_parent_announce(message: discord.Message, content: str) -> bool:
+    """親が任意メッセージを全 allow チャンネルに一斉送信するコマンドを処理する（親のみ）。
+    「アナウンス [本文]」の形式にマッチする。メンションあり/なしどちらも対応する。"""
+    if not is_parent(message.author.id):
+        return False
+
+    body = (content or "").strip()
+    # メンションが含まれる場合は除去した本文を使う
+    mention_body = extract_input_from_mention(body, client.user)
+    target = mention_body if mention_body is not None else body
+
+    # 「アナウンス 本文」の形式を抽出する（本文は複数行にも対応）
+    m = re.match(r"^アナウンス\s+(.+)$", target.strip(), re.DOTALL)
+    if not m:
+        return False
+
+    announce_text = m.group(1).strip()
+    channel_ids = get_allow_channel_ids()
+    if not channel_ids:
+        await message.channel.send("`allow_channel_ids` が未設定なので一斉送信できないよ。")
+        return True
+
+    sent = 0
+    failed: list[str] = []
+    # 全 allow チャンネルに「【アナウンス】本文」を送信する
+    for cid in sorted(channel_ids):
+        try:
+            channel = client.get_channel(int(cid))
+            if channel is None:
+                channel = await client.fetch_channel(int(cid))
+            await channel.send(f"【アナウンス】\n{announce_text}")
+            sent += 1
+        except Exception as e:
+            failed.append(str(cid))
+
+    if failed:
+        await message.channel.send(
+            f"{sent}チャンネルに送信したよ。失敗チャンネル: {', '.join(failed)}"
+        )
+    else:
+        await message.channel.send(f"{sent}チャンネルに送信したよ。")
+    return True
+
+
 async def maybe_handle_manual_expense(
     message: discord.Message,
     user_conf: dict,
@@ -1159,6 +1246,14 @@ async def on_message(message: discord.Message):
 
     # 親による設定変更コマンド（「設定変更 たろう 固定 800円」）
     if await maybe_handle_user_setting_change(message, content):
+        return
+
+    # 親による全ユーザー一括支給コマンド（「一括支給」）
+    if await maybe_handle_bulk_grant(message, content):
+        return
+
+    # 親による全チャンネル一斉アナウンス（「アナウンス [本文]」）
+    if await maybe_handle_parent_announce(message, content):
         return
 
     mention_input = extract_input_from_mention(content, client.user)
