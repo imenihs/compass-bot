@@ -519,6 +519,10 @@ async def on_message(message: discord.Message):
     if await handlers_parent.maybe_handle_parent_broadcast_guide(message, content):
         return
 
+    # 「使い方の説明」は単体チャンネルへの送信（一斉送信より後に判定する）
+    if await handlers_parent.maybe_handle_parent_usage_single(message, content):
+        return
+
     if ALLOW_CHANNEL_IDS is not None and message.channel.id not in ALLOW_CHANNEL_IDS:
         return
 

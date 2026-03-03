@@ -61,6 +61,7 @@ async def maybe_handle_parent_broadcast_guide(message: discord.Message, content:
     mention_body = extract_input_from_mention((content or "").strip(), _client.user)
     body = mention_body if mention_body is not None else (content or "")
     normalized = _normalize_japanese_command(body)
+    # 「と初期設定」付きを先に判定して単体送信と区別する
     is_cmd = (
         "使い方の説明と初期設定" in normalized
         or "つかいかたのせつめいとしょきせってい" in normalized
@@ -92,6 +93,32 @@ async def maybe_handle_parent_broadcast_guide(message: discord.Message, content:
     if failed:
         msg += f"\n送信失敗: {', '.join(str(x) for x in failed)}"
     await message.channel.send(msg)
+    return True
+
+
+async def maybe_handle_parent_usage_single(message: discord.Message, content: str) -> bool:
+    """「使い方の説明」コマンドでコマンドを送ったチャンネル1つだけに使い方を送信する（親のみ）。
+    「使い方の説明と初期設定」（全チャンネル一斉）より後に判定すること。"""
+    if not _is_parent(message.author.id):
+        return False
+
+    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
+    body = mention_body if mention_body is not None else (content or "")
+    normalized = _normalize_japanese_command(body)
+    # 「と初期設定」付きは一斉送信コマンドなのでここでは除外する
+    is_cmd = (
+        "使い方の説明" in normalized
+        or "つかいかたのせつめい" in normalized
+    ) and (
+        "初期設定" not in normalized
+        and "しょきせってい" not in normalized
+    )
+    if not is_cmd:
+        return False
+
+    # コマンドを送ったチャンネルに直接送信する
+    await message.channel.send(_usage_guide_text())
+    await message.channel.send("（このチャンネル単体への送信だよ。全チャンネルへ送る場合は「使い方の説明と初期設定」を使ってね）")
     return True
 
 
