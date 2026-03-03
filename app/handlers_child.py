@@ -24,7 +24,7 @@ from app.config import (
     get_log_dir,
     get_parent_ids,
 )
-from app.storage import JST
+from app.storage import append_jsonl, now_jst_iso, JST
 
 # モジュールレベルの依存オブジェクト — init() で bot.py から注入する
 _wallet_service = None
@@ -317,6 +317,20 @@ async def maybe_handle_manual_expense(
         action="manual_expense",
         note=note,
     )
+    # pocket_journal にも同時記録する（振り返り・分析で金額が見えるようにする）
+    log_dir = get_log_dir(system_conf)
+    journal_path = log_dir / f"{user_name}_pocket_journal.jsonl"
+    append_jsonl(journal_path, {
+        "ts": now_jst_iso(),
+        "discord_user_id": message.author.id,
+        "name": user_name,
+        # メモがあればそれを品目とし、なければ「支出」と記録する
+        "item": note if note else "支出",
+        "reason": "手動支出",
+        "reason_word_count": 0,
+        "satisfaction": None,
+        "amount": amount,
+    })
     await message.channel.send(
         f"支出を記録したよ。"
         f"\n- 金額: {amount}円"

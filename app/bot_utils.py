@@ -431,19 +431,26 @@ def _child_review_message(
             "買ったものがあれば「支出記録」で記録してみてね。"
         )
 
-    # 満足度の平均を算出する（0〜10 の整数が入っている前提）
-    avg_sat = sum(int(r.get("satisfaction", 0)) for r in month_rows) / count
+    # 満足度の平均を算出する（satisfaction が None のレコードは除外する）
+    sat_rows = [r for r in month_rows if r.get("satisfaction") is not None]
+    avg_sat = sum(int(r["satisfaction"]) for r in sat_rows) / len(sat_rows) if sat_rows else None
     # 品目の出現頻度を集計して Top3 を取得する
     item_counts = Counter(str(r.get("item", "")).strip() for r in month_rows if r.get("item"))
     top3 = [item for item, _ in item_counts.most_common(3)]
     top3_str = "・".join(top3) if top3 else "なし"
+    # amount フィールドがあるレコードを集計して総支出額を算出する
+    total_amount = sum(int(r["amount"]) for r in month_rows if r.get("amount") is not None)
+    # 金額集計行は合計額が1円以上のときのみ表示する
+    amount_line = f"{total_amount:,}円" if total_amount > 0 else "記録なし"
+    sat_line = f"{avg_sat:.1f}/10" if avg_sat is not None else "記録なし"
 
     if age is not None and age <= 9:
         # 低学年向け — ひらがな多め、シンプルな構成にする
         return (
             f"【{name}さんの{month}月のきろく】\n"
             f"かいたもの: {count}回\n"
-            f"まんぞくど: {avg_sat:.1f}/10\n"
+            f"つかったがく: {amount_line}\n"
+            f"まんぞくど: {sat_line}\n"
             f"かったもの: {top3_str}\n"
             f"いまのざんだか: {balance:,}円"
         )
@@ -452,7 +459,8 @@ def _child_review_message(
         return (
             f"【{name}さんの{month}月の振り返り】\n"
             f"支出件数: {count}件\n"
-            f"満足度平均: {avg_sat:.1f}/10\n"
+            f"支出合計: {amount_line}\n"
+            f"満足度平均: {sat_line}\n"
             f"使ったもの: {top3_str}\n"
             f"現在残高: {balance:,}円"
         )
@@ -460,7 +468,8 @@ def _child_review_message(
     return (
         f"【{name}さんの{month}月の支出まとめ】\n"
         f"件数: {count}件\n"
-        f"満足度平均: {avg_sat:.1f}/10\n"
+        f"合計支出: {amount_line}\n"
+        f"満足度平均: {sat_line}\n"
         f"主な支出: {top3_str}\n"
         f"現在残高: {balance:,}円"
     )

@@ -250,6 +250,8 @@ async def maybe_handle_spending_record_flow(
 
     log_dir = get_log_dir(system_conf)
     journal_path = log_dir / f"{user_conf['name']}_pocket_journal.jsonl"
+    # amount フィールドは任意（省略時は None）— 後方互換性あり
+    amount = parsed.get("amount")
     record = {
         "ts": now_jst_iso(),
         "discord_user_id": message.author.id,
@@ -258,17 +260,21 @@ async def maybe_handle_spending_record_flow(
         "reason": parsed["reason"],
         "reason_word_count": reason_words,
         "satisfaction": parsed["satisfaction"],
+        "amount": amount,
     }
     append_jsonl(journal_path, record)
     compare_msg = _self_compare_message(log_dir, str(user_conf.get("name", "")), int(parsed["satisfaction"]))
     pending.pop(user_name, None)
     state["spending_record_pending_by_user"] = pending
     wallet_service.save_audit_state(state)
+    # 金額が入力されている場合は記録内容に表示する
+    amount_line = f"\n- 金額: {amount:,}円" if amount is not None else ""
     await message.channel.send(
         "システムにお小遣い帳を記録したよ。"
         f"\n- 使った物: {parsed['item']}"
         f"\n- 理由: {parsed['reason']}"
         f"\n- 満足度: {parsed['satisfaction']}/10"
+        f"{amount_line}"
         f"\n- 比較: {compare_msg}"
     )
     return True
