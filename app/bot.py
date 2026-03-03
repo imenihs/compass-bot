@@ -6,19 +6,14 @@ import discord
 from datetime import datetime
 
 from app.bot_utils import (
-    _assessment_history_message,
     _build_goal_achieved_message,
-    _child_review_message,
     _contains_any_keyword,
     _contains_force_assess_keyword,
     _extract_keyword_hits,
-    _is_same_month,
     _latest_assessed_amount,
     _load_jsonl,
     _monthly_increase_stats,
     _normalize_assessed_amounts,
-    _normalize_japanese_command,
-    _normalize_keyword,
     _parse_fixed_delta_request,
     _parse_yen_amount,
     _progress_bar,
@@ -26,7 +21,6 @@ from app.bot_utils import (
     _rough_word_count,
     _self_compare_message,
     _spending_analysis_for_user,
-    _ledger_history_message,
     _usage_guide_text,
     _usage_guide_text_parent,
 )
@@ -40,7 +34,6 @@ from app.config import (
     get_force_assess_test_keyword,
     get_gemini_model,
     get_log_dir,
-    update_user_field,
     get_low_balance_alert_setting,
     get_monthly_summary_setting,
     get_parent_ids,
@@ -61,6 +54,8 @@ from app.prompts import build_prompt
 from app.reminder_service import ReminderService
 from app.storage import append_jsonl, now_jst_iso, JST
 from app.wallet_service import WalletService
+# 分割したハンドラモジュール（親向け・子供向け）を読み込む
+from app import handlers_parent, handlers_child
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -217,45 +212,6 @@ async def maybe_handle_help_and_initial_setup(
 
     return False
 
-async def maybe_handle_parent_broadcast_guide(message: discord.Message, content: str) -> bool:
-    if not is_parent(message.author.id):
-        return False
-
-    mention_body = extract_input_from_mention((content or "").strip(), client.user)
-    body = mention_body if mention_body is not None else (content or "")
-    normalized = _normalize_japanese_command(body)
-    is_cmd = (
-        "使い方の説明と初期設定" in normalized
-        or "つかいかたのせつめいとしょきせってい" in normalized
-    )
-    if not is_cmd:
-        return False
-
-    channel_ids = get_allow_channel_ids()
-    if not channel_ids:
-        await message.channel.send(
-            "`settings/setting.json` の `allow_channel_ids` が未設定なので一斉通知できないよ。"
-        )
-        return True
-
-    sent = 0
-    failed: list[str] = []
-    text = _usage_guide_text()
-    for cid in sorted(channel_ids):
-        try:
-            channel = client.get_channel(int(cid))
-            if channel is None:
-                channel = await client.fetch_channel(int(cid))
-            await channel.send(text)
-            sent += 1
-        except Exception as e:
-            failed.append(f"{cid}({type(e).__name__})")
-
-    msg = f"使い方と初期設定のアナウンスを {sent}/{len(channel_ids)} チャネルに送信したよ。"
-    if failed:
-        msg += f"\n送信失敗: {', '.join(str(x) for x in failed)}"
-    await message.channel.send(msg)
-    return True
 
 async def maybe_handle_spending_record_flow(
     message: discord.Message,
@@ -316,679 +272,6 @@ async def maybe_handle_spending_record_flow(
         f"\n- 比較: {compare_msg}"
     )
     return True
-
-async def maybe_handle_savings_goal(
-    message: discord.Message,
-    user_conf: dict,
-    input_block: str,
-) -> bool:
-    """貯金目標の追加・確認・削除コマンドを処理する（Feature 5 複数目標対応版）"""
-    user_name = str(user_conf.get("name", ""))
-    # ユーザー名が取得できない場合は処理不可のためスキップする
-    if not user_name:
-        return False
-
-    # 「貯金目標 タイトル 金額円」パターン — 追加または同名タイトルの金額更新
-    set_match = re.match(r"^貯金目標\s+(.+?)\s+(\d[\d,]*)\s*円?$", input_block.strip())
-    # 「目標確認」パターン — 全目標をリスト表示する
-    is_check = _contains_any_keyword(input_block, ["目標確認", "もくひょうかくにん"])
-    # 「目標全削除」パターン — 全目標を一括削除する
-    is_clear_all = _contains_any_keyword(input_block, ["目標全削除", "もくひょうぜんさくじょ"])
-    # 「目標削除 タイトル」パターン — タイトル指定で1件削除する
-    clear_title_match = re.match(r"^目標削除\s+(.+)$", input_block.strip())
-    # 「目標削除」のみ（引数なし）— どれを削除するか案内する
-    is_clear_bare = bool(re.match(r"^目標削除\s*$", input_block.strip()))
-
-    # いずれにも該当しなければ次のハンドラへ委譲する
-    if not set_match and not is_check and not is_clear_all and not clear_title_match and not is_clear_bare:
-        return False
-
-    current = wallet_service.get_balance(user_name)
-
-    # 目標追加・更新: add_savings_goal は同名なら金額更新、新規なら追加する
-    if set_match:
-        title = set_match.group(1).strip()
-        target_amount = int(set_match.group(2).replace(",", ""))
-        success, result = wallet_service.add_savings_goal(user_name, title, target_amount)
-        # 上限超過の場合は result にエラーメッセージが入っている
-        if not success:
-            await message.channel.send(result)
-            return True
-        bar = _progress_bar(current, target_amount)
-        action_word = "更新" if result == "updated" else "追加"
-        await message.channel.send(
-            f"貯金目標を{action_word}したよ。\n"
-            f"・目標: {title} {target_amount:,}円\n"
-            f"・現在残高: {current:,}円\n"
-            f"・進捗: {bar}"
-        )
-        return True
-
-    # 全削除
-    if is_clear_all:
-        wallet_service.clear_all_savings_goals(user_name)
-        await message.channel.send(f"{user_name}の貯金目標を全て削除したよ。")
-        return True
-
-    # タイトル指定削除
-    if clear_title_match:
-        title = clear_title_match.group(1).strip()
-        found = wallet_service.remove_savings_goal(user_name, title)
-        if found:
-            await message.channel.send(f"目標「{title}」を削除したよ。")
-        else:
-            await message.channel.send(f"目標「{title}」は見つからなかったよ。")
-        return True
-
-    # 引数なし削除 — 一覧を見せてタイトル指定を促す
-    if is_clear_bare:
-        goals = wallet_service.get_savings_goals(user_name)
-        if not goals:
-            await message.channel.send("削除する目標がないよ。")
-        else:
-            goal_list = "\n".join(f"・{g['title']}" for g in goals)
-            await message.channel.send(
-                "どの目標を削除する？\n"
-                f"{goal_list}\n"
-                "「目標削除 タイトル」で削除できるよ。全部消す場合は「目標全削除」ね。"
-            )
-        return True
-
-    # 目標確認: 全目標をプログレスバー付きで一覧表示する
-    if is_check:
-        goals = wallet_service.get_savings_goals(user_name)
-        if not goals:
-            await message.channel.send(
-                "貯金目標がまだ設定されてないよ。\n"
-                "`貯金目標 ゲーム機 30000円` の形で設定してね。"
-            )
-            return True
-        lines = [f"【{user_name}の貯金目標（残高: {current:,}円）】"]
-        for g in goals:
-            title = str(g.get("title", ""))
-            target_amount = int(g.get("target_amount", 0))
-            bar = _progress_bar(current, target_amount)
-            # 残り金額が負にならないよう 0 でクランプする
-            remaining = max(target_amount - current, 0)
-            lines.append(
-                f"\n・{title}: {target_amount:,}円\n"
-                f"  進捗: {bar}\n"
-                f"  あと: {remaining:,}円"
-            )
-        await message.channel.send("\n".join(lines))
-        return True
-
-    return False
-
-
-async def maybe_handle_child_review(
-    message: discord.Message,
-    user_conf: dict,
-    system_conf: dict,
-    input_block: str,
-) -> bool:
-    """子供向け今月の振り返りコマンドを処理する（Feature 6）。
-    「振り返り」「今月の振り返り」などで起動し、当月の支出記録サマリーを返す。"""
-    # 対応キーワードを列挙する（ひらがな表記も受け付ける）
-    review_keywords = ["振り返り", "ふりかえり", "今月の振り返り", "こんげつのふりかえり"]
-    if not _contains_any_keyword(input_block, review_keywords):
-        return False
-
-    user_name = str(user_conf.get("name", ""))
-    if not user_name:
-        return False
-
-    now = datetime.now(JST)
-    log_dir = get_log_dir(system_conf)
-    # 当月の pocket_journal を読み込んでフィルタリングする
-    journal_path = log_dir / f"{user_name}_pocket_journal.jsonl"
-    all_rows = _load_jsonl(journal_path)
-    month_rows = [
-        r for r in all_rows
-        if _is_same_month(r.get("ts"), now.year, now.month)
-    ]
-    # ウォレット残高を取得して振り返りメッセージに添える
-    balance = wallet_service.get_balance(user_name)
-    msg = _child_review_message(
-        user_conf=user_conf,
-        month_rows=month_rows,
-        balance=balance,
-        year=now.year,
-        month=now.month,
-    )
-    await message.channel.send(msg)
-    return True
-
-
-async def maybe_handle_assessment_history(
-    message: discord.Message,
-    user_conf: dict,
-    system_conf: dict,
-    input_block: str,
-) -> bool:
-    """査定履歴確認コマンドを処理する（Tier 2-E）。
-    「査定履歴」で直近5件の査定金額（固定・臨時・合計）を一覧表示する。"""
-    history_keywords = ["査定履歴", "さていれきし"]
-    if not _contains_any_keyword(input_block, history_keywords):
-        return False
-
-    user_name = str(user_conf.get("name", ""))
-    if not user_name:
-        return False
-
-    log_dir = get_log_dir(system_conf)
-    # allowance_amounts.jsonl から全件読み込んで末尾5件を取得する
-    amounts_path = log_dir / f"{user_name}_allowance_amounts.jsonl"
-    all_rows = _load_jsonl(amounts_path)
-    # 新しい順に並べるため末尾から取得し、表示は新→旧の順にする
-    recent = list(reversed(all_rows[-5:]))
-    msg = _assessment_history_message(user_conf=user_conf, rows=recent)
-    await message.channel.send(msg)
-    return True
-
-
-async def maybe_handle_parent_dashboard(message: discord.Message, content: str) -> bool:
-    """親向けダッシュボード: 全ユーザーの残高・状況を一覧表示する（Feature 1）"""
-    # 親以外はこのコマンドを使えない
-    if not is_parent(message.author.id):
-        return False
-
-    # メンション部分を除去してコマンド本文を取得する
-    mention_body = extract_input_from_mention((content or "").strip(), client.user)
-    body = mention_body if mention_body is not None else (content or "")
-    normalized = _normalize_japanese_command(body)
-    # 「全体確認」「ぜんたいかくにん」のどちらでも反応する
-    if "全体確認" not in normalized and "ぜんたいかくにん" not in normalized:
-        return False
-
-    # ユーザー一覧・残高監査状態・ログディレクトリを取得する
-    system_conf = load_system()
-    log_dir = get_log_dir(system_conf)
-    # ユーザーを名前順にソートして表示順を安定させる
-    users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-    audit_state = wallet_service.load_audit_state()
-    # pending_by_user に名前があれば残高報告が未完了である
-    pending_by_user = audit_state.get("pending_by_user", {})
-
-    lines = ["【全体確認ダッシュボード】"]
-    for u in users:
-        name = str(u.get("name", ""))
-        fixed = int(u.get("fixed_allowance", 0))
-        balance = wallet_service.get_balance(name)
-        # 監査の pending 状態で報告済/未報告を判定する
-        report_status = "未報告" if name in pending_by_user else "報告済"
-
-        # 支出記録JSONL の末尾レコードから最終支出日を取得する
-        journal_path = log_dir / f"{name}_pocket_journal.jsonl"
-        journal_rows = _load_jsonl(journal_path)
-        last_spending_date = "なし"
-        if journal_rows:
-            last_ts = journal_rows[-1].get("ts")
-            if last_ts:
-                try:
-                    dt = datetime.fromisoformat(str(last_ts))
-                    # 月/日の形式で表示する（年は省略）
-                    last_spending_date = dt.strftime("%m/%d")
-                except Exception:
-                    pass
-
-        lines.append(
-            f"・{name}: 固定{fixed}円 / 残高{balance}円 / 残高報告:{report_status} / 最終支出:{last_spending_date}"
-        )
-
-    await message.channel.send("\n".join(lines))
-    return True
-
-
-async def maybe_handle_spending_analysis(message: discord.Message, content: str) -> bool:
-    """支出傾向分析コマンドを処理する: 「[name]の分析」または「全員の分析」（Feature 4、親専用）"""
-    # 親以外のアクセスは無視する
-    if not is_parent(message.author.id):
-        return False
-
-    # メンション除去後の本文を取得する
-    mention_body = extract_input_from_mention((content or "").strip(), client.user)
-    body = mention_body if mention_body is not None else (content or "")
-    body_stripped = body.strip()
-
-    # 「全員の分析」パターン — 正規化後の表記でも反応する
-    all_match = "全員の分析" in body_stripped or "ぜんいんのぶんせき" in _normalize_japanese_command(body_stripped)
-    # 「[name]の分析」パターン — 名前部分を正規表現で抽出する
-    name_match = re.search(r"(.+)の分析", body_stripped)
-
-    # いずれのパターンにも該当しない場合は次のハンドラへ委譲する
-    if not all_match and not name_match:
-        return False
-
-    system_conf = load_system()
-    log_dir = get_log_dir(system_conf)
-    # 過去3ヶ月の集計基準日として現在時刻を使用する
-    now_dt = datetime.now(JST)
-
-    if all_match:
-        # 全ユーザーの分析テキストをまとめて生成する
-        users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-        parts = [_spending_analysis_for_user(log_dir, str(u.get("name", "")), now_dt) for u in users]
-        reply = "\n\n".join(parts) if parts else "ユーザーが見つからないよ。"
-    else:
-        # 特定ユーザー名を正規表現グループから取得する
-        target_name = name_match.group(1).strip()
-        reply = _spending_analysis_for_user(log_dir, target_name, now_dt)
-
-    # Discord の1メッセージ文字数上限（2000文字）を超えないよう 1900 文字で分割する
-    if len(reply) > 1900:
-        for i in range(0, len(reply), 1900):
-            await message.channel.send(reply[i: i + 1900])
-    else:
-        await message.channel.send(reply)
-    return True
-
-
-async def maybe_handle_wallet_audit_send(message: discord.Message, content: str) -> bool:
-    mention_body = extract_input_from_mention((content or "").strip(), client.user)
-    if not (mention_body and mention_body.strip() in {"残高チェック送信", "月頭案内送信"}):
-        return False
-
-    if not is_parent(message.author.id):
-        await message.channel.send("残高チェック送信は親のみ実行できるよ。")
-        return True
-
-    try:
-        await reminder_service.send_wallet_audit()
-        await message.channel.send("残高チェック案内を送信したよ。")
-    except Exception as e:
-        await message.channel.send(f"送信に失敗したよ。原因: {type(e).__name__}: {e}")
-    return True
-
-
-async def maybe_handle_reminder_test(message: discord.Message, content: str) -> bool:
-    mention_body = extract_input_from_mention((content or "").strip(), client.user)
-    is_test_cmd = bool(
-        mention_body
-        and mention_body.strip().lower()
-        in {"reminder test", "reminder-test", "リマインダーテスト", "リマインダー テスト"}
-    )
-    if not is_test_cmd:
-        return False
-
-    if not is_parent(message.author.id):
-        await message.channel.send("リマインダーテストは親のみ実行できるよ。")
-        return True
-
-    channel_id = ALLOWANCE_REMINDER.get("channel_id")
-    if not channel_id:
-        await message.channel.send("`settings/setting.json` の `allowance_reminder.channel_id` を設定してね。")
-        return True
-
-    payday = reminder_service.next_payday(today=datetime.now(JST).date(), payday_day=int(ALLOWANCE_REMINDER["payday_day"]))
-    try:
-        await reminder_service.send_allowance_reminder(payday=payday, channel_id=int(channel_id), is_test=True)
-        await message.channel.send("リマインダーをテスト送信したよ。")
-    except Exception as e:
-        await message.channel.send(f"テスト送信に失敗したよ。原因: {type(e).__name__}: {e}")
-    return True
-
-async def maybe_handle_manual_grant(message: discord.Message, content: str) -> bool:
-    """親が手動でお小遣いを支給するコマンドを処理する（親のみ）。
-    「支給 たろう 700円」の形式にマッチする。"""
-    # 親以外は無視する
-    if not is_parent(message.author.id):
-        return False
-    # 先頭に「支給」を含む形式にマッチさせる（ユーザー名と金額が必須）
-    m = re.search(r"支給\s+(\S+)\s+(\d[\d,]*)\s*円", (content or "").strip())
-    if not m:
-        return False
-
-    target_name = m.group(1)
-    amount = int(m.group(2).replace(",", ""))
-
-    # 対象ユーザーを名前で検索する
-    target_conf = find_user_by_name(target_name)
-    if target_conf is None:
-        await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
-        return True
-
-    system_conf = load_system()
-    before = wallet_service.get_balance(target_name)
-    # allowance_grant（Gemini査定自動付与）と区別するため別のアクション名にする
-    new_balance, achieved_goals = wallet_service.update_balance(
-        user_conf=target_conf,
-        system_conf=system_conf,
-        delta=amount,
-        action="allowance_manual_grant",
-        note="manual_grant_by_parent",
-        extra={"granted_by": str(message.author.id)},
-    )
-    await message.channel.send(
-        f"{target_name}に支給したよ。"
-        f"\n- 金額: {amount}円"
-        f"\n残高: {before}円 → {new_balance}円"
-    )
-    # 支給により目標が達成された場合は祝福メッセージを送る
-    for achieved_goal in achieved_goals:
-        await message.channel.send(
-            _build_goal_achieved_message(user_conf=target_conf, goal=achieved_goal)
-        )
-    return True
-
-
-async def maybe_handle_balance_adjustment(message: discord.Message, content: str) -> bool:
-    """親が残高を直接調整するコマンドを処理する（親のみ）。
-    「残高調整 たろう +500円」「残高調整 たろう -300円」「残高調整 たろう 500円」の形式にマッチする。"""
-    # 親以外は無視する
-    if not is_parent(message.author.id):
-        return False
-    # 「残高調整」＋ユーザー名＋符号あり/なし金額の形式にマッチさせる
-    m = re.search(r"残高調整\s+(\S+)\s+([+-]?\d[\d,]*)\s*円", (content or "").strip())
-    if not m:
-        return False
-
-    target_name = m.group(1)
-    # 符号なしの場合は加算（正）として扱う
-    delta = int(m.group(2).replace(",", ""))
-
-    target_conf = find_user_by_name(target_name)
-    if target_conf is None:
-        await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
-        return True
-
-    system_conf = load_system()
-    before = wallet_service.get_balance(target_name)
-    new_balance, achieved_goals = wallet_service.update_balance(
-        user_conf=target_conf,
-        system_conf=system_conf,
-        delta=delta,
-        action="balance_adjustment",
-        note="manual_adjustment_by_parent",
-        extra={"adjusted_by": str(message.author.id)},
-    )
-    direction = "加算" if delta >= 0 else "減算"
-    await message.channel.send(
-        f"{target_name}の残高を調整したよ。"
-        f"\n- {direction}: {abs(delta)}円（{delta:+d}円）"
-        f"\n残高: {before}円 → {new_balance}円"
-    )
-    # 加算調整で目標が達成された場合は祝福メッセージを送る
-    for achieved_goal in achieved_goals:
-        await message.channel.send(
-            _build_goal_achieved_message(user_conf=target_conf, goal=achieved_goal)
-        )
-    return True
-
-
-async def maybe_handle_user_setting_change(message: discord.Message, content: str) -> bool:
-    """親がユーザーの固定お小遣い・臨時上限を変更するコマンドを処理する（親のみ）。
-    「設定変更 たろう 固定 800円」「設定変更 たろう 臨時 5000円」の形式にマッチする。"""
-    # 親以外は無視する
-    if not is_parent(message.author.id):
-        return False
-    # 「設定変更 ユーザー名 固定/臨時 金額円」の形式にマッチさせる
-    m = re.search(r"設定変更\s+(\S+)\s+(固定|臨時)\s+(\d[\d,]*)\s*円", (content or "").strip())
-    if not m:
-        return False
-
-    target_name = m.group(1)
-    setting_type = m.group(2)  # "固定" または "臨時"
-    amount = int(m.group(3).replace(",", ""))
-
-    # 対象ユーザーを名前で検索する
-    target_conf = find_user_by_name(target_name)
-    if target_conf is None:
-        await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
-        return True
-
-    # 変更対象フィールドと表示ラベルを決定する
-    if setting_type == "固定":
-        field = "fixed_allowance"
-        label = "固定お小遣い"
-    else:
-        field = "temporary_max"
-        label = "臨時お小遣い上限"
-
-    old_value = int(target_conf.get(field, 0))
-
-    # users/*.json ファイルの対象フィールドを書き換える
-    if not update_user_field(target_name, field, amount):
-        await message.channel.send(f"{target_name}の設定ファイルの更新に失敗したよ。")
-        return True
-
-    await message.channel.send(
-        f"{target_name}の{label}を変更したよ。"
-        f"\n{old_value}円 → {amount}円"
-    )
-    return True
-
-
-async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> bool:
-    """親が全ユーザーに固定お小遣いを一括支給するコマンドを処理する（親のみ）。
-    全ユーザーの fixed_allowance を残高に加算し、結果を一覧表示する。"""
-    if not is_parent(message.author.id):
-        return False
-    # 誤作動を防ぐため完全一致で判定する
-    if (content or "").strip() != "一括支給":
-        return False
-
-    users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-    if not users:
-        await message.channel.send("ユーザーが設定されていないよ。")
-        return True
-
-    system_conf = load_system()
-    lines = ["【一括支給完了】"]
-    # 全ユーザーを走査して fixed_allowance を残高に加算する
-    for u in users:
-        name = str(u.get("name", ""))
-        amount = int(u.get("fixed_allowance", 0))
-        # 固定お小遣いが設定されていないユーザーはスキップする
-        if amount <= 0:
-            lines.append(f"・{name}: スキップ（固定額未設定）")
-            continue
-        new_balance, achieved_goals = wallet_service.update_balance(
-            user_conf=u,
-            system_conf=system_conf,
-            delta=amount,
-            action="allowance_monthly_auto_grant",
-            note="bulk_grant_by_parent",
-            extra={"granted_by": str(message.author.id)},
-        )
-        lines.append(f"・{name}: +{amount}円 → {new_balance}円")
-        # 支給により目標が達成された場合は祝福メッセージを送る
-        for achieved_goal in achieved_goals:
-            await message.channel.send(
-                _build_goal_achieved_message(user_conf=u, goal=achieved_goal)
-            )
-
-    await message.channel.send("\n".join(lines))
-    return True
-
-
-async def maybe_handle_parent_announce(message: discord.Message, content: str) -> bool:
-    """親が任意メッセージを全 allow チャンネルに一斉送信するコマンドを処理する（親のみ）。
-    「アナウンス [本文]」の形式にマッチする。メンションあり/なしどちらも対応する。"""
-    if not is_parent(message.author.id):
-        return False
-
-    body = (content or "").strip()
-    # メンションが含まれる場合は除去した本文を使う
-    mention_body = extract_input_from_mention(body, client.user)
-    target = mention_body if mention_body is not None else body
-
-    # 「アナウンス 本文」の形式を抽出する（本文は複数行にも対応）
-    m = re.match(r"^アナウンス\s+(.+)$", target.strip(), re.DOTALL)
-    if not m:
-        return False
-
-    announce_text = m.group(1).strip()
-    channel_ids = get_allow_channel_ids()
-    if not channel_ids:
-        await message.channel.send("`allow_channel_ids` が未設定なので一斉送信できないよ。")
-        return True
-
-    sent = 0
-    failed: list[str] = []
-    # 全 allow チャンネルに「【アナウンス】本文」を送信する
-    for cid in sorted(channel_ids):
-        try:
-            channel = client.get_channel(int(cid))
-            if channel is None:
-                channel = await client.fetch_channel(int(cid))
-            await channel.send(f"【アナウンス】\n{announce_text}")
-            sent += 1
-        except Exception as e:
-            failed.append(str(cid))
-
-    if failed:
-        await message.channel.send(
-            f"{sent}チャンネルに送信したよ。失敗チャンネル: {', '.join(failed)}"
-        )
-    else:
-        await message.channel.send(f"{sent}チャンネルに送信したよ。")
-    return True
-
-
-async def maybe_handle_manual_expense(
-    message: discord.Message,
-    user_conf: dict,
-    system_conf: dict,
-    input_block: str,
-) -> bool:
-    """子供（または親の代理）が手動で支出を記録するコマンドを処理する。
-    「支出 500円 お菓子」の形式にマッチする。残高から差し引く。"""
-    # 「支出 金額円 メモ」の形式にマッチさせる（メモは省略可）
-    m = re.match(r"^支出\s+(\d[\d,]*)\s*円\s*(.*)?$", (input_block or "").strip())
-    if not m:
-        return False
-
-    amount = int(m.group(1).replace(",", ""))
-    note = (m.group(2) or "").strip()
-    user_name = str(user_conf.get("name", ""))
-    before = wallet_service.get_balance(user_name)
-
-    # delta を負にして残高を減算する
-    new_balance, _ = wallet_service.update_balance(
-        user_conf=user_conf,
-        system_conf=system_conf,
-        delta=-amount,
-        action="manual_expense",
-        note=note,
-    )
-    await message.channel.send(
-        f"支出を記録したよ。"
-        f"\n- 金額: {amount}円"
-        f"\n- メモ: {note if note else 'なし'}"
-        f"\n残高: {before}円 → {new_balance}円"
-    )
-    # 支出後に残高が低下した場合のアラートチェックをする
-    await _maybe_send_low_balance_alert(user_conf=user_conf, new_balance=new_balance)
-    return True
-
-
-async def maybe_handle_ledger_history(
-    message: discord.Message,
-    user_conf: dict,
-    system_conf: dict,
-    input_block: str,
-) -> bool:
-    """入出金台帳の履歴を表示するコマンドを処理する。
-    「入出金履歴」「台帳確認」→ 自分の履歴。親は「たろうの台帳」で他ユーザーも参照可能。"""
-    body = (input_block or "").strip()
-
-    # 「たろうの台帳」「たろうの入出金履歴」形式のパターン（親のみ）
-    m_target = re.match(r"^(.+)の(?:台帳|入出金履歴)$", body)
-    if m_target:
-        target_name = m_target.group(1).strip()
-        # 「全員の台帳」は対応しないので無視して通過させる（分析コマンドとの混在防止）
-        if target_name == "全員":
-            return False
-        if not is_parent(message.author.id):
-            await message.channel.send("他のユーザーの台帳確認は親のみできるよ。")
-            return True
-        target_conf = find_user_by_name(target_name)
-        if target_conf is None:
-            await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
-            return True
-        view_conf = target_conf
-    elif body in {"入出金履歴", "台帳確認"}:
-        # 自分の履歴を表示する
-        view_conf = user_conf
-    else:
-        return False
-
-    # wallet_ledger.jsonl を読み込んで直近 10 件を表示する
-    log_dir = get_log_dir(system_conf)
-    ledger_path = log_dir / f"{view_conf.get('name', '')}_wallet_ledger.jsonl"
-    rows = _load_jsonl(ledger_path)
-    await message.channel.send(_ledger_history_message(view_conf, rows))
-    return True
-
-
-async def maybe_handle_manual_income(
-    message: discord.Message,
-    user_conf: dict,
-    system_conf: dict,
-    input_block: str,
-) -> bool:
-    """子供（または親の代理）が臨時収入を記録するコマンドを処理する。
-    「入金 3000円 お年玉」の形式にマッチする。残高に加算する。"""
-    # 「入金 金額円 メモ」の形式にマッチさせる（メモは省略可）
-    m = re.match(r"^入金\s+(\d[\d,]*)\s*円\s*(.*)?$", (input_block or "").strip())
-    if not m:
-        return False
-
-    amount = int(m.group(1).replace(",", ""))
-    note = (m.group(2) or "").strip()
-    user_name = str(user_conf.get("name", ""))
-    before = wallet_service.get_balance(user_name)
-
-    # delta を正にして残高を加算する
-    new_balance, achieved_goals = wallet_service.update_balance(
-        user_conf=user_conf,
-        system_conf=system_conf,
-        delta=amount,
-        action="manual_income",
-        note=note,
-    )
-    await message.channel.send(
-        f"入金を記録したよ。"
-        f"\n- 金額: {amount}円"
-        f"\n- メモ: {note if note else 'なし'}"
-        f"\n残高: {before}円 → {new_balance}円"
-    )
-    # 入金により目標が達成された場合は祝福メッセージを送る
-    for achieved_goal in achieved_goals:
-        await message.channel.send(
-            _build_goal_achieved_message(user_conf=user_conf, goal=achieved_goal)
-        )
-    return True
-
-
-async def _maybe_send_low_balance_alert(user_conf: dict, new_balance: int) -> None:
-    """残高が閾値を下回ったとき親チャンネルへアラートを送信する（Feature 2）"""
-    cfg = LOW_BALANCE_ALERT
-    # 機能が無効化されていれば何もしない
-    if not cfg.get("enabled"):
-        return
-    channel_id = cfg.get("channel_id")
-    # 送信先チャンネルが未設定の場合はスキップする
-    if not channel_id:
-        return
-    threshold = int(cfg.get("threshold", 500))
-    # 新残高が閾値以上であればアラート不要
-    if new_balance >= threshold:
-        return
-
-    name = str(user_conf.get("name", ""))
-    try:
-        # キャッシュにチャンネルがない場合は API で取得する
-        channel = client.get_channel(int(channel_id))
-        if channel is None:
-            channel = await client.fetch_channel(int(channel_id))
-        await channel.send(
-            f"【低残高アラート】{name}さんの残高が{new_balance}円になりました（閾値:{threshold}円）。"
-        )
-    except Exception as e:
-        # アラート失敗はボット動作を止めないためログ出力のみとする
-        print(f"Low balance alert error: {e}")
 
 
 async def _detect_command_intent(input_block: str) -> dict | None:
@@ -1204,6 +487,18 @@ async def send_assessment_change_notice(
 @client.event
 async def on_ready():
     print(f"Compass logged in as {client.user}")
+    # 分割したハンドラモジュールに依存オブジェクトを注入する
+    handlers_parent.init(
+        wallet_service=wallet_service,
+        client=client,
+        reminder_service=reminder_service,
+        allowance_reminder_conf=ALLOWANCE_REMINDER,
+    )
+    handlers_child.init(
+        wallet_service=wallet_service,
+        client=client,
+        low_balance_alert_conf=LOW_BALANCE_ALERT,
+    )
     reminder_service.start_loop_if_needed()
     print("Allowance reminder loop started")
 
@@ -1214,7 +509,8 @@ async def on_message(message: discord.Message):
         return
 
     content = (message.content or "").strip()
-    if await maybe_handle_parent_broadcast_guide(message, content):
+    # 「使い方の説明と初期設定」は全チャンネルへの一斉通知のため最優先で処理する
+    if await handlers_parent.maybe_handle_parent_broadcast_guide(message, content):
         return
 
     if ALLOW_CHANNEL_IDS is not None and message.channel.id not in ALLOW_CHANNEL_IDS:
@@ -1224,36 +520,36 @@ async def on_message(message: discord.Message):
         await message.channel.send("`[#SH-xxx]`形式は非対応です。`@compass-bot 内容` で送ってね。")
         return
 
-    if await maybe_handle_parent_dashboard(message, content):
+    if await handlers_parent.maybe_handle_parent_dashboard(message, content):
         return
 
-    if await maybe_handle_spending_analysis(message, content):
+    if await handlers_parent.maybe_handle_spending_analysis(message, content):
         return
 
-    if await maybe_handle_wallet_audit_send(message, content):
+    if await handlers_parent.maybe_handle_wallet_audit_send(message, content):
         return
 
-    if await maybe_handle_reminder_test(message, content):
+    if await handlers_parent.maybe_handle_reminder_test(message, content):
         return
 
     # 親による支給コマンド（「支給 たろう 700円」）
-    if await maybe_handle_manual_grant(message, content):
+    if await handlers_parent.maybe_handle_manual_grant(message, content):
         return
 
     # 親による残高調整コマンド（「残高調整 たろう +500円」）
-    if await maybe_handle_balance_adjustment(message, content):
+    if await handlers_parent.maybe_handle_balance_adjustment(message, content):
         return
 
     # 親による設定変更コマンド（「設定変更 たろう 固定 800円」）
-    if await maybe_handle_user_setting_change(message, content):
+    if await handlers_parent.maybe_handle_user_setting_change(message, content):
         return
 
     # 親による全ユーザー一括支給コマンド（「一括支給」）
-    if await maybe_handle_bulk_grant(message, content):
+    if await handlers_parent.maybe_handle_bulk_grant(message, content):
         return
 
     # 親による全チャンネル一斉アナウンス（「アナウンス [本文]」）
-    if await maybe_handle_parent_announce(message, content):
+    if await handlers_parent.maybe_handle_parent_announce(message, content):
         return
 
     mention_input = extract_input_from_mention(content, client.user)
@@ -1302,14 +598,14 @@ async def on_message(message: discord.Message):
     ):
         return
 
-    if await maybe_handle_savings_goal(
+    if await handlers_child.maybe_handle_savings_goal(
         message=message,
         user_conf=user_conf,
         input_block=input_block,
     ):
         return
 
-    if await maybe_handle_child_review(
+    if await handlers_child.maybe_handle_child_review(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
@@ -1317,7 +613,7 @@ async def on_message(message: discord.Message):
     ):
         return
 
-    if await maybe_handle_assessment_history(
+    if await handlers_child.maybe_handle_assessment_history(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
@@ -1326,7 +622,7 @@ async def on_message(message: discord.Message):
         return
 
     # 入出金台帳確認コマンド（「入出金履歴」「台帳確認」「たろうの台帳」）
-    if await maybe_handle_ledger_history(
+    if await handlers_child.maybe_handle_ledger_history(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
@@ -1335,7 +631,7 @@ async def on_message(message: discord.Message):
         return
 
     # 子供による手動支出コマンド（「支出 500円 お菓子」）
-    if await maybe_handle_manual_expense(
+    if await handlers_child.maybe_handle_manual_expense(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
@@ -1344,7 +640,7 @@ async def on_message(message: discord.Message):
         return
 
     # 子供による臨時入金コマンド（「入金 3000円 お年玉」）
-    if await maybe_handle_manual_income(
+    if await handlers_child.maybe_handle_manual_income(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
@@ -1512,7 +808,7 @@ async def on_message(message: discord.Message):
             print("assessment change notify error:", e)
             await message.channel.send(f"査定変更通知の送信に失敗したよ。原因: {type(e).__name__}: {e}")
         if assessed.get("total") is not None:
-            # tuple で (更新後残高, 達成した目標 or None) が返る
+            # tuple で (更新後残高, 達成した目標リスト) が返る
             new_balance, achieved_goals = wallet_service.update_balance(
                 user_conf=user_conf,
                 system_conf=system_conf,
@@ -1521,7 +817,8 @@ async def on_message(message: discord.Message):
                 note="gemini_assessed_total",
                 extra={"discord_user_id": int(message.author.id)},
             )
-            await _maybe_send_low_balance_alert(user_conf=user_conf, new_balance=new_balance)
+            # 残高低下時は親へアラートを送信する（handlers_child に移管済み）
+            await handlers_child.maybe_send_low_balance_alert(user_conf=user_conf, new_balance=new_balance)
             # 達成した目標ごとに祝福メッセージを送信する（複数同時達成もあり得る）
             for achieved_goal in achieved_goals:
                 await message.channel.send(
