@@ -37,7 +37,8 @@ def _usage_guide_text() -> str:
         "\n"
         "■ 振り返り・履歴\n"
         "・今月の振り返り: `振り返り`\n"
-        "・査定履歴: `査定履歴`"
+        "・査定履歴: `査定履歴`\n"
+        "・入出金履歴: `入出金履歴` または `台帳確認`"
     )
 
 
@@ -506,6 +507,66 @@ def _assessment_history_message(user_conf: dict, rows: list[dict]) -> str:
         header = f"【{name}さんのさていのきろく（さいきん{len(rows)}かい）】"
     else:
         header = f"【{name}さんの査定履歴（直近{len(rows)}件）】"
+
+    return header + "\n" + "\n".join(lines)
+
+
+def _ledger_history_message(user_conf: dict, rows: list[dict], limit: int = 10) -> str:
+    """入出金台帳の直近N件を一覧形式でまとめて返す。
+    rows は wallet_ledger.jsonl の全件を想定し、この関数内で末尾 limit 件に絞る。"""
+    name = user_conf.get("name", "")
+    raw_age = user_conf.get("age")
+    # 年齢を int に正規化する
+    if isinstance(raw_age, int):
+        age = raw_age
+    elif isinstance(raw_age, str) and raw_age.strip().isdigit():
+        age = int(raw_age.strip())
+    else:
+        age = None
+
+    # 末尾（最新）から limit 件を取り出して新しい順に並べる
+    recent = list(reversed(rows[-limit:])) if rows else []
+
+    # 記録がない場合は空の旨を伝える
+    if not recent:
+        if age is not None and age <= 9:
+            return f"{name}さん、まだ入出金のきろくはないよ！"
+        return f"{name}さん、まだ入出金の記録はないよ。"
+
+    # action を日本語ラベルに変換するマッピング
+    ACTION_LABELS = {
+        "initial_setup":             "初期設定",
+        "allowance_grant":           "査定支給",
+        "allowance_manual_grant":    "手動支給",
+        "allowance_monthly_auto_grant": "月次支給",
+        "manual_expense":            "手動支出",
+        "manual_income":             "臨時入金",
+        "balance_adjustment":        "残高調整",
+        "penalty":                   "ペナルティ",
+    }
+
+    lines = []
+    for r in recent:
+        # タイムスタンプを「月/日」に整形する
+        ts_str = r.get("ts", "")
+        try:
+            dt = datetime.fromisoformat(str(ts_str))
+            date_label = f"{dt.month}/{dt.day}"
+        except Exception:
+            date_label = "?"
+
+        action = str(r.get("action", ""))
+        label = ACTION_LABELS.get(action, action)
+        delta = int(r.get("delta", 0))
+        after = int(r.get("balance_after", 0))
+        # delta の符号を明示して方向が一目でわかるようにする
+        delta_str = f"{delta:+d}円"
+        lines.append(f"  {date_label}  {label}  {delta_str}  → {after}円")
+
+    if age is not None and age <= 9:
+        header = f"【{name}さんのお金のきろく（さいきん{len(recent)}けん）】"
+    else:
+        header = f"【{name}さんの入出金履歴（直近{len(recent)}件）】"
 
     return header + "\n" + "\n".join(lines)
 

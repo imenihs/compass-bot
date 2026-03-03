@@ -26,6 +26,7 @@ from app.bot_utils import (
     _rough_word_count,
     _self_compare_message,
     _spending_analysis_for_user,
+    _ledger_history_message,
     _usage_guide_text,
     _usage_guide_text_parent,
 )
@@ -795,6 +796,45 @@ async def maybe_handle_manual_expense(
     return True
 
 
+async def maybe_handle_ledger_history(
+    message: discord.Message,
+    user_conf: dict,
+    system_conf: dict,
+    input_block: str,
+) -> bool:
+    """入出金台帳の履歴を表示するコマンドを処理する。
+    「入出金履歴」「台帳確認」→ 自分の履歴。親は「たろうの台帳」で他ユーザーも参照可能。"""
+    body = (input_block or "").strip()
+
+    # 「たろうの台帳」「たろうの入出金履歴」形式のパターン（親のみ）
+    m_target = re.match(r"^(.+)の(?:台帳|入出金履歴)$", body)
+    if m_target:
+        target_name = m_target.group(1).strip()
+        # 「全員の台帳」は対応しないので無視して通過させる（分析コマンドとの混在防止）
+        if target_name == "全員":
+            return False
+        if not is_parent(message.author.id):
+            await message.channel.send("他のユーザーの台帳確認は親のみできるよ。")
+            return True
+        target_conf = find_user_by_name(target_name)
+        if target_conf is None:
+            await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
+            return True
+        view_conf = target_conf
+    elif body in {"入出金履歴", "台帳確認"}:
+        # 自分の履歴を表示する
+        view_conf = user_conf
+    else:
+        return False
+
+    # wallet_ledger.jsonl を読み込んで直近 10 件を表示する
+    log_dir = get_log_dir(system_conf)
+    ledger_path = log_dir / f"{view_conf.get('name', '')}_wallet_ledger.jsonl"
+    rows = _load_jsonl(ledger_path)
+    await message.channel.send(_ledger_history_message(view_conf, rows))
+    return True
+
+
 async def maybe_handle_manual_income(
     message: discord.Message,
     user_conf: dict,
@@ -1183,6 +1223,15 @@ async def on_message(message: discord.Message):
         return
 
     if await maybe_handle_assessment_history(
+        message=message,
+        user_conf=user_conf,
+        system_conf=system_conf,
+        input_block=input_block,
+    ):
+        return
+
+    # 入出金台帳確認コマンド（「入出金履歴」「台帳確認」「たろうの台帳」）
+    if await maybe_handle_ledger_history(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
