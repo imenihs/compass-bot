@@ -39,6 +39,7 @@ from app.config import (
     get_force_assess_test_keyword,
     get_gemini_model,
     get_log_dir,
+    update_user_field,
     get_low_balance_alert_setting,
     get_monthly_summary_setting,
     get_parent_ids,
@@ -714,6 +715,49 @@ async def maybe_handle_balance_adjustment(message: discord.Message, content: str
     return True
 
 
+async def maybe_handle_user_setting_change(message: discord.Message, content: str) -> bool:
+    """親がユーザーの固定お小遣い・臨時上限を変更するコマンドを処理する（親のみ）。
+    「設定変更 たろう 固定 800円」「設定変更 たろう 臨時 5000円」の形式にマッチする。"""
+    # 親以外は無視する
+    if not is_parent(message.author.id):
+        return False
+    # 「設定変更 ユーザー名 固定/臨時 金額円」の形式にマッチさせる
+    m = re.search(r"設定変更\s+(\S+)\s+(固定|臨時)\s+(\d[\d,]*)\s*円", (content or "").strip())
+    if not m:
+        return False
+
+    target_name = m.group(1)
+    setting_type = m.group(2)  # "固定" または "臨時"
+    amount = int(m.group(3).replace(",", ""))
+
+    # 対象ユーザーを名前で検索する
+    target_conf = find_user_by_name(target_name)
+    if target_conf is None:
+        await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
+        return True
+
+    # 変更対象フィールドと表示ラベルを決定する
+    if setting_type == "固定":
+        field = "fixed_allowance"
+        label = "固定お小遣い"
+    else:
+        field = "temporary_max"
+        label = "臨時お小遣い上限"
+
+    old_value = int(target_conf.get(field, 0))
+
+    # users/*.json ファイルの対象フィールドを書き換える
+    if not update_user_field(target_name, field, amount):
+        await message.channel.send(f"{target_name}の設定ファイルの更新に失敗したよ。")
+        return True
+
+    await message.channel.send(
+        f"{target_name}の{label}を変更したよ。"
+        f"\n{old_value}円 → {amount}円"
+    )
+    return True
+
+
 async def maybe_handle_manual_expense(
     message: discord.Message,
     user_conf: dict,
@@ -1071,6 +1115,10 @@ async def on_message(message: discord.Message):
 
     # 親による残高調整コマンド（「残高調整 たろう +500円」）
     if await maybe_handle_balance_adjustment(message, content):
+        return
+
+    # 親による設定変更コマンド（「設定変更 たろう 固定 800円」）
+    if await maybe_handle_user_setting_change(message, content):
         return
 
     mention_input = extract_input_from_mention(content, client.user)

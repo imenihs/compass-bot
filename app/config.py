@@ -280,6 +280,38 @@ def get_pocket_journal_reminder_setting() -> dict:
     }
 
 
+def find_user_json_path_by_name(name: str) -> Path | None:
+    """ユーザー名に対応する users/*.json のファイルパスを返す。見つからなければ None を返す"""
+    target = (name or "").strip()
+    if not target:
+        return None
+    # 全ユーザーファイルを走査して name フィールドが一致するパスを返す
+    for p in USERS_DIR.glob("*.json"):
+        try:
+            data = _load_json(p)
+            if str(data.get("name", "")).strip() == target:
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def update_user_field(name: str, field: str, value) -> bool:
+    """ユーザーの設定ファイルの指定フィールドを更新して保存する。成功すれば True を返す"""
+    path = find_user_json_path_by_name(name)
+    if path is None:
+        return False
+    try:
+        data = _load_json(path)
+        # 指定フィールドを上書きして保存する
+        data[field] = value
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
 def get_log_dir(system_conf: dict) -> Path:
     rel = system_conf.get("log_dir", "data/logs")
     return ROOT / rel
