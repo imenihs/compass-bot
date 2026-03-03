@@ -46,11 +46,13 @@ def extract_input_from_mention(text: str, bot_user: discord.ClientUser | None) -
 
 def parse_usage_report(text: str) -> dict | None:
     """
-    お小遣い帳の3項目入力を解析する。
+    お小遣い帳の3〜4項目入力を解析する。
     必須:
     - 使った物
     - 理由
     - 満足度(0-10)
+    任意:
+    - 金額（「金額: 300円」形式）
     """
     body = (text or "").strip()
     if not body:
@@ -72,10 +74,15 @@ def parse_usage_report(text: str) -> dict | None:
     if not item or not reason:
         return None
 
+    # 金額フィールドの解析（省略可能、後方互換性あり）
+    amount_m = re.search(r"金額\s*[：:]\s*(\d[\d,]*)\s*円?", body)
+    amount = int(amount_m.group(1).replace(",", "")) if amount_m else None
+
     return {
         "item": item,
         "reason": reason,
         "satisfaction": satisfaction,
+        "amount": amount,
     }
 
 
@@ -85,6 +92,7 @@ def parse_usage_report_flexible(text: str) -> dict | None:
     例:
     - ノート, 勉強のために必要だった, 8
     - ノート / テスト対策で使った / 8
+    - ノート / テスト対策で使った / 8 / 300円（金額付き）
     """
     body = (text or "").strip()
     if not body:
@@ -103,13 +111,22 @@ def parse_usage_report_flexible(text: str) -> dict | None:
     if len(parts) < 3:
         return None
 
-    sat_raw = parts[-1]
+    # 4要素以上: item / reason / satisfaction / amount（金額は任意）
+    # 3要素: item / reason / satisfaction
+    sat_raw = parts[2] if len(parts) >= 4 else parts[-1]
     m = re.search(r"(\d{1,2})", sat_raw)
     if not m:
         return None
     satisfaction = int(m.group(1))
     if satisfaction < 0 or satisfaction > 10:
         return None
+
+    # 4要素目が金額として存在する場合に解析する
+    amount = None
+    if len(parts) >= 4:
+        am = re.search(r"(\d[\d,]*)", parts[3])
+        if am:
+            amount = int(am.group(1).replace(",", ""))
 
     item = parts[0]
     reason = parts[1]
@@ -120,6 +137,7 @@ def parse_usage_report_flexible(text: str) -> dict | None:
         "item": item,
         "reason": reason,
         "satisfaction": satisfaction,
+        "amount": amount,
     }
 
 
