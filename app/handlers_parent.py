@@ -405,8 +405,11 @@ async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> boo
     全ユーザーの fixed_allowance を残高に加算し、結果を一覧表示する。"""
     if not _is_parent(message.author.id):
         return False
+    # メンション付き（「@compass-bot 一括支給」）にも対応するためメンション除去後に判定する
+    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
+    target = mention_body if mention_body is not None else (content or "")
     # 誤作動を防ぐため完全一致で判定する
-    if (content or "").strip() != "一括支給":
+    if target.strip() != "一括支給":
         return False
 
     users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
