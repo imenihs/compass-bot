@@ -456,6 +456,7 @@ async def admin_approve(
 
 # ---------- エントリーポイント ----------
 
+@app.get("/", response_class=HTMLResponse)
 @app.get("/compass-bot", response_class=HTMLResponse)
 @app.get("/compass-bot/", response_class=HTMLResponse)
 async def index(session_token: Optional[str] = Cookie(default=None)):
