@@ -1,0 +1,25 @@
+# compass-bot セキュリティ設定
+# ソースコード・データ・設定ファイルへの直接アクセスをブロックする
+
+# Python ソースファイルへのアクセスを禁止する
+<FilesMatch "\.(py|pyc|pyo|env)$">
+    Require all denied
+</FilesMatch>
+
+# 機密ディレクトリへのアクセスを禁止する
+<DirectoryMatch "^.*(app|data|settings|templates|\.venv|__pycache__)$">
+    Require all denied
+</DirectoryMatch>
+
+# JSONL・JSON データファイルへのアクセスを禁止する
+<FilesMatch "\.(json|jsonl|txt|cfg|ini|toml)$">
+    Require all denied
+</FilesMatch>
+
+# .htaccess 自体の参照を禁止する
+<Files ".htaccess">
+    Require all denied
+</Files>
+
+# /app, /data, /settings, /templates パスへのアクセスをブロックする
+RedirectMatch 403 ^/compass-bot/(app|data|settings|templates|\.venv)(/.*)?$

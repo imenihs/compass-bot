@@ -488,3 +488,40 @@ async def maybe_handle_parent_announce(message: discord.Message, content: str) -
     else:
         await message.channel.send(f"{sent}チャンネルに送信したよ。")
     return True
+
+
+async def maybe_handle_web_approve(message: discord.Message, content: str) -> bool:
+    """「web承認 [ユーザー名]」コマンドで Web ダッシュボードアクセス申請を承認する（親のみ）。
+    承認すると仮パスワードを発行して Discord 経由で通知する。"""
+    if not _is_parent(message.author.id):
+        return False
+
+    body = (content or "").strip()
+    # メンションを除去してからコマンド判定する
+    mention_body = extract_input_from_mention(body, _client.user)
+    target = mention_body if mention_body is not None else body
+
+    # 「web承認 ユーザー名」の形式にマッチする
+    m = re.match(r"^web承認\s+(.+)$", target.strip(), re.IGNORECASE)
+    if not m:
+        return False
+
+    username = m.group(1).strip()
+    # web_auth モジュールを経由して申請を承認する
+    from app import web_auth
+    temp_pw = await web_auth.approve_application(username)
+    if temp_pw is None:
+        await message.channel.send(
+            f"「{username}」の承認待ち申請が見つからなかったよ。"
+            f"申請ユーザー名を確認してね。"
+        )
+        return True
+
+    # 仮パスワードを Discord で通知する（DM 送信は不可能なため同チャンネルに送信）
+    await message.channel.send(
+        f"✅ **{username}** のWebアクセスを承認したよ！\n"
+        f"仮パスワード: `{temp_pw}`\n"
+        f"下記URLでパスワードを設定してね:\n"
+        f"https://rwc.0t0.jp/compass-bot/set_password?username={username}"
+    )
+    return True

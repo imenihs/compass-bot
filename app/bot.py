@@ -505,6 +505,9 @@ async def on_ready():
         client=client,
         low_balance_alert_conf=LOW_BALANCE_ALERT,
     )
+    # Webダッシュボード用サーバーに Discord client と wallet_service を注入する
+    from app import server as web_server
+    web_server.init(discord_client=client, wallet_service=wallet_service)
     reminder_service.start_loop_if_needed()
     print("Allowance reminder loop started")
 
@@ -560,6 +563,10 @@ async def on_message(message: discord.Message):
 
     # 親による全チャンネル一斉アナウンス（「アナウンス [本文]」）
     if await handlers_parent.maybe_handle_parent_announce(message, content):
+        return
+
+    # 親によるWebダッシュボードアクセス申請の承認（「web承認 [ユーザー名]」）
+    if await handlers_parent.maybe_handle_web_approve(message, content):
         return
 
     mention_input = extract_input_from_mention(content, client.user)
