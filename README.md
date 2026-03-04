@@ -77,7 +77,8 @@
 - `templates/`: Jinja2 HTML テンプレート群（login / register / set_password / dashboard）
 - `settings/system.json`: 共通設定（currency / log_dir 等）
 - `settings/setting.json`: 実運用設定（親ID / チャンネル / 各機能設定）
-- `settings/users/*.json`: ユーザー個別設定（名前・年齢・固定お小遣い・キーワード等）
+- `settings/users/*.json`: 子供ユーザー個別設定（名前・年齢・固定お小遣い・キーワード等）
+- `settings/users/parents/*.json`: 親ユーザー設定（名前・Discord IDのみのシンプル形式）
 - `data/logs/*.jsonl`: 監査/台帳/イベント/お小遣い帳ログ
 
 ## 必要環境
@@ -437,8 +438,10 @@ web承認 たろう
 > **管理者権限の自動付与**: Web 登録時のユーザー名が `settings/users/*.json` の `name` と一致し、かつその `discord_user_id` が `setting.json` の `parent_ids` に含まれる場合、パスワード設定時に自動的に管理者（親）として登録されます。
 
 ### 注意事項
-- Web ユーザー名は `settings/users/*.json` の `name` フィールドと一致させること（親・子供ともに必須）
-- 親の管理者権限判定は `setting.json` の `parent_ids`（Discord ID）を使用する
+- Web ユーザー名は登録済みの `name` フィールドと一致させること（親・子供ともに必須）
+  - 子供: `settings/users/*.json` の `name`
+  - 親: `settings/users/parents/*.json` の `name`
+- 管理者権限は `parents/` ディレクトリへの登録で自動付与される（`parent_ids` は不要）
 - セッションは7日間有効。期限切れ後は再ログインが必要
 
 ## ログ
