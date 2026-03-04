@@ -7,3 +7,4 @@
 /data
 !/settings/*.example.json
 !/settings/users/*.example.json
+/debug

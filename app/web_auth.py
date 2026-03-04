@@ -89,10 +89,10 @@ async def approve_application(username: str) -> Optional[str]:
     async with _lock:
         state = _read_json(WEB_AUTH_STATE_PATH)
         apps = state.get("applications", {})
-        # username で申請を検索する
+        # username で申請を検索する（pending または approved＝PW未設定 も再承認可能）
         target_id = None
         for app_id, app in apps.items():
-            if app.get("username") == username and app.get("status") == "pending":
+            if app.get("username") == username and app.get("status") in ("pending", "approved"):
                 target_id = app_id
                 break
         if target_id is None:
