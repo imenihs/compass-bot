@@ -64,24 +64,12 @@ def find_user_by_name(name: str) -> Optional[dict]:
     return None
 
 def get_parent_ids() -> set[int]:
-    """親ユーザーの Discord ID 集合を返す。
-    parents/*.json から自動収集し、setting.json の parent_ids を後方互換として追加する"""
+    """親ユーザーの Discord ID 集合を返す。users/parents/*.json から収集する"""
     ids: set[int] = set()
-    # parents/ ディレクトリから自動収集する（こちらが正規の登録方法）
     for p in load_all_parents():
         uid = p.get("discord_user_id")
         if uid:
             ids.add(int(uid))
-    # setting.json の parent_ids は後方互換のために残す（additive）
-    setting = load_setting()
-    raw_list = setting.get("parent_ids")
-    if isinstance(raw_list, list):
-        ids |= {int(x) for x in raw_list}
-    elif not ids:
-        # どちらも未設定の場合は環境変数にフォールバックする
-        raw = os.environ.get("PARENT_IDS", "").strip()
-        if raw:
-            ids |= {int(x.strip()) for x in raw.split(",") if x.strip()}
     return ids
 
 def get_allow_channel_ids() -> set[int] | None:
