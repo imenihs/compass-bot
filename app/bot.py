@@ -1,8 +1,10 @@
+import asyncio
 import os
 import json
 import re
 
 import discord
+import uvicorn
 from datetime import datetime
 
 from app.bot_utils import (
@@ -849,7 +851,27 @@ async def on_message(message: discord.Message):
         await message.channel.send(reply)
 
 
+async def _main():
+    """Discordボットと uvicorn Webサーバーを同一プロセスで並列起動する"""
+    from app.server import app as web_app
+    # uvicorn を asyncio モードで起動する（ポート8765固定）
+    uvicorn_config = uvicorn.Config(
+        app=web_app,
+        host="127.0.0.1",
+        port=8765,
+        loop="asyncio",
+        log_level="warning",  # uvicornのアクセスログは warning 以上のみ表示
+    )
+    uvicorn_server = uvicorn.Server(uvicorn_config)
+    # Discord クライアントと uvicorn を並列で実行する
+    async with client:
+        await asyncio.gather(
+            client.start(DISCORD_BOT_TOKEN),
+            uvicorn_server.serve(),
+        )
+
+
 if __name__ == "__main__":
     if not DISCORD_BOT_TOKEN or not GEMINI_API_KEY:
         raise RuntimeError("DISCORD_BOT_TOKEN / GEMINI_API_KEY が未設定")
-    client.run(DISCORD_BOT_TOKEN)
+    asyncio.run(_main())
