@@ -7,6 +7,8 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_DIR = ROOT / "settings"
 USERS_DIR = SETTINGS_DIR / "users"
+# 親ユーザーは子供と分けて管理する
+PARENTS_DIR = USERS_DIR / "parents"
 SYSTEM_PATH = SETTINGS_DIR / "system.json"
 SETTING_PATH = SETTINGS_DIR / "setting.json"
 
@@ -23,6 +25,7 @@ def load_setting() -> dict:
     return _load_json(SETTING_PATH)
 
 def load_all_users() -> list[dict]:
+    """子供ユーザー一覧を返す。users/*.json を対象とし parents/ サブディレクトリは除外する"""
     users = []
     for p in USERS_DIR.glob("*.json"):
         # .example.json はサンプルファイルのため実ユーザーとして読み込まない
@@ -31,31 +34,55 @@ def load_all_users() -> list[dict]:
         users.append(_load_json(p))
     return users
 
+def load_all_parents() -> list[dict]:
+    """親ユーザー一覧を返す。users/parents/*.json を対象とする"""
+    parents = []
+    if not PARENTS_DIR.exists():
+        return parents
+    for p in PARENTS_DIR.glob("*.json"):
+        # .example.json はサンプルファイルのため除外する
+        if p.name.endswith(".example.json"):
+            continue
+        parents.append(_load_json(p))
+    return parents
+
 def find_user_by_discord_id(discord_user_id: int) -> Optional[dict]:
-    for u in load_all_users():
+    """discord_user_id でユーザーを検索する。子供→親の順で両ディレクトリを検索する"""
+    for u in load_all_users() + load_all_parents():
         if int(u.get("discord_user_id", -1)) == int(discord_user_id):
             return u
     return None
 
 def find_user_by_name(name: str) -> Optional[dict]:
+    """名前でユーザーを検索する。子供→親の順で両ディレクトリを検索する"""
     target = (name or "").strip()
     if not target:
         return None
-    for u in load_all_users():
+    for u in load_all_users() + load_all_parents():
         if str(u.get("name", "")).strip() == target:
             return u
     return None
 
 def get_parent_ids() -> set[int]:
+    """親ユーザーの Discord ID 集合を返す。
+    parents/*.json から自動収集し、setting.json の parent_ids を後方互換として追加する"""
+    ids: set[int] = set()
+    # parents/ ディレクトリから自動収集する（こちらが正規の登録方法）
+    for p in load_all_parents():
+        uid = p.get("discord_user_id")
+        if uid:
+            ids.add(int(uid))
+    # setting.json の parent_ids は後方互換のために残す（additive）
     setting = load_setting()
     raw_list = setting.get("parent_ids")
     if isinstance(raw_list, list):
-        return {int(x) for x in raw_list}
-
-    raw = os.environ.get("PARENT_IDS", "").strip()
-    if not raw:
-        return set()
-    return {int(x.strip()) for x in raw.split(",") if x.strip()}
+        ids |= {int(x) for x in raw_list}
+    elif not ids:
+        # どちらも未設定の場合は環境変数にフォールバックする
+        raw = os.environ.get("PARENT_IDS", "").strip()
+        if raw:
+            ids |= {int(x.strip()) for x in raw.split(",") if x.strip()}
+    return ids
 
 def get_allow_channel_ids() -> set[int] | None:
     """

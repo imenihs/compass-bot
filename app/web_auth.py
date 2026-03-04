@@ -151,13 +151,12 @@ async def is_pw_setting_mode(username: str) -> bool:
 # ---------- ユーザー・パスワード管理 ----------
 
 def _is_parent_by_name(username: str) -> bool:
-    """ユーザー名が setting.json の parent_ids に登録された親かどうかを判定する。
-    users/*.json の name フィールドと discord_user_id を照合する。"""
+    """ユーザー名が users/parents/ に登録された親かどうかを判定する。
+    parents/*.json の name フィールドと照合するだけでよい。"""
     # 循環インポートを避けるため関数内でインポートする
-    from app.config import load_all_users, get_parent_ids
-    parent_ids = get_parent_ids()
-    for u in load_all_users():
-        if u.get("name") == username and int(u.get("discord_user_id", 0)) in parent_ids:
+    from app.config import load_all_parents
+    for p in load_all_parents():
+        if p.get("name") == username:
             return True
     return False
 
