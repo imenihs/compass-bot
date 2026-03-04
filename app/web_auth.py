@@ -150,15 +150,31 @@ async def is_pw_setting_mode(username: str) -> bool:
 
 # ---------- ユーザー・パスワード管理 ----------
 
+def _is_parent_by_name(username: str) -> bool:
+    """ユーザー名が setting.json の parent_ids に登録された親かどうかを判定する。
+    users/*.json の name フィールドと discord_user_id を照合する。"""
+    # 循環インポートを避けるため関数内でインポートする
+    from app.config import load_all_users, get_parent_ids
+    parent_ids = get_parent_ids()
+    for u in load_all_users():
+        if u.get("name") == username and int(u.get("discord_user_id", 0)) in parent_ids:
+            return True
+    return False
+
+
 async def set_password(username: str, password: str) -> bool:
     """
     本パスワードを設定して web_users.json に保存する。
+    users/*.json と parent_ids の照合で親なら is_admin=True を自動付与する。
     申請状態を completed に更新する。
     """
     async with _lock:
         # パスワードハッシュを生成する
         salt = secrets.token_hex(16)
         pw_hash = _hash_password(password, salt)
+
+        # 親ユーザーかどうかを自動判定する（username == users/*.json の name かつ parent_ids に含まれる）
+        is_admin = _is_parent_by_name(username)
 
         # ユーザー情報を保存する
         users = _read_json(WEB_USERS_PATH)
@@ -167,7 +183,7 @@ async def set_password(username: str, password: str) -> bool:
             "salt": salt,
             "pw_hash": pw_hash,
             "created_at": _now_timestamp(),
-            "is_admin": False,  # デフォルトは一般ユーザー
+            "is_admin": is_admin,  # 親なら True、子供なら False
         }
         _write_json(WEB_USERS_PATH, users)
 
