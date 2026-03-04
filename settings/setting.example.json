@@ -1,4 +1,5 @@
 {
+  "web_base_url": "https://example.com",
   "allow_channel_ids": [
     222222222222222222
   ],

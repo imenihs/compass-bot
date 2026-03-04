@@ -72,6 +72,11 @@ def get_parent_ids() -> set[int]:
             ids.add(int(uid))
     return ids
 
+def get_web_base_url() -> str:
+    """WebダッシュボードのベースURL（URLのハードコードを避けるため設定から読む）"""
+    setting = load_setting()
+    return setting.get("web_base_url", "https://example.com")
+
 def get_allow_channel_ids() -> set[int] | None:
     """
     ALLOW_CHANNEL_IDS が未設定なら None（制限なし）

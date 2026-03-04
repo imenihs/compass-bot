@@ -18,7 +18,7 @@ from app.config import (
     get_allow_channel_ids,
     get_allowance_reminder_setting,
     get_low_balance_alert_setting,
-    get_parent_ids,
+    get_web_base_url,
     load_all_users,
     load_system,
 )
@@ -441,12 +441,13 @@ async def admin_approve(
     temp_pw = await web_auth.approve_application(username)
     if temp_pw:
         # Discord に仮パスワードを通知する
+        base_url = get_web_base_url()
         msg = (
             f"✅ **Webアクセスを承認しました**\n"
             f"ユーザー: **{username}**\n"
             f"仮パスワード: `{temp_pw}`\n"
             f"下記URLからパスワードを設定してください:\n"
-            f"https://rwc.0t0.jp/compass-bot/set_password?username={username}"
+            f"{base_url}/compass-bot/set_password?username={username}"
         )
         await _notify_discord(msg)
 
