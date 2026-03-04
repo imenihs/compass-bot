@@ -7,6 +7,7 @@
 - 財布残高（ウォレット）を管理する
 - 毎月リマインド（支給前通知）と残高監査を行う
 - 親向けダッシュボード・低残高アラート・月次サマリー・傾向分析・目標貯金に対応
+- ブラウザから閲覧できる Webダッシュボード（`compass.rwc.0t0.jp`）を搭載
 
 ## 主な機能
 
@@ -50,6 +51,14 @@
 - 「目標確認」でプログレスバー付きの進捗を表示
 - 「目標削除」で目標をリセット
 
+10. Webダッシュボード（ブラウザ閲覧）
+- `compass.rwc.0t0.jp` からログインして残高・支出・目標貯金を確認できる
+- **親・子供の両方**が利用可能（表示内容はユーザー種別で自動切替）
+- 親: 全員の残高・支出・報告状況を一覧管理、承認待ち申請を操作
+- 子供: 自分の残高・支出記録・貯金目標の進捗を閲覧
+- 申請 → Discord で親が承認 → 仮パスワード発行 → 本パスワード設定 の登録フロー
+- `setting.json` の `parent_ids`（Discord ID）と `users/*.json` の `discord_user_id` を照合して管理者権限を自動付与
+
 ## ディレクトリ構成
 
 - `app/bot.py`: Discordイベント（on_message/on_ready）・コアハンドラ（初期設定・支出記録・Gemini査定フロー）
@@ -63,7 +72,9 @@
 - `app/prompts.py`: Gemini へ渡すプロンプトのビルド関数
 - `app/config.py`: 設定ファイル読み込み（users / setting / system）
 - `app/storage.py`: JSONL 追記・JST タイムスタンプなど共通I/Oユーティリティ
-- `app/server.py`: ヘルスチェック用 FastAPI サーバー
+- `app/server.py`: FastAPI サーバー（ヘルスチェック + Webダッシュボード全エンドポイント）
+- `app/web_auth.py`: Webダッシュボード認証モジュール（申請・承認・セッション管理）
+- `templates/`: Jinja2 HTML テンプレート群（login / register / set_password / dashboard）
 - `settings/system.json`: 共通設定（currency / log_dir 等）
 - `settings/setting.json`: 実運用設定（親ID / チャンネル / 各機能設定）
 - `settings/users/*.json`: ユーザー個別設定（名前・年齢・固定お小遣い・キーワード等）
@@ -82,6 +93,8 @@
 - `uvicorn`
 - `python-dotenv`
 - `httpx`
+- `jinja2`（Webダッシュボード用テンプレートエンジン）
+- `python-multipart`（フォーム送信の受け取り）
 
 ## セットアップ
 
@@ -115,9 +128,15 @@ cp settings/users/user.example.json settings/users/<your_user_key>.json
 python3 app/bot.py
 ```
 
-### Health API（任意）
+### Webダッシュボード（uvicorn）
 ```bash
-uvicorn app.server:app --host 0.0.0.0 --port 8000
+uvicorn app.server:app --host 127.0.0.1 --port 8765
+```
+
+systemd サービスとして運用する場合:
+```bash
+sudo systemctl start compass-web
+sudo systemctl enable compass-web   # 自動起動を有効化
 ```
 
 ## 設定
@@ -356,6 +375,15 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
 使い方の説明
 ```
 
+### 26. Webダッシュボード アクセス承認（親のみ）
+ユーザーからの申請を承認して仮パスワードを発行:
+```text
+web承認 たろう
+```
+承認すると Discord に仮パスワードが通知される。
+
+---
+
 ### 25. 使い方の一斉通知（全チャンネル）
 `allow_channel_ids` の全チャンネルへ使い方と初期設定を通知:
 ```text
@@ -373,6 +401,45 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
 ```text
 @compass-bot reminder test
 ```
+
+## Webダッシュボード
+
+ブラウザから `https://compass.rwc.0t0.jp` にアクセスしてお小遣いの状況を確認できます。
+**親・子供の両方が利用可能**です。ログイン後の表示内容はユーザー種別で自動的に切り替わります。
+
+### 登録フロー（初回のみ）
+
+1. **アクセス申請**
+   - `https://compass.rwc.0t0.jp/compass-bot/register` を開く
+   - ユーザー名を入力して申請
+     - **親の場合**: `settings/users/*.json` の `name` フィールドと一致するユーザー名を入力
+     - **子供の場合**: 同上（`name` フィールドと一致させること）
+
+2. **親が Discord で承認**
+   - Discord に申請通知が届く
+   - 親が `web承認 [ユーザー名]` と送信
+   - Discord に仮パスワードが通知される
+
+3. **本パスワード設定**
+   - `https://compass.rwc.0t0.jp/compass-bot/set_password` を開く
+   - 仮パスワードを入力 → 本パスワード（8文字以上）を設定
+
+4. **ログイン**
+   - `https://compass.rwc.0t0.jp/compass-bot/login` またはトップページからログイン
+
+### 表示内容
+
+| ユーザー種別 | 表示内容 |
+|---|---|
+| 親（管理者） | 全ユーザーの残高・今月支出・低残高フラグ・貯金目標・残高報告状況、承認待ち申請一覧 |
+| 子供（一般） | 自分の残高・今月支出・直近5件の支出記録・貯金目標の進捗 |
+
+> **管理者権限の自動付与**: Web 登録時のユーザー名が `settings/users/*.json` の `name` と一致し、かつその `discord_user_id` が `setting.json` の `parent_ids` に含まれる場合、パスワード設定時に自動的に管理者（親）として登録されます。
+
+### 注意事項
+- Web ユーザー名は `settings/users/*.json` の `name` フィールドと一致させること（親・子供ともに必須）
+- 親の管理者権限判定は `setting.json` の `parent_ids`（Discord ID）を使用する
+- セッションは7日間有効。期限切れ後は再ログインが必要
 
 ## ログ
 
