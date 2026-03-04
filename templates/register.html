@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}アクセス申請 — Compass Bot{% endblock %}
+{% block content %}
+<div style="max-width:480px; margin: 40px auto;">
+  <div class="card">
+    <h2>Webアクセス申請</h2>
+    <div class="alert alert-info">
+      申請後、管理者（保護者）がDiscordで承認します。
+      承認されると仮パスワードが発行されます。
+    </div>
+    {% if error %}
+      <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+    {% if success %}
+      <div class="alert alert-success">{{ success }}</div>
+    {% endif %}
+    {% if not success %}
+    <form method="post" action="/compass-bot/register">
+      <div class="form-group">
+        <label>ユーザー名（お小遣い帳に登録している名前）</label>
+        <input type="text" name="username" required placeholder="例: たろう">
+      </div>
+      <button type="submit" class="btn btn-primary" style="width:100%;">申請する</button>
+    </form>
+    <div style="margin-top:16px; font-size:0.85rem; color:#666; text-align:center;">
+      すでにアカウントがある方は
+      <a href="/compass-bot/login" style="color:#5865f2;">ログイン</a>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

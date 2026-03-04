@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}ログイン — Compass Bot{% endblock %}
+{% block content %}
+<div style="max-width:400px; margin: 40px auto;">
+  <div class="card">
+    <h2>ログイン</h2>
+    {% if error %}
+      <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+    <form method="post" action="/compass-bot/login">
+      <div class="form-group">
+        <label>ユーザー名</label>
+        <input type="text" name="username" required autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label>パスワード</label>
+        <input type="password" name="password" required autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn btn-primary" style="width:100%;">ログイン</button>
+    </form>
+    <div style="margin-top:16px; font-size:0.85rem; color:#666; text-align:center;">
+      アカウントをお持ちでない方は
+      <a href="/compass-bot/register" style="color:#5865f2;">申請はこちら</a>
+    </div>
+  </div>
+</div>
+{% endblock %}

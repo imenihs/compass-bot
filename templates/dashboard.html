@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}ダッシュボード — Compass Bot{% endblock %}
+{% block content %}
+<h2 style="margin-bottom:20px; color:#444;">ダッシュボード</h2>
+
+{% if is_admin %}
+<!-- 管理者向け全体概要 -->
+<div class="card">
+  <h2>👨‍👩‍👧‍👦 全ユーザー残高一覧</h2>
+  {% if users %}
+  <table>
+    <thead>
+      <tr>
+        <th>名前</th>
+        <th>残高</th>
+        <th>今月支出</th>
+        <th>最終支出日</th>
+        <th>残高報告</th>
+        <th>目標貯金</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for u in users %}
+      <tr>
+        <td>{{ u.name }}</td>
+        <td style="font-weight:600;">
+          {% if u.balance is not none %}
+            {{ "{:,}".format(u.balance) }}円
+            {% if u.low_balance %}
+              <span class="badge badge-danger">低残高</span>
+            {% endif %}
+          {% else %}
+            <span style="color:#aaa;">未設定</span>
+          {% endif %}
+        </td>
+        <td>{{ "{:,}".format(u.month_spending) }}円（{{ u.month_count }}件）</td>
+        <td>{{ u.last_spent_date or "—" }}</td>
+        <td>
+          {% if u.audit_reported %}
+            <span class="badge badge-ok">報告済</span>
+          {% else %}
+            <span class="badge badge-warn">未報告</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if u.goals %}
+            {% for g in u.goals %}
+              <div style="margin-bottom:6px;">
+                <div style="font-size:0.85rem; margin-bottom:2px;">{{ g.title }}（{{ "{:,}".format(g.target) }}円）</div>
+                <div class="progress-bar-bg">
+                  <div class="progress-bar-fill" style="width:{{ [g.pct, 100]|min }}%;"></div>
+                </div>
+                <div style="font-size:0.75rem; color:#888; text-align:right;">{{ g.pct }}%</div>
+              </div>
+            {% endfor %}
+          {% else %}
+            <span style="color:#aaa; font-size:0.85rem;">なし</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <div style="color:#aaa; text-align:center; padding:20px;">ユーザーデータがありません</div>
+  {% endif %}
+</div>
+
+{% if pending_apps %}
+<div class="card">
+  <h2>🔔 Webアクセス承認待ち申請</h2>
+  <table>
+    <thead>
+      <tr><th>ユーザー名</th><th>申請日時</th><th>操作</th></tr>
+    </thead>
+    <tbody>
+    {% for app in pending_apps %}
+      <tr>
+        <td>{{ app.username }}</td>
+        <td>{{ app.requested_at_str }}</td>
+        <td>
+          <form method="post" action="/compass-bot/admin/approve" style="display:inline;">
+            <input type="hidden" name="username" value="{{ app.username }}">
+            <button type="submit" class="btn btn-primary" style="padding:5px 14px; font-size:0.85rem;">承認</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div style="font-size:0.82rem; color:#888; margin-top:8px;">
+    ※ 承認するとDiscordに仮パスワードが通知されます
+  </div>
+</div>
+{% endif %}
+
+{% else %}
+<!-- 一般ユーザー（子供）向け表示 -->
+<div class="card">
+  <h2>💰 残高</h2>
+  {% if my_balance is not none %}
+    <div style="font-size:2rem; font-weight:700; color:{% if my_low_balance %}#c00{% else %}#333{% endif %};">
+      {{ "{:,}".format(my_balance) }}円
+    </div>
+    {% if my_low_balance %}
+      <div class="alert alert-error" style="margin-top:10px;">残高が少なくなっています！</div>
+    {% endif %}
+  {% else %}
+    <div class="alert alert-info">残高が未設定です。Discordで初期設定をしてください。</div>
+  {% endif %}
+</div>
+
+{% if my_goals %}
+<div class="card">
+  <h2>🎯 目標貯金</h2>
+  {% for g in my_goals %}
+    <div style="margin-bottom:16px;">
+      <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+        <span style="font-weight:600;">{{ g.title }}</span>
+        <span style="font-size:0.85rem; color:#666;">{{ "{:,}".format(g.saved) }} / {{ "{:,}".format(g.target) }}円</span>
+      </div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" style="width:{{ [g.pct, 100]|min }}%;"></div>
+      </div>
+      <div style="font-size:0.8rem; color:#888; text-align:right; margin-top:2px;">{{ g.pct }}%達成</div>
+    </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>📝 今月の支出</h2>
+  <div style="font-size:1.1rem; margin-bottom:8px;">
+    {{ "{:,}".format(my_month_spending) }}円（{{ my_month_count }}件）
+  </div>
+  {% if my_recent_items %}
+    <table>
+      <thead><tr><th>日付</th><th>品目</th><th>満足度</th><th>金額</th></tr></thead>
+      <tbody>
+      {% for item in my_recent_items %}
+        <tr>
+          <td>{{ item.date }}</td>
+          <td>{{ item.item }}</td>
+          <td>{{ item.satisfaction if item.satisfaction is not none else "—" }}</td>
+          <td>{{ "{:,}".format(item.amount) + "円" if item.amount else "—" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div style="color:#aaa; text-align:center; padding:10px;">今月の支出記録はありません</div>
+  {% endif %}
+</div>
+{% endif %}
+
+{% endblock %}
