@@ -3,6 +3,13 @@
 {% block content %}
 <h2 style="margin-bottom:20px; color:#444;">ダッシュボード</h2>
 
+{% if flash_msg %}
+<div class="alert alert-success" style="margin-bottom:16px;">✅ {{ flash_msg }}</div>
+{% endif %}
+{% if flash_error %}
+<div class="alert alert-error" style="margin-bottom:16px;">❌ {{ flash_error }}</div>
+{% endif %}
+
 {% if is_admin %}
 <!-- 管理者向け全体概要 -->
 <div class="card">
@@ -64,6 +71,70 @@
   {% else %}
     <div style="color:#aaa; text-align:center; padding:20px;">ユーザーデータがありません</div>
   {% endif %}
+</div>
+
+<!-- 親操作パネル -->
+<div class="card">
+  <h2>⚙️ お小遣い操作</h2>
+
+  <!-- 個別支給 -->
+  <div style="margin-bottom:24px;">
+    <h3 style="font-size:1rem; margin-bottom:10px; color:#555;">💸 個別支給</h3>
+    <form method="post" action="/compass-bot/op/grant" style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
+      <div>
+        <label style="font-size:0.85rem; display:block; margin-bottom:4px;">対象ユーザー</label>
+        <select name="target" required style="padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem;">
+          {% for u in users %}
+            <option value="{{ u.name }}">{{ u.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label style="font-size:0.85rem; display:block; margin-bottom:4px;">金額（円）</label>
+        <input type="number" name="amount" min="1" placeholder="例: 500" required
+               style="padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem; width:120px;">
+      </div>
+      <button type="submit" class="btn btn-primary">支給する</button>
+    </form>
+  </div>
+
+  <!-- 一括支給 -->
+  <div style="margin-bottom:24px; padding-top:16px; border-top:1px solid #eee;">
+    <h3 style="font-size:1rem; margin-bottom:6px; color:#555;">💰 一括支給（全員の固定額）</h3>
+    <p style="font-size:0.82rem; color:#888; margin:0 0 10px;">各ユーザーの固定お小遣い額をまとめて支給します。</p>
+    <form method="post" action="/compass-bot/op/bulk_grant"
+          onsubmit="return confirm('全員に固定お小遣いを一括支給しますか？');">
+      <button type="submit" class="btn btn-primary">一括支給する</button>
+    </form>
+  </div>
+
+  <!-- 残高調整 -->
+  <div style="padding-top:16px; border-top:1px solid #eee;">
+    <h3 style="font-size:1rem; margin-bottom:10px; color:#555;">🔧 残高調整（加算 / 減算）</h3>
+    <form method="post" action="/compass-bot/op/adjust" style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
+      <div>
+        <label style="font-size:0.85rem; display:block; margin-bottom:4px;">対象ユーザー</label>
+        <select name="target" required style="padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem;">
+          {% for u in users %}
+            <option value="{{ u.name }}">{{ u.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label style="font-size:0.85rem; display:block; margin-bottom:4px;">金額（円）</label>
+        <input type="number" name="amount" min="1" placeholder="例: 100" required
+               style="padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem; width:120px;">
+      </div>
+      <div>
+        <label style="font-size:0.85rem; display:block; margin-bottom:4px;">操作</label>
+        <select name="direction" style="padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem;">
+          <option value="plus">➕ 加算</option>
+          <option value="minus">➖ 減算</option>
+        </select>
+      </div>
+      <button type="submit" class="btn btn-primary">調整する</button>
+    </form>
+  </div>
 </div>
 
 {% if pending_apps %}

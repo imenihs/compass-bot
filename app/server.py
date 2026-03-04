@@ -19,6 +19,7 @@ from app.config import (
     get_allowance_reminder_setting,
     get_low_balance_alert_setting,
     get_web_base_url,
+    find_user_by_name,
     load_all_users,
     load_system,
 )
@@ -374,6 +375,8 @@ async def post_set_password(
 async def get_dashboard(
     request: Request,
     session_token: Optional[str] = Cookie(default=None),
+    msg: str = "",
+    error: str = "",
 ):
     """ダッシュボードページを表示する。未ログインはログインページへリダイレクトする"""
     username = await _get_current_user(session_token)
@@ -405,6 +408,8 @@ async def get_dashboard(
             "is_admin": True,
             "users": user_stats,
             "pending_apps": pending_apps,
+            "flash_msg": msg,
+            "flash_error": error,
         })
     else:
         # 一般ユーザー（子供）: 自分のデータのみ表示する
@@ -421,6 +426,8 @@ async def get_dashboard(
             "my_month_spending": stats["month_spending"],
             "my_month_count": stats["month_count"],
             "my_recent_items": stats["recent_items"],
+            "flash_msg": msg,
+            "flash_error": error,
         })
 
 
@@ -453,6 +460,133 @@ async def admin_approve(
 
     # ダッシュボードへ戻る
     return RedirectResponse(url="/compass-bot/dashboard", status_code=303)
+
+
+# ---------- 親操作エンドポイント（Phase A） ----------
+
+def _op_redirect(msg: str = "", error: str = "") -> RedirectResponse:
+    """操作後にダッシュボードへリダイレクトする。結果メッセージをクエリパラメータで渡す"""
+    from urllib.parse import quote
+    if error:
+        return RedirectResponse(url=f"/compass-bot/dashboard?error={quote(error)}", status_code=303)
+    return RedirectResponse(url=f"/compass-bot/dashboard?msg={quote(msg)}", status_code=303)
+
+
+@app.post("/compass-bot/op/grant")
+async def op_grant(
+    session_token: Optional[str] = Cookie(default=None),
+    target: str = Form(...),
+    amount: str = Form(...),
+):
+    """親が特定ユーザーへ手動支給する"""
+    current_user = await _get_current_user(session_token)
+    if not current_user or not _is_admin(current_user):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    # 金額を整数に変換する（カンマ・円記号を除去）
+    try:
+        amt = int(amount.replace(",", "").replace("円", "").strip())
+    except ValueError:
+        return _op_redirect(error="金額が正しくありません。")
+    if amt <= 0:
+        return _op_redirect(error="金額は1円以上を入力してください。")
+
+    target_conf = find_user_by_name(target)
+    if target_conf is None:
+        return _op_redirect(error=f"「{target}」は見つかりませんでした。")
+    if not _wallet_service or not _wallet_service.has_wallet(target):
+        return _op_redirect(error=f"「{target}」のウォレットが未設定です。")
+
+    system_conf = load_system()
+    before = _wallet_service.get_balance(target)
+    new_balance, _ = _wallet_service.update_balance(
+        user_conf=target_conf,
+        system_conf=system_conf,
+        delta=amt,
+        action="allowance_manual_grant",
+        note="manual_grant_by_parent_web",
+        extra={"granted_by": current_user},
+    )
+    return _op_redirect(msg=f"{target}に{amt:,}円を支給しました（{before:,}円 → {new_balance:,}円）")
+
+
+@app.post("/compass-bot/op/bulk_grant")
+async def op_bulk_grant(
+    session_token: Optional[str] = Cookie(default=None),
+):
+    """親が全子供ユーザーに固定お小遣いを一括支給する"""
+    current_user = await _get_current_user(session_token)
+    if not current_user or not _is_admin(current_user):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    if not _wallet_service:
+        return _op_redirect(error="ウォレットサービスが未初期化です。")
+
+    system_conf = load_system()
+    results = []
+    # 子供ユーザー（load_all_users = 子供のみ）を一括処理する
+    for user_conf in sorted(load_all_users(), key=lambda x: str(x.get("name", ""))):
+        name = user_conf.get("name", "")
+        fixed = int(user_conf.get("fixed_allowance", 0))
+        if not name or fixed <= 0:
+            continue
+        if not _wallet_service.has_wallet(name):
+            continue
+        before = _wallet_service.get_balance(name)
+        new_bal, _ = _wallet_service.update_balance(
+            user_conf=user_conf,
+            system_conf=system_conf,
+            delta=fixed,
+            action="allowance_grant",
+            note="bulk_grant_by_parent_web",
+            extra={"granted_by": current_user},
+        )
+        results.append(f"{name}: {before:,}→{new_bal:,}円")
+
+    if not results:
+        return _op_redirect(error="支給対象のユーザーが見つかりませんでした。")
+    return _op_redirect(msg="一括支給完了 / " + " | ".join(results))
+
+
+@app.post("/compass-bot/op/adjust")
+async def op_adjust(
+    session_token: Optional[str] = Cookie(default=None),
+    target: str = Form(...),
+    amount: str = Form(...),
+    direction: str = Form(...),  # "plus" or "minus"
+):
+    """親が残高を手動調整する（加算・減算）"""
+    current_user = await _get_current_user(session_token)
+    if not current_user or not _is_admin(current_user):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    try:
+        amt = int(amount.replace(",", "").replace("円", "").strip())
+    except ValueError:
+        return _op_redirect(error="金額が正しくありません。")
+    if amt <= 0:
+        return _op_redirect(error="金額は1円以上を入力してください。")
+
+    delta = amt if direction == "plus" else -amt
+
+    target_conf = find_user_by_name(target)
+    if target_conf is None:
+        return _op_redirect(error=f"「{target}」は見つかりませんでした。")
+    if not _wallet_service or not _wallet_service.has_wallet(target):
+        return _op_redirect(error=f"「{target}」のウォレットが未設定です。")
+
+    system_conf = load_system()
+    before = _wallet_service.get_balance(target)
+    new_balance, _ = _wallet_service.update_balance(
+        user_conf=target_conf,
+        system_conf=system_conf,
+        delta=delta,
+        action="balance_adjustment",
+        note="manual_adjustment_by_parent_web",
+        extra={"adjusted_by": current_user},
+    )
+    label = "加算" if delta >= 0 else "減算"
+    return _op_redirect(msg=f"{target}の残高を{label}しました（{before:,}円 → {new_balance:,}円）")
 
 
 # ---------- エントリーポイント ----------
