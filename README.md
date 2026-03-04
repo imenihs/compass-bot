@@ -129,15 +129,12 @@ cp settings/users/user.example.json settings/users/<your_user_key>.json
 python3 app/bot.py
 ```
 
-### Webダッシュボード（uvicorn）
-```bash
-uvicorn app.server:app --host 127.0.0.1 --port 8765
-```
+### Webダッシュボード
+Discord Botと同一プロセスで自動起動します。
 
-systemd サービスとして運用する場合:
 ```bash
-sudo systemctl start compass-web
-sudo systemctl enable compass-web   # 自動起動を有効化
+# Bot を起動すれば Web ダッシュボードも同時に起動する（port 8765）
+sudo systemctl start compass
 ```
 
 ## 設定
@@ -170,7 +167,7 @@ sudo systemctl enable compass-web   # 自動起動を有効化
 - `unspecified`
 
 ### `settings/setting.json`
-- `parent_ids`: 親（管理者）ユーザーID配列
+- `web_base_url`: WebダッシュボードのベースURL（例: `https://compass.rwc.0t0.jp`）
 - `allow_channel_ids`: Botが反応するチャンネルID配列
 - `gemini_model`: 利用モデル
 - `assess_keyword`: 査定抽出判定キーワード
@@ -458,7 +455,6 @@ web承認 たろう
 
 ## 注意点
 
-- `[#SH-xxx]` 形式は非対応です。
 - `chat.require_mention=true` の場合はメンション必須です。
 - `allow_channel_ids` を設定している場合、対象チャンネル以外では反応しません。
 - Bot文面や査定ルールは `app/prompts.py` で調整できます。
