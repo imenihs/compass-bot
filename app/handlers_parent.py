@@ -518,10 +518,12 @@ async def maybe_handle_web_approve(message: discord.Message, content: str) -> bo
         return True
 
     # 仮パスワードを Discord で通知する（DM 送信は不可能なため同チャンネルに送信）
+    from app.config import get_web_base_url
+    base_url = get_web_base_url()
     await message.channel.send(
         f"✅ **{username}** のWebアクセスを承認したよ！\n"
         f"仮パスワード: `{temp_pw}`\n"
         f"下記URLでパスワードを設定してね:\n"
-        f"https://rwc.0t0.jp/compass-bot/set_password?username={username}"
+        f"{base_url}/compass-bot/set_password?username={username}"
     )
     return True
