@@ -12,6 +12,19 @@ from datetime import datetime
 from pathlib import Path
 
 
+def _thinking_message(age: int | None = None) -> str:
+    """年齢に応じた「考え中」メッセージを返す。
+    AI 呼び出し前に先送りして、応答待ちをユーザーに伝える。"""
+    if age is not None and age <= 7:
+        # 小学1〜2年生向け: ほぼひらがな
+        return "かんがえてるよ…"
+    if age is not None and age <= 9:
+        # 小学3〜4年生向け: 混合
+        return "かんがえ中だよ…"
+    # 10歳以上・未設定
+    return "考え中だよ…"
+
+
 def _usage_guide_text() -> str:
     """子供向けの使い方案内テキストを返す（ベーステキスト）。
     年齢適応が必要な場合は bot.py 側で Gemini にリライトさせる。"""
