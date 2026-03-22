@@ -8,11 +8,15 @@ import uvicorn
 from datetime import datetime
 
 from app.bot_utils import (
+    _assessment_history_message,
     _build_goal_achieved_message,
+    _child_review_message,
     _contains_any_keyword,
     _contains_force_assess_keyword,
     _extract_keyword_hits,
+    _is_same_month,
     _latest_assessed_amount,
+    _ledger_history_message,
     _load_jsonl,
     _monthly_increase_stats,
     _normalize_assessed_amounts,
@@ -43,7 +47,9 @@ from app.config import (
     get_wallet_audit_setting,
     load_all_users,
     load_system,
+    update_user_field,
 )
+from app import intent_normalizer
 from app.gemini_service import GeminiService, count_recent_allowance_requests
 from app.message_parser import (
     extract_input_from_mention,
@@ -73,24 +79,6 @@ LOW_BALANCE_ALERT = get_low_balance_alert_setting()
 MONTHLY_SUMMARY = get_monthly_summary_setting()
 POCKET_JOURNAL_REMINDER = get_pocket_journal_reminder_setting()
 
-# Geminiによる自然語コマンド意図判定プロンプト（案② ハイブリッド方式）
-_INTENT_PROMPT_TEMPLATE = """\
-以下のユーザーメッセージが次のコマンドのどれに相当するか判定してください。
-
-コマンド一覧:
-- dashboard: 全員の残高・状況を確認したい（例:「みんなの状況は？」「全員の残高教えて」）
-- analysis_all: 全員の支出傾向を分析したい（例:「みんなの使い方の傾向は？」）
-- analysis_user: 特定ユーザーの支出傾向を分析したい（例:「たろうの最近の支出は？」）
-- goal_check: 貯金目標の進捗を確認したい（例:「目標どのくらい進んだ？」「いくら貯まった？」）
-- goal_set: 貯金目標を設定したい（例:「ゲーム機のために30000円貯めたい」）
-- goal_clear: 貯金目標を削除・キャンセルしたい（例:「目標をやめる」「貯金目標取り消して」）
-- none: 上記のどれにも当てはまらない（お小遣い相談、雑談など）
-
-メッセージ: {message}
-
-JSON形式のみで回答してください（説明文不要）:
-{{"intent": "<コマンド名>", "target_name": "<ユーザー名またはnull>", "goal_title": "<タイトルまたはnull>", "goal_amount": <金額の整数またはnull>}}
-"""
 
 gemini_service = GeminiService(
     api_key=GEMINI_API_KEY,
@@ -135,84 +123,55 @@ def _set_initial_setup_pending(user_name: str, enabled: bool) -> None:
     state["initial_setup_pending_by_user"] = pending
     wallet_service.save_audit_state(state)
 
-async def maybe_handle_help_and_initial_setup(
+async def _handle_initial_setup_pending(
     message: discord.Message,
     user_conf: dict,
     system_conf: dict,
     input_block: str,
 ) -> bool:
+    """初期設定フローの pending 状態を処理する（AI正規化の前に呼ぶ）。
+    pending 状態でない場合は False を返して次の処理へ委譲する。"""
     user_name = str(user_conf.get("name", ""))
-    if not user_name:
+    if not user_name or not _is_initial_setup_pending(user_name):
         return False
 
-    setup_keywords = ["初期設定", "しょきせってい"]
-    usage_keywords = ["使い方", "つかいかた"]
-    balance_keywords = ["現在のお小遣い", "おこづかいいくら", "残高確認", "いまの残高", "今の残高"]
-    spending_keywords = ["支出記録", "ししゅつきろく", "支出の記録", "ししゅつのきろく","使った記録","つかったきろく"]
-
-    is_setup = _contains_any_keyword(input_block, setup_keywords)
-    is_usage = _contains_any_keyword(input_block, usage_keywords)
-    is_balance_check = _contains_any_keyword(input_block, balance_keywords)
-    is_spending = _contains_any_keyword(input_block, spending_keywords)
-    is_pending = _is_initial_setup_pending(user_name)
-
-    if is_setup or is_pending:
-        amount = _parse_yen_amount(input_block)
-        if amount is None:
-            _set_initial_setup_pending(user_name, True)
-            await message.channel.send(
-                "初期設定をはじめるよ。"
-                "\nいまの所持金を `1234円` の形で送ってね。"
-            )
-            return True
-
-        before = wallet_service.get_balance(user_name)
-        delta = int(amount) - int(before)
-        wallet_service.update_balance(
-            user_conf=user_conf,
-            system_conf=system_conf,
-            delta=delta,
-            action="initial_setup",
-            note="set_current_wallet_balance",
-            extra={"discord_user_id": int(message.author.id)},
-        )
-        _set_initial_setup_pending(user_name, False)
+    # pending 状態: 金額入力を待っている
+    amount = _parse_yen_amount(input_block)
+    if amount is None:
         await message.channel.send(
-            "初期設定を反映したよ。"
-            f"\n対象: {user_name}"
-            f"\n所持金: {before}円 → {amount}円"
+            "初期設定を続けるよ。\nいまの所持金を `1234円` の形で送ってね。"
         )
         return True
 
-    if is_usage:
-        # 子供向けガイドを送信する
-        await message.channel.send(_usage_guide_text())
-        # 親の場合は親専用コマンド一覧も追加で送信する
-        if is_parent(message.author.id):
-            await message.channel.send(_usage_guide_text_parent())
-        return True
+    # 金額が入力されたので残高を設定する
+    before = wallet_service.get_balance(user_name)
+    delta = int(amount) - int(before)
+    wallet_service.update_balance(
+        user_conf=user_conf,
+        system_conf=system_conf,
+        delta=delta,
+        action="initial_setup",
+        note="set_current_wallet_balance",
+        extra={"discord_user_id": int(message.author.id)},
+    )
+    _set_initial_setup_pending(user_name, False)
+    await message.channel.send(
+        "初期設定を反映したよ。"
+        f"\n対象: {user_name}"
+        f"\n所持金: {before}円 → {amount}円"
+    )
+    return True
 
-    if is_balance_check:
-        now_balance = wallet_service.get_balance(user_name)
-        await message.channel.send(f"{user_name}さんの現在の所持金は {now_balance}円 だよ。")
-        return True
 
-    if is_spending:
-        state = wallet_service.load_audit_state()
-        pending = state.get("spending_record_pending_by_user", {})
-        if not isinstance(pending, dict):
-            pending = {}
-        pending[user_name] = now_jst_iso()
-        state["spending_record_pending_by_user"] = pending
-        wallet_service.save_audit_state(state)
-        await message.channel.send(
-            "支出の記録をするよ。次のどちらかで送ってね。"
-            "\n1. `使った物: ノート` `理由: テスト勉強のため` `満足度: 8`"
-            "\n2. `ノート / テスト勉強のため / 8`"
-        )
-        return True
+# NOTE: maybe_handle_help_and_initial_setup は B案移行に伴い
+#       _handle_initial_setup_pending に置き換えた（N-2）。
+#       トリガー（初期設定・使い方・残高確認・支出記録の起動）は
+#       AI正規化 → _dispatch_by_intent で処理する。
 
-    return False
+# NOTE: 支出記録フロー（pending 状態 + 直接フォーマット入力）は
+#       maybe_handle_spending_record_flow で継続して処理する。
+#       起動トリガー（自然言語での「支出記録したい」等）は
+#       AI正規化 → _dispatch_by_intent の spending_record ブランチで処理する。
 
 
 async def maybe_handle_spending_record_flow(
@@ -282,108 +241,288 @@ async def maybe_handle_spending_record_flow(
     return True
 
 
-async def _detect_command_intent(input_block: str) -> dict | None:
-    """
-    自然語メッセージからコマンド意図をGeminiで判定する（案② ハイブリッド方式）。
-    40文字超の場合はお小遣い相談の可能性が高いためスキップする。
-    戻り値: {"intent": "...", "target_name": ..., "goal_title": ..., "goal_amount": ...} or None
-    """
-    # 長文はコマンドではなく相談と判断してAPI呼び出しをスキップする（コスト節約）
-    if len(input_block) > 40:
-        return None
+# ------------------------------------------------------------------
+# pending_intent 状態管理（confidence:low 確認フロー用）
+# ------------------------------------------------------------------
 
-    prompt = _INTENT_PROMPT_TEMPLATE.format(message=input_block)
-    try:
-        # call_silent は「考え中...」を表示しない軽量呼び出しである
-        raw = await gemini_service.call_silent(prompt)
-        # Geminiの返答からJSONブロックだけを正規表現で抽出する
-        m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
-        if m:
-            result = json.loads(m.group())
-            # intent フィールドが存在する場合のみ有効な結果として返す
-            if isinstance(result, dict) and result.get("intent"):
-                return result
-    except Exception as e:
-        # intent検知の失敗はボット動作を止めないためログ出力のみとする
-        print(f"Intent detection error: {e}")
-    return None
+def _get_pending_intent(user_name: str) -> dict | None:
+    """pending_intent 状態を取得する。なければ None を返す"""
+    state = wallet_service.load_audit_state()
+    pending = state.get("pending_intent_by_user", {})
+    return pending.get(user_name) if isinstance(pending, dict) else None
 
 
-async def _handle_detected_intent(
+def _set_pending_intent(user_name: str, intent_result: dict, original_input: str) -> None:
+    """confidence:low の確認待ち intent を保存する"""
+    state = wallet_service.load_audit_state()
+    pending = state.get("pending_intent_by_user")
+    if not isinstance(pending, dict):
+        pending = {}
+    # 元のメッセージと intent_result を保存して確認後にディスパッチできるようにする
+    pending[user_name] = {
+        "ts": now_jst_iso(),
+        "intent_result": intent_result,
+        "original_input": original_input,
+    }
+    state["pending_intent_by_user"] = pending
+    wallet_service.save_audit_state(state)
+
+
+def _clear_pending_intent(user_name: str) -> None:
+    """pending_intent 状態を削除する"""
+    state = wallet_service.load_audit_state()
+    pending = state.get("pending_intent_by_user", {})
+    if isinstance(pending, dict):
+        pending.pop(user_name, None)
+    state["pending_intent_by_user"] = pending
+    wallet_service.save_audit_state(state)
+
+
+async def _ask_intent_confirmation(
+    message: discord.Message,
+    user_conf: dict,
+    intent_result: dict,
+    original_input: str,
+) -> None:
+    """confidence:low の場合、確認メッセージを送信して pending_intent に保存する"""
+    user_name = str(user_conf.get("name", ""))
+    intent = intent_result.get("intent", "none")
+    question = intent_normalizer.get_confirmation_question(intent)
+    # pending_intent を保存して次回の返答で確認を受け取れるようにする
+    _set_pending_intent(user_name, intent_result, original_input)
+    await message.channel.send(f"{question}（「はい」か「ちがう」で答えてね）")
+
+
+async def _handle_pending_intent_reply(
     message: discord.Message,
     user_conf: dict,
     system_conf: dict,
-    intent: dict,
+    input_block: str,
 ) -> bool:
-    """Gemini が検出したコマンド意図に応じて適切なハンドラを呼び出す（案②）"""
-    intent_name = str(intent.get("intent", "none")).strip()
+    """pending_intent の確認返答を処理する（B案: 1回のみ確認フロー）。
+    pending がなければ False を返して次の処理へ委譲する。"""
+    user_name = str(user_conf.get("name", ""))
+    pending = _get_pending_intent(user_name)
+    if not pending:
+        return False
 
-    # --- dashboard: 全体確認ダッシュボード（親専用）---
-    if intent_name == "dashboard":
-        # 親以外からのアクセスは無視する
-        if not is_parent(message.author.id):
-            return False
-        # maybe_handle_parent_dashboard と同じロジックでダッシュボードを構築する
-        system_conf_l = load_system()
-        log_dir = get_log_dir(system_conf_l)
-        users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-        audit_state = wallet_service.load_audit_state()
-        pending_by_user = audit_state.get("pending_by_user", {})
-        lines = ["【全体確認ダッシュボード】"]
-        for u in users:
-            name = str(u.get("name", ""))
-            fixed = int(u.get("fixed_allowance", 0))
-            balance = wallet_service.get_balance(name)
-            report_status = "未報告" if name in pending_by_user else "報告済"
-            # 支出記録の末尾レコードから最終支出日を取得する
-            journal_rows = _load_jsonl(log_dir / f"{name}_pocket_journal.jsonl")
-            last_spending_date = "なし"
-            if journal_rows:
-                last_ts = journal_rows[-1].get("ts")
-                if last_ts:
-                    try:
-                        dt = datetime.fromisoformat(str(last_ts))
-                        last_spending_date = dt.strftime("%m/%d")
-                    except Exception:
-                        pass
-            lines.append(
-                f"・{name}: 固定{fixed}円 / 残高{balance}円 / 残高報告:{report_status} / 最終支出:{last_spending_date}"
+    if intent_normalizer.is_yes_reply(input_block):
+        # ユーザーが確認 → 保存された intent で改めてディスパッチする
+        _clear_pending_intent(user_name)
+        saved_intent = pending.get("intent_result", {})
+        saved_input = pending.get("original_input", input_block)
+        return await _dispatch_by_intent(message, user_conf, system_conf, saved_input, saved_intent)
+
+    if intent_normalizer.is_no_reply(input_block):
+        # ユーザーが否定 → pending を消して査定フローへ落とす
+        _clear_pending_intent(user_name)
+        return False
+
+    # 明確な yes/no でない → 確認は1回だけのルール通り pending を消してフォールスルー
+    _clear_pending_intent(user_name)
+    return False
+
+
+# ------------------------------------------------------------------
+# B案ディスパッチャー — AI正規化済みの intent に応じてハンドラを呼ぶ
+# ------------------------------------------------------------------
+
+async def _dispatch_by_intent(
+    message: discord.Message,
+    user_conf: dict,
+    system_conf: dict,
+    input_block: str,
+    intent_result: dict,
+) -> bool:
+    """AI正規化済みの intent に応じて適切な処理を呼び出すディスパッチャー。
+    処理した場合 True、査定フローへ落とす場合 False を返す。"""
+    intent = str(intent_result.get("intent", "none")).strip()
+    entities = intent_result.get("entities") or {}
+    user_name = str(user_conf.get("name", ""))
+
+    # --- 残高確認 ---
+    if intent == "balance_check":
+        balance = wallet_service.get_balance(user_name)
+        await message.channel.send(f"{user_name}さんの現在の所持金は {balance}円 だよ。")
+        return True
+
+    # --- 使い方ガイド ---
+    if intent == "usage_guide":
+        # 子供向けガイドを送信する
+        await message.channel.send(_usage_guide_text())
+        # 親の場合は親専用コマンド一覧も追加で送信する
+        if is_parent(message.author.id):
+            await message.channel.send(_usage_guide_text_parent())
+        return True
+
+    # --- 初期設定（トリガー）---
+    if intent == "initial_setup":
+        # AI が金額を entities に持っている場合は即設定、なければフロー開始
+        amount = entities.get("amount")
+        if amount is None:
+            amount = _parse_yen_amount(input_block)
+        if amount is None:
+            # 金額不明 → pending 状態にして入力を促す
+            _set_initial_setup_pending(user_name, True)
+            await message.channel.send(
+                "初期設定をはじめるよ。\nいまの所持金を `1234円` の形で送ってね。"
             )
-        await message.channel.send("\n".join(lines))
+        else:
+            before = wallet_service.get_balance(user_name)
+            delta = int(amount) - int(before)
+            wallet_service.update_balance(
+                user_conf=user_conf,
+                system_conf=system_conf,
+                delta=delta,
+                action="initial_setup",
+                note="set_current_wallet_balance",
+                extra={"discord_user_id": int(message.author.id)},
+            )
+            _set_initial_setup_pending(user_name, False)
+            await message.channel.send(
+                "初期設定を反映したよ。"
+                f"\n対象: {user_name}"
+                f"\n所持金: {before}円 → {amount}円"
+            )
         return True
 
-    # --- analysis_all / analysis_user: 支出傾向分析（親専用）---
-    if intent_name in ("analysis_all", "analysis_user"):
-        if not is_parent(message.author.id):
+    # --- 支出記録フロー開始（トリガー）---
+    if intent == "spending_record":
+        # pending 状態を立てて入力フォーマットを案内する
+        state = wallet_service.load_audit_state()
+        pending = state.get("spending_record_pending_by_user", {})
+        if not isinstance(pending, dict):
+            pending = {}
+        pending[user_name] = now_jst_iso()
+        state["spending_record_pending_by_user"] = pending
+        wallet_service.save_audit_state(state)
+        await message.channel.send(
+            "支出の記録をするよ。次のどちらかで送ってね。"
+            "\n1. `使った物: ノート` `理由: テスト勉強のため` `満足度: 8`"
+            "\n2. `ノート / テスト勉強のため / 8`"
+        )
+        return True
+
+    # --- 手動支出（金額明示の即時記録）---
+    if intent == "manual_expense":
+        amount = entities.get("amount")
+        item = str(entities.get("item") or "").strip()
+        # entities に金額がない場合は input から regex で再試行する
+        if amount is None:
+            m = re.match(r"(\d[\d,]*)\s*円", input_block)
+            if m:
+                amount = int(m.group(1).replace(",", ""))
+        if not amount:
+            await message.channel.send(
+                "金額が読み取れなかったよ。「支出 500円 お菓子」の形で送ってね。"
+            )
+            return True
+        before = wallet_service.get_balance(user_name)
+        new_balance, _ = wallet_service.update_balance(
+            user_conf=user_conf,
+            system_conf=system_conf,
+            delta=-int(amount),
+            action="manual_expense",
+            note=item,
+        )
+        # pocket_journal にも記録して振り返り・分析で金額が見えるようにする
+        log_dir = get_log_dir(system_conf)
+        journal_path = log_dir / f"{user_name}_pocket_journal.jsonl"
+        append_jsonl(journal_path, {
+            "ts": now_jst_iso(),
+            "discord_user_id": message.author.id,
+            "name": user_name,
+            "item": item if item else "支出",
+            "reason": "手動支出",
+            "reason_word_count": 0,
+            "satisfaction": None,
+            "amount": int(amount),
+        })
+        await message.channel.send(
+            f"支出を記録したよ。"
+            f"\n- 金額: {amount}円"
+            f"\n- メモ: {item if item else 'なし'}"
+            f"\n残高: {before}円 → {new_balance}円"
+        )
+        # 残高低下時は親へアラートを送信する
+        await handlers_child.maybe_send_low_balance_alert(user_conf=user_conf, new_balance=new_balance)
+        return True
+
+    # --- 臨時入金 ---
+    if intent == "manual_income":
+        amount = entities.get("amount")
+        # item・reason どちらかをメモとして使う
+        item = str(entities.get("item") or entities.get("reason") or "").strip()
+        if amount is None:
+            m = re.match(r"(\d[\d,]*)\s*円", input_block)
+            if m:
+                amount = int(m.group(1).replace(",", ""))
+        if not amount:
+            await message.channel.send(
+                "金額が読み取れなかったよ。「入金 3000円 お年玉」の形で送ってね。"
+            )
+            return True
+        before = wallet_service.get_balance(user_name)
+        new_balance, achieved_goals = wallet_service.update_balance(
+            user_conf=user_conf,
+            system_conf=system_conf,
+            delta=int(amount),
+            action="manual_income",
+            note=item,
+        )
+        await message.channel.send(
+            f"入金を記録したよ。"
+            f"\n- 金額: {amount}円"
+            f"\n- メモ: {item if item else 'なし'}"
+            f"\n残高: {before}円 → {new_balance}円"
+        )
+        # 入金で目標が達成された場合は祝福メッセージを送る
+        for achieved_goal in achieved_goals:
+            await message.channel.send(
+                _build_goal_achieved_message(user_conf=user_conf, goal=achieved_goal)
+            )
+        return True
+
+    # --- 残高報告（照合）---
+    if intent == "balance_report":
+        # AI が抽出した amount を優先し、なければ regex で parse する
+        reported = entities.get("amount")
+        if reported is None:
+            reported = parse_balance_report(input_block)
+        if reported is None:
+            # 金額が取れない場合は査定フローへ落とす
             return False
-        log_dir = get_log_dir(load_system())
-        now_dt = datetime.now(JST)
-        if intent_name == "analysis_all":
-            # 全ユーザー分の分析テキストを結合して返す
-            users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-            parts = [_spending_analysis_for_user(log_dir, str(u.get("name", "")), now_dt) for u in users]
-            reply = "\n\n".join(parts) if parts else "ユーザーが見つからないよ。"
-        else:
-            # Gemini が抽出した target_name が空の場合はエラーを返す
-            target_name = str(intent.get("target_name") or "").strip()
-            if not target_name:
-                await message.channel.send("分析対象のユーザー名が分からなかったよ。`[名前]の分析` と送ってね。")
-                return True
-            reply = _spending_analysis_for_user(log_dir, target_name, now_dt)
-        # 1900文字を超える場合は分割して送信する
-        if len(reply) > 1900:
-            for i in range(0, len(reply), 1900):
-                await message.channel.send(reply[i: i + 1900])
-        else:
-            await message.channel.send(reply)
+        expected = wallet_service.get_balance(user_name)
+        diff = int(reported) - int(expected)
+        state = wallet_service.load_audit_state()
+        state["pending_by_user"].pop(user_name, None)
+        wallet_service.save_audit_state(state)
+        if diff == 0:
+            await message.channel.send(
+                f"{user_name}の残高報告を記録したよ。"
+                f"\n報告残高: {reported}円 / 帳簿残高: {expected}円（差分0円）"
+            )
+            return True
+        # 差分がある場合はペナルティを適用する
+        penalty = wallet_service.apply_penalty(
+            user_conf=user_conf,
+            system_conf=system_conf,
+            diff=diff,
+            wallet_audit_conf=WALLET_AUDIT,
+        )
+        new_balance = wallet_service.get_balance(user_name)
+        await message.channel.send(
+            f"{user_name}の残高差分を検知したよ。"
+            f"\n報告残高: {reported}円 / 帳簿残高: {expected}円 / 差分: {diff}円"
+            f"\nペナルティ減額: {penalty}円"
+            f"\n減額後の帳簿残高: {new_balance}円"
+        )
         return True
 
-    # --- goal_check: 目標確認（複数対応）---
-    if intent_name == "goal_check":
-        user_name = str(user_conf.get("name", ""))
+    # --- 貯金目標 確認 ---
+    if intent == "goal_check":
         goals = wallet_service.get_savings_goals(user_name)
         current = wallet_service.get_balance(user_name)
-        # 目標未設定の場合は設定方法を案内する
         if not goals:
             await message.channel.send(
                 "貯金目標がまだ設定されてないよ。\n`貯金目標 ゲーム機 30000円` の形で設定してね。"
@@ -403,12 +542,11 @@ async def _handle_detected_intent(
             await message.channel.send("\n".join(lines))
         return True
 
-    # --- goal_set: 目標追加（Gemini が title と amount を抽出する）---
-    if intent_name == "goal_set":
-        user_name = str(user_conf.get("name", ""))
-        goal_title = str(intent.get("goal_title") or "").strip()
-        goal_amount = intent.get("goal_amount")
-        # タイトルまたは金額が取得できない場合は再入力を促す
+    # --- 貯金目標 設定 ---
+    if intent == "goal_set":
+        goal_title = str(entities.get("goal_title") or "").strip()
+        goal_amount = entities.get("amount")
+        # タイトルまたは金額が取れない場合は再入力を促す
         if not goal_title or not isinstance(goal_amount, (int, float)) or goal_amount <= 0:
             await message.channel.send(
                 "目標のタイトルと金額が分からなかったよ。\n`貯金目標 ゲーム機 30000円` の形で送ってね。"
@@ -430,14 +568,156 @@ async def _handle_detected_intent(
         )
         return True
 
-    # --- goal_clear: 全目標削除（Gemini検知は曖昧なケース → 全削除が妥当）---
-    if intent_name == "goal_clear":
-        user_name = str(user_conf.get("name", ""))
-        wallet_service.clear_all_savings_goals(user_name)
-        await message.channel.send(f"{user_name}の貯金目標を全て削除したよ。")
+    # --- 貯金目標 削除 ---
+    if intent == "goal_clear":
+        goal_title = str(entities.get("goal_title") or "").strip()
+        if goal_title:
+            # タイトルが指定されている場合は1件だけ削除する
+            found = wallet_service.remove_savings_goal(user_name, goal_title)
+            if found:
+                await message.channel.send(f"目標「{goal_title}」を削除したよ。")
+            else:
+                await message.channel.send(f"目標「{goal_title}」は見つからなかったよ。")
+        else:
+            # タイトル不明 → 全削除
+            wallet_service.clear_all_savings_goals(user_name)
+            await message.channel.send(f"{user_name}の貯金目標を全て削除したよ。")
         return True
 
-    # 上記のいずれにも該当しない intent は処理しない
+    # --- 子供向け振り返り ---
+    if intent == "child_review":
+        now = datetime.now(JST)
+        log_dir = get_log_dir(system_conf)
+        journal_path = log_dir / f"{user_name}_pocket_journal.jsonl"
+        all_rows = _load_jsonl(journal_path)
+        # 当月の支出記録だけを絞り込む
+        month_rows = [
+            r for r in all_rows
+            if _is_same_month(r.get("ts"), now.year, now.month)
+        ]
+        balance = wallet_service.get_balance(user_name)
+        msg = _child_review_message(
+            user_conf=user_conf,
+            month_rows=month_rows,
+            balance=balance,
+            year=now.year,
+            month=now.month,
+        )
+        await message.channel.send(msg)
+        return True
+
+    # --- 査定履歴確認 ---
+    if intent == "assessment_history":
+        log_dir = get_log_dir(system_conf)
+        amounts_path = log_dir / f"{user_name}_allowance_amounts.jsonl"
+        all_rows = _load_jsonl(amounts_path)
+        # 新しい順に並べるため末尾5件を逆順で取得する
+        recent = list(reversed(all_rows[-5:]))
+        msg = _assessment_history_message(user_conf=user_conf, rows=recent)
+        await message.channel.send(msg)
+        return True
+
+    # --- 入出金台帳履歴 ---
+    if intent == "ledger_history":
+        target_name = str(entities.get("target_name") or "").strip()
+        if target_name and target_name != user_name:
+            # 他ユーザーの台帳閲覧は親のみ許可する
+            if not is_parent(message.author.id):
+                await message.channel.send("他のユーザーの台帳確認は親のみできるよ。")
+                return True
+            target_conf = find_user_by_name(target_name)
+            if target_conf is None:
+                await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
+                return True
+            view_conf = target_conf
+        else:
+            # target_name 未指定 → 自分の台帳を表示する
+            view_conf = user_conf
+        log_dir = get_log_dir(system_conf)
+        ledger_path = log_dir / f"{view_conf.get('name', '')}_wallet_ledger.jsonl"
+        rows = _load_jsonl(ledger_path)
+        await message.channel.send(_ledger_history_message(view_conf, rows))
+        return True
+
+    # --- ダッシュボード（親専用）---
+    if intent == "dashboard":
+        if not is_parent(message.author.id):
+            return False
+        log_dir = get_log_dir(load_system())
+        users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
+        audit_state = wallet_service.load_audit_state()
+        pending_by_user = audit_state.get("pending_by_user", {})
+        lines = ["【全体確認ダッシュボード】"]
+        for u in users:
+            name = str(u.get("name", ""))
+            fixed = int(u.get("fixed_allowance", 0))
+            balance = wallet_service.get_balance(name)
+            report_status = "未報告" if name in pending_by_user else "報告済"
+            # 最終支出日を pocket_journal の末尾レコードから取得する
+            journal_rows = _load_jsonl(log_dir / f"{name}_pocket_journal.jsonl")
+            last_spending_date = "なし"
+            if journal_rows:
+                last_ts = journal_rows[-1].get("ts")
+                if last_ts:
+                    try:
+                        dt = datetime.fromisoformat(str(last_ts))
+                        last_spending_date = dt.strftime("%m/%d")
+                    except Exception:
+                        pass
+            lines.append(
+                f"・{name}: 固定{fixed}円 / 残高{balance}円 / 残高報告:{report_status} / 最終支出:{last_spending_date}"
+            )
+        await message.channel.send("\n".join(lines))
+        return True
+
+    # --- 支出傾向分析（親専用）---
+    if intent in ("analysis_all", "analysis_user"):
+        if not is_parent(message.author.id):
+            return False
+        log_dir = get_log_dir(load_system())
+        now_dt = datetime.now(JST)
+        if intent == "analysis_all":
+            # 全ユーザー分の分析テキストを結合して返す
+            users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
+            parts = [_spending_analysis_for_user(log_dir, str(u.get("name", "")), now_dt) for u in users]
+            reply = "\n\n".join(parts) if parts else "ユーザーが見つからないよ。"
+        else:
+            # analysis_user: entities から対象ユーザー名を取得する
+            target_name = str(entities.get("target_name") or "").strip()
+            if not target_name:
+                await message.channel.send("分析対象のユーザー名が分からなかったよ。`[名前]の分析` と送ってね。")
+                return True
+            reply = _spending_analysis_for_user(log_dir, target_name, now_dt)
+        # 1900文字超の場合は分割して送信する
+        if len(reply) > 1900:
+            for i in range(0, len(reply), 1900):
+                await message.channel.send(reply[i: i + 1900])
+        else:
+            await message.channel.send(reply)
+        return True
+
+    # --- ボットパーソナリティ変更（N-4）---
+    if intent == "personality_change":
+        personality = str(entities.get("personality") or "sibling").strip()
+        # 有効な personality 値にフォールバックする
+        valid = {"parent", "sibling", "friend", "teacher"}
+        if personality not in valid:
+            personality = "sibling"
+        ok = update_user_field(user_name, "bot_personality", personality)
+        labels = {
+            "parent": "親っぽい口調",
+            "sibling": "兄姉っぽい口調",
+            "friend": "友達口調",
+            "teacher": "先生口調",
+        }
+        label = labels.get(personality, personality)
+        if ok:
+            await message.channel.send(f"話し方を「{label}」に変えたよ。")
+        else:
+            await message.channel.send("設定の変更に失敗したよ。")
+        return True
+
+    # none / allowance_request は査定フローへ落とす
     return False
 
 
@@ -601,7 +881,10 @@ async def on_message(message: discord.Message):
         await message.channel.send("設定にあなたのDiscord IDが登録されてないみたい。親に `settings/users/*.json` を追加してもらってね。")
         return
 
-    if await maybe_handle_help_and_initial_setup(
+    # --- B案フロー: pending 状態の処理（AI正規化をスキップして直接処理する）---
+
+    # 初期設定フローの pending 状態を処理する（金額待ち）
+    if await _handle_initial_setup_pending(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
@@ -609,6 +892,7 @@ async def on_message(message: discord.Message):
     ):
         return
 
+    # 支出記録フロー（pending 状態 + 直接フォーマット入力をAI前にキャッチする）
     if await maybe_handle_spending_record_flow(
         message=message,
         user_conf=user_conf,
@@ -617,14 +901,8 @@ async def on_message(message: discord.Message):
     ):
         return
 
-    if await handlers_child.maybe_handle_savings_goal(
-        message=message,
-        user_conf=user_conf,
-        input_block=input_block,
-    ):
-        return
-
-    if await handlers_child.maybe_handle_child_review(
+    # pending_intent の確認返答を処理する（confidence:low 確認フロー）
+    if await _handle_pending_intent_reply(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
@@ -632,77 +910,21 @@ async def on_message(message: discord.Message):
     ):
         return
 
-    if await handlers_child.maybe_handle_assessment_history(
-        message=message,
-        user_conf=user_conf,
-        system_conf=system_conf,
-        input_block=input_block,
-    ):
+    # --- B案: AI正規化 → ディスパッチャー ---
+
+    # Gemini 軽量モデルで intent + entities + confidence を取得する
+    intent_result = await intent_normalizer.normalize_intent(input_block, gemini_service)
+
+    # 低信頼度の場合は確認メッセージを送って終了する（確認は1回のみ）
+    if intent_result.get("confidence") == "low":
+        await _ask_intent_confirmation(message, user_conf, intent_result, input_block)
         return
 
-    # 入出金台帳確認コマンド（「入出金履歴」「台帳確認」「たろうの台帳」）
-    if await handlers_child.maybe_handle_ledger_history(
-        message=message,
-        user_conf=user_conf,
-        system_conf=system_conf,
-        input_block=input_block,
-    ):
+    # ディスパッチャー（all child コマンドを intent ベースで処理する）
+    if await _dispatch_by_intent(message, user_conf, system_conf, input_block, intent_result):
         return
 
-    # 子供による手動支出コマンド（「支出 500円 お菓子」）
-    if await handlers_child.maybe_handle_manual_expense(
-        message=message,
-        user_conf=user_conf,
-        system_conf=system_conf,
-        input_block=input_block,
-    ):
-        return
-
-    # 子供による臨時入金コマンド（「入金 3000円 お年玉」）
-    if await handlers_child.maybe_handle_manual_income(
-        message=message,
-        user_conf=user_conf,
-        system_conf=system_conf,
-        input_block=input_block,
-    ):
-        return
-
-    # 案② ハイブリッドGemini意図判定: ルールベースでマッチしなかった短いメッセージのみ試みる
-    detected_intent = await _detect_command_intent(input_block)
-    if detected_intent and detected_intent.get("intent") != "none":
-        if await _handle_detected_intent(message, user_conf, system_conf, intent=detected_intent):
-            return
-
-    reported_balance = parse_balance_report(input_block)
-    if reported_balance is not None:
-        expected = wallet_service.get_balance(str(user_conf.get("name", "")))
-        diff = int(reported_balance) - int(expected)
-        state = wallet_service.load_audit_state()
-        state["pending_by_user"].pop(str(user_conf.get("name", "")), None)
-        wallet_service.save_audit_state(state)
-
-        if diff == 0:
-            await message.channel.send(
-                f"{user_conf.get('name')}の残高報告を記録したよ。"
-                f"\n報告残高: {reported_balance}円 / 帳簿残高: {expected}円（差分0円）"
-            )
-            return
-
-        penalty = wallet_service.apply_penalty(
-            user_conf=user_conf,
-            system_conf=system_conf,
-            diff=diff,
-            wallet_audit_conf=WALLET_AUDIT,
-        )
-        new_balance = wallet_service.get_balance(str(user_conf.get("name", "")))
-        await message.channel.send(
-            f"{user_conf.get('name')}の残高差分を検知したよ。"
-            f"\n報告残高: {reported_balance}円 / 帳簿残高: {expected}円 / 差分: {diff}円"
-            f"\nペナルティ減額: {penalty}円"
-            f"\n減額後の帳簿残高: {new_balance}円"
-        )
-        return
-
+    # none / allowance_request の場合は査定フローへ落ちる
     force_assess_mode = _contains_force_assess_keyword(input_block, FORCE_ASSESS_TEST_KEYWORD)
     await message.channel.send("考え中だよ...")
 
@@ -743,6 +965,8 @@ async def on_message(message: discord.Message):
         fixed_increase_cap=int(user_conf.get("fixed_increase_cap", 100)),
         months_since_last_fixed_increase=increase_stats["months_since_last_fixed_increase"],
         fixed_increase_count_this_year=increase_stats["fixed_increase_count_this_year"],
+        # bot_personality は user_conf から読む（N-4）
+        bot_personality=str(user_conf.get("bot_personality", "sibling")),
     )
     try:
         reply = await gemini_service.call_with_progress(message.channel, prompt)

@@ -1,6 +1,52 @@
 import json
 
 
+def _personality_tone_rule(personality: str) -> str:
+    """ボットパーソナリティに応じた口調指示を返す（N-4）"""
+    rules = {
+        "parent": (
+            "口調は「親が子供に話すような」温かく安心感のあるトーン。"
+            "「ちゃんとできてるよ」「一緒に考えようね」など安心させる表現を使う。"
+            "丁寧で穏やか。説明はしっかりめに。"
+        ),
+        "sibling": (
+            "口調は「兄や姉が弟妹に話すような」フレンドリーで話しやすいトーン（デフォルト）。"
+            "「それ、いいと思う！」「どうしたい？」など対等で親しみやすい表現を使う。"
+            "タメ口寄りだが適度な丁寧さを持ち合わせる。"
+        ),
+        "friend": (
+            "口調は「同い年の友達と話すような」軽めでカジュアルなトーン。"
+            "「えー、いいじゃん！」「どうする？」などタメ口で共感多め。"
+            "短くテンポよく返す。説教口調は厳禁。"
+        ),
+        "teacher": (
+            "口調は「先生が生徒に話すような」丁寧で教育的なトーン。"
+            "「〜という考え方もあるよ」「一つ確認してみよう」などロジカルな言い回し。"
+            "丁寧かつ上から目線にならない。"
+        ),
+    }
+    return rules.get(personality, rules["sibling"])
+
+
+def _coaching_rule() -> str:
+    """コーチングを行う場面・行わない場面のルールを返す（N-3）。
+    査定のたびに毎回コーチングするのではなく、必要な場面に絞ること。"""
+    return (
+        "【コーチングを行う場面（この場合のみコーチングを入れる）】\n"
+        "- 明らかな浪費・衝動パターンが続いているとき（過去の満足度が低いものが多い等）\n"
+        "- 貯蓄意思はあるが目的・計画が曖昧なとき\n"
+        "- 同じ失敗を繰り返しているとき（似たような低満足度の支出が続く等）\n"
+        "\n"
+        "【コーチングをしない場面（短く答えて終わる）】\n"
+        "- 残高確認・目標確認・履歴確認など情報取得系の応答\n"
+        "- 支出記録・入金など記録操作系の応答\n"
+        "- 査定理由が十分で計画が明確なとき\n"
+        "- 雑談\n"
+        "\n"
+        "コーチングを入れる場合は「1〜2文以内」が上限。誘導質問の多発は禁止。"
+    )
+
+
 def _age_language_rule(age: int | None) -> str:
     """年齢に応じた言葉遣いの具体的指示を返す。未設定は小学校中学年基準とする"""
     if age is None:
@@ -69,6 +115,7 @@ def build_prompt(
     fixed_increase_cap: int = 0,
     months_since_last_fixed_increase: int | None = None,
     fixed_increase_count_this_year: int = 0,
+    bot_personality: str = "sibling",
 ) -> str:
     if not assess_keyword:
         raise ValueError("assess_keyword is required")
@@ -110,6 +157,10 @@ def build_prompt(
         "性別情報は会話の具体例・興味関心の当て方の補助としてのみ使う。"
         "固定観念で決めつけたり、査定の有利不利を変えたりしない。"
     )
+    # パーソナリティ設定: user_conf の bot_personality を優先し、引数をフォールバックとする
+    personality = str(user_conf.get("bot_personality") or bot_personality or "sibling").strip()
+    personality_tone_rule = _personality_tone_rule(personality)
+    coaching_rule = _coaching_rule()
 
     return f"""
 あなたは家庭内のお小遣いサポートBot「Compass」です。日本語で返答します。
@@ -119,7 +170,9 @@ def build_prompt(
 雑談などで査定が不要と判断した場合は、通常回答にしてください。
 子どもの発言に不明点や深掘りしないと判断ができない点があれば1問の質問を2回まで繰り返せます。ただし、判断ができない場合のみ質問は許可し、メタ認知の質問はしないでください。
 子どもの名前を呼ぶときは必ず「{name}さん、」の形式を使ってください。
-コーチングの話術を活用し、あなたが「～したほうがいい」と指示するのではなく、自発的に考え自分自身で決める力を伸ばしてあげてください。
+【口調設定（bot_personality: {personality}）】: {personality_tone_rule}
+【コーチングルール】:
+{coaching_rule}
 文章の読みやすさルール: {reading_style_rule}
 対象年齢: {age_text}
 対象性別: {gender_text}
