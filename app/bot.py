@@ -254,6 +254,14 @@ async def _commit_expense_record(
     balance_line = ""
     if amount:
         before = wallet_service.get_balance(user_name)
+        if int(before) - int(amount) < 0:
+            # 残高不足: pocket_journal には記録するが残高は変更しない
+            await message.channel.send(
+                "お小遣い帳には記録したよ。\n"
+                f"でも残高が足りないよ！今の残高は {before}円 で、{int(amount):,}円 は使えないよ。\n"
+                "残高の変更はしなかったよ。"
+            )
+            return
         new_balance, _ = wallet_service.update_balance(
             user_conf=user_conf,
             system_conf=system_conf,
