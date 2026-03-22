@@ -182,8 +182,10 @@ async def _extract_expense_info(text: str, gemini_service) -> dict:
         "以下のメッセージから支出情報を抽出してJSONのみ返してください（説明不要）。\n"
         '{"item": "買ったもの(必須)", "amount": 金額の整数またはnull, '
         '"reason": "理由またはnull", "satisfaction": 0〜10の整数またはnull}\n'
-        "【注意】item は具体的な商品・サービス名が必要です。"
-        "「なんか」「もの」「あれ」「これ」など曖昧すぎる場合は item を null にしてください。\n\n"
+        "【注意】\n"
+        "- item は具体的な商品・サービス名が必要。「なんか」「もの」「あれ」「これ」など曖昧な場合は null。\n"
+        "- reason は購入の動機・感想・目的のみ。「残高教えて」「いくらある？」などコマンド的な文章から reason を推測しないこと。\n"
+        "- 支出の話をしていないメッセージには全フィールド null を返すこと。\n\n"
         f"メッセージ: {text}"
     )
     if not gemini_service:
