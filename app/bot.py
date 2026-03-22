@@ -180,7 +180,11 @@ async def maybe_handle_spending_record_flow(
     user_conf: dict,
     system_conf: dict,
     input_block: str,
+    gemini_service=None,
 ) -> bool:
+    """支出記録フロー（pending 状態のみ処理する）。
+    pending 中の自然言語入力を Gemini で構造化して pocket_journal に記録する。
+    金額が読み取れた場合は残高も更新する。"""
     user_name = str(user_conf.get("name", ""))
     if not user_name:
         return False
@@ -190,54 +194,91 @@ async def maybe_handle_spending_record_flow(
     if not isinstance(pending, dict):
         pending = {}
 
-    is_pending = user_name in pending
-    parsed = parse_usage_report(input_block) or parse_usage_report_flexible(input_block)
-
-    if parsed is None and not is_pending:
+    # pending 状態でなければこのハンドラーは処理しない
+    if user_name not in pending:
         return False
 
-    if parsed is None and is_pending:
+    # Gemini で自然言語から支出情報を抽出する
+    extract_prompt = (
+        "以下のメッセージから支出情報を抽出してJSONのみ返してください（説明不要）。\n"
+        '{"item": "買ったもの(必須)", "amount": 金額の整数またはnull, '
+        '"reason": "理由またはnull", "satisfaction": 0〜10の整数またはnull}\n\n'
+        f"メッセージ: {input_block}"
+    )
+    extracted = None
+    if gemini_service:
+        try:
+            raw = await gemini_service.call_silent(extract_prompt)
+            m = re.search(r'\{[\s\S]*\}', raw)
+            if m:
+                extracted = json.loads(m.group())
+        except Exception as e:
+            print(f"[spending_record] extract error: {e}")
+
+    # item が読み取れなかった場合は再促す
+    if not extracted or not extracted.get("item"):
         await message.channel.send(
-            "支出の記録を続けるよ。"
-            "\n`使った物 / 理由 / 満足度(0-10)` の形で送ってね。"
+            "何を買ったか読み取れなかったよ。\n"
+            "「何を買ったか」を送ってね。金額・理由・満足度（0〜10）も一緒に書いてくれると嬉しい！"
         )
         return True
 
-    reason_words = _rough_word_count(parsed["reason"])
-    if reason_words < 3:
-        await message.channel.send(
-            "理由は3語以上で書いてね。例: `理由: 英語 の テスト 対策`"
-        )
-        return True
+    item = str(extracted.get("item") or "").strip()
+    amount = extracted.get("amount")
+    reason = str(extracted.get("reason") or "").strip() or None
+    satisfaction = extracted.get("satisfaction")
 
+    # pocket_journal に記録する
     log_dir = get_log_dir(system_conf)
-    journal_path = log_dir / f"{user_conf['name']}_pocket_journal.jsonl"
-    # amount フィールドは任意（省略時は None）— 後方互換性あり
-    amount = parsed.get("amount")
+    journal_path = log_dir / f"{user_name}_pocket_journal.jsonl"
+    reason_words = _rough_word_count(reason or "")
     record = {
         "ts": now_jst_iso(),
         "discord_user_id": message.author.id,
-        "name": user_conf.get("name"),
-        "item": parsed["item"],
-        "reason": parsed["reason"],
+        "name": user_name,
+        "item": item,
+        "reason": reason or "",
         "reason_word_count": reason_words,
-        "satisfaction": parsed["satisfaction"],
-        "amount": amount,
+        "satisfaction": int(satisfaction) if satisfaction is not None else None,
+        "amount": int(amount) if amount is not None else None,
     }
     append_jsonl(journal_path, record)
-    compare_msg = _self_compare_message(log_dir, str(user_conf.get("name", "")), int(parsed["satisfaction"]))
+
+    # 金額がある場合は残高を更新する
+    balance_line = ""
+    if amount:
+        before = wallet_service.get_balance(user_name)
+        new_balance, _ = wallet_service.update_balance(
+            user_conf=user_conf,
+            system_conf=system_conf,
+            delta=-int(amount),
+            action="spending_record",
+            note=item,
+        )
+        balance_line = f"\n残高: {before}円 → {new_balance}円"
+        await handlers_child.maybe_send_low_balance_alert(user_conf=user_conf, new_balance=new_balance)
+
+    # 満足度がある場合は自己比較メッセージを追加する
+    compare_msg = ""
+    if satisfaction is not None:
+        compare_msg = "\n" + _self_compare_message(log_dir, user_name, int(satisfaction))
+
+    # pending 状態をクリアして完了メッセージを送信する
     pending.pop(user_name, None)
     state["spending_record_pending_by_user"] = pending
     wallet_service.save_audit_state(state)
-    # 金額が入力されている場合は記録内容に表示する
-    amount_line = f"\n- 金額: {amount:,}円" if amount is not None else ""
+
+    amount_line = f"\n- 金額: {int(amount):,}円" if amount else ""
+    reason_line = f"\n- 理由: {reason}" if reason else ""
+    satisfaction_line = f"\n- 満足度: {satisfaction}/10" if satisfaction is not None else ""
     await message.channel.send(
-        "システムにお小遣い帳を記録したよ。"
-        f"\n- 使った物: {parsed['item']}"
-        f"\n- 理由: {parsed['reason']}"
-        f"\n- 満足度: {parsed['satisfaction']}/10"
+        "お小遣い帳に記録したよ！"
+        f"\n- 買ったもの: {item}"
         f"{amount_line}"
-        f"\n- 比較: {compare_msg}"
+        f"{reason_line}"
+        f"{satisfaction_line}"
+        f"{balance_line}"
+        f"{compare_msg}"
     )
     return True
 
@@ -407,7 +448,7 @@ async def _dispatch_by_intent(
 
     # --- 支出記録フロー開始（トリガー）---
     if intent == "spending_record":
-        # pending 状態を立てて入力フォーマットを案内する
+        # pending 状態を立てて自然言語での入力を促す
         state = wallet_service.load_audit_state()
         pending = state.get("spending_record_pending_by_user", {})
         if not isinstance(pending, dict):
@@ -416,9 +457,9 @@ async def _dispatch_by_intent(
         state["spending_record_pending_by_user"] = pending
         wallet_service.save_audit_state(state)
         await message.channel.send(
-            "支出の記録をするよ。次のどちらかで送ってね。"
-            "\n1. `使った物: ノート` `理由: テスト勉強のため` `満足度: 8`"
-            "\n2. `ノート / テスト勉強のため / 8`"
+            "何を買ったか教えてね！\n"
+            "金額・理由・満足度（0〜10）も分かれば一緒に書いてくれると嬉しい。\n"
+            "例: 「ノートを150円で買った。テストのため。満足度8」"
         )
         return True
 
@@ -911,12 +952,13 @@ async def on_message(message: discord.Message):
     ):
         return
 
-    # 支出記録フロー（pending 状態 + 直接フォーマット入力をAI前にキャッチする）
+    # 支出記録フロー（pending 状態のみ AI 前にキャッチする）
     if await maybe_handle_spending_record_flow(
         message=message,
         user_conf=user_conf,
         system_conf=system_conf,
         input_block=input_block,
+        gemini_service=gemini_service,
     ):
         return
 
