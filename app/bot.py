@@ -202,7 +202,9 @@ async def maybe_handle_spending_record_flow(
     extract_prompt = (
         "以下のメッセージから支出情報を抽出してJSONのみ返してください（説明不要）。\n"
         '{"item": "買ったもの(必須)", "amount": 金額の整数またはnull, '
-        '"reason": "理由またはnull", "satisfaction": 0〜10の整数またはnull}\n\n'
+        '"reason": "理由またはnull", "satisfaction": 0〜10の整数またはnull}\n'
+        "【注意】item は具体的な商品・サービス名が必要です。"
+        "「なんか」「もの」「あれ」「これ」など曖昧すぎる場合は item を null にしてください。\n\n"
         f"メッセージ: {input_block}"
     )
     extracted = None
