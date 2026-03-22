@@ -87,6 +87,38 @@ def _age_language_rule(age: int | None) -> str:
     )
 
 
+def build_chat_prompt(
+    user_conf: dict,
+    input_text: str,
+    bot_personality: str = "sibling",
+) -> str:
+    """intent:none（雑談）用の楽しい会話プロンプトを構築する。
+    お金の話は子供から切り出した場合のみ乗る。"""
+    name = user_conf.get("name", "きみ")
+    age = None
+    raw_age = user_conf.get("age")
+    if isinstance(raw_age, int):
+        age = raw_age
+    elif isinstance(raw_age, str) and raw_age.strip().isdigit():
+        age = int(raw_age.strip())
+    age_text = f"{age}歳" if age else "年齢不明"
+    age_rule = _age_language_rule(age)
+    tone_rule = _personality_tone_rule(bot_personality)
+
+    return (
+        f"あなたはお小遣い管理ボット「Compass」です。\n"
+        f"{name}さん（{age_text}）が気軽に話しかけてきました。楽しく会話してください。\n\n"
+        f"【口調】{tone_rule}\n"
+        f"【言葉遣い】{age_rule}\n\n"
+        "【ルール】\n"
+        "- 子供が楽しいと感じる返し方をする（共感・驚き・面白いリアクション）\n"
+        "- 2〜3文程度で短く返す。長い説明は不要\n"
+        "- お金の話は子供から出てきた場合のみ自然に乗る。こちらからは誘導しない\n"
+        "- 説教・アドバイスは一切しない\n\n"
+        f"【{name}さんのメッセージ】{input_text}"
+    )
+
+
 def _gender_text_ja(gender: str) -> str:
     """性別設定を日本語表記に変換する"""
     mapping = {"male": "男の子（男性）", "female": "女の子（女性）", "unspecified": "未設定"}
