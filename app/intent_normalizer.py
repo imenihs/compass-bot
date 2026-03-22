@@ -34,7 +34,7 @@ _NORMALIZE_PROMPT = """\
 - none: 雑談・上記のどれにも当てはまらない
 
 【返却 JSON 形式】
-{"intent": "<intent名>", "entities": {"target_name": null, "amount": null, "item": null, "reason": null, "satisfaction": null, "goal_title": null, "personality": null}, "confidence": "high" または "low"}
+{{"intent": "<intent名>", "entities": {{"target_name": null, "amount": null, "item": null, "reason": null, "satisfaction": null, "goal_title": null, "personality": null}}, "confidence": "high" または "low"}}
 
 【判定ルール】
 - intent が明確に判断できない場合は confidence を "low" にする
