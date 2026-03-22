@@ -59,7 +59,7 @@ from app.message_parser import (
     parse_usage_report_flexible,
     parse_proxy_request,
 )
-from app.prompts import build_prompt
+from app.prompts import build_chat_prompt, build_prompt
 from app.reminder_service import ReminderService
 from app.storage import append_jsonl, now_jst_iso, JST
 from app.wallet_service import WalletService
@@ -396,6 +396,109 @@ def _get_pending_intent(user_name: str) -> dict | None:
     return pending.get(user_name) if isinstance(pending, dict) else None
 
 
+async def _handle_wallet_check_pending(
+    message: discord.Message,
+    user_conf: dict,
+    system_conf: dict,
+    input_block: str,
+) -> bool:
+    """wallet_check pending 状態を処理する。財布の中身の金額入力を受け取って照合する。"""
+    user_name = str(user_conf.get("name", ""))
+    state = wallet_service.load_audit_state()
+    wcp = state.get("wallet_check_pending_by_user", {})
+    if not isinstance(wcp, dict) or user_name not in wcp:
+        return False
+
+    # 金額を抽出する
+    reported = _parse_yen_amount(input_block)
+    if reported is None:
+        await message.channel.send("金額が読み取れなかったよ。「1500円」のように送ってね。")
+        return True
+
+    # 照合してクリアする
+    expected = wallet_service.get_balance(user_name)
+    diff = int(reported) - int(expected)
+    wcp.pop(user_name, None)
+    state["wallet_check_pending_by_user"] = wcp
+    state.get("pending_by_user", {}).pop(user_name, None)
+    wallet_service.save_audit_state(state)
+
+    if diff == 0:
+        await message.channel.send(
+            f"財布チェックOK！ちゃんと合ってたよ！\n"
+            f"財布: {reported}円 / 帳簿: {expected}円（ぴったり！）"
+        )
+        return True
+
+    diff_desc = f"{abs(diff)}円{'多い' if diff > 0 else '少ない'}"
+    penalty = wallet_service.apply_penalty(
+        user_conf=user_conf,
+        system_conf=system_conf,
+        diff=diff,
+        wallet_audit_conf=WALLET_AUDIT,
+    )
+    new_balance = wallet_service.get_balance(user_name)
+    await message.channel.send(
+        f"財布と帳簿がずれてたよ。\n"
+        f"財布: {reported}円 / 帳簿: {expected}円（{diff_desc}）\n"
+        f"帳簿に合わせるためペナルティとして {penalty}円 減らしたよ。\n"
+        f"帳簿残高: {new_balance}円"
+    )
+    return True
+
+
+async def _handle_goal_set_pending(
+    message: discord.Message,
+    user_conf: dict,
+    system_conf: dict,
+    input_block: str,
+) -> bool:
+    """goal_set pending 状態を処理する。タイトルまたは金額の補完入力を受け取って目標を設定する。"""
+    user_name = str(user_conf.get("name", ""))
+    state = wallet_service.load_audit_state()
+    gp = state.get("goal_set_pending_by_user", {})
+    if not isinstance(gp, dict) or user_name not in gp:
+        return False
+
+    partial = gp[user_name] if isinstance(gp.get(user_name), dict) else {}
+    stored_title = partial.get("title")
+    stored_amount = partial.get("amount")
+
+    # 補完情報を input_block から抽出する
+    new_amount = _parse_yen_amount(input_block)
+    new_title = input_block.strip() if not new_amount else None
+
+    title = stored_title or new_title
+    amount = stored_amount or new_amount
+
+    if not title or not amount:
+        # まだ揃っていない → 足りない方を再度聞く
+        if not title:
+            await message.channel.send("何を貯めたいか教えてね！")
+        else:
+            await message.channel.send(f"「{title}」いくら貯めたい？")
+        return True
+
+    # 揃った → 目標を設定してクリアする
+    success, result = wallet_service.add_savings_goal(user_name, str(title), int(amount))
+    gp.pop(user_name, None)
+    state["goal_set_pending_by_user"] = gp
+    wallet_service.save_audit_state(state)
+    if not success:
+        await message.channel.send(result)
+        return True
+    current = wallet_service.get_balance(user_name)
+    bar = _progress_bar(current, int(amount))
+    action_word = "更新" if result == "updated" else "追加"
+    await message.channel.send(
+        f"貯金目標を{action_word}したよ。\n"
+        f"・目標: {title} {int(amount):,}円\n"
+        f"・現在残高: {current:,}円\n"
+        f"・進捗: {bar}"
+    )
+    return True
+
+
 def _set_pending_intent(user_name: str, intent_result: dict, original_input: str) -> None:
     """confidence:low の確認待ち intent を保存する"""
     state = wallet_service.load_audit_state()
@@ -577,9 +680,7 @@ async def _dispatch_by_intent(
             if m:
                 amount = int(m.group(1).replace(",", ""))
         if not amount:
-            await message.channel.send(
-                "金額が読み取れなかったよ。「入金 3000円 お年玉」の形で送ってね。"
-            )
+            await message.channel.send("いくらもらったか教えてくれる？")
             return True
         before = wallet_service.get_balance(user_name)
         new_balance, achieved_goals = wallet_service.update_balance(
@@ -602,27 +703,39 @@ async def _dispatch_by_intent(
             )
         return True
 
-    # --- 残高報告（照合）---
+    # --- 財布チェック（残高照合）---
     if intent == "balance_report":
         # AI が抽出した amount を優先し、なければ regex で parse する
         reported = entities.get("amount")
         if reported is None:
             reported = parse_balance_report(input_block)
         if reported is None:
-            # 金額が取れない場合は査定フローへ落とす
-            return False
+            # 金額がない → pending にして財布の中身を聞く
+            state = wallet_service.load_audit_state()
+            wcp = state.get("wallet_check_pending_by_user", {})
+            if not isinstance(wcp, dict):
+                wcp = {}
+            wcp[user_name] = now_jst_iso()
+            state["wallet_check_pending_by_user"] = wcp
+            wallet_service.save_audit_state(state)
+            await message.channel.send("今の財布の中身はいくら？")
+            return True
         expected = wallet_service.get_balance(user_name)
         diff = int(reported) - int(expected)
+        # 残高報告済みフラグをクリアする
         state = wallet_service.load_audit_state()
-        state["pending_by_user"].pop(user_name, None)
+        state.get("pending_by_user", {}).pop(user_name, None)
+        state.get("wallet_check_pending_by_user", {}).pop(user_name, None)
         wallet_service.save_audit_state(state)
         if diff == 0:
+            # 一致: 褒める
             await message.channel.send(
-                f"{user_name}の残高報告を記録したよ。"
-                f"\n報告残高: {reported}円 / 帳簿残高: {expected}円（差分0円）"
+                f"財布チェックOK！ちゃんと合ってたよ 🎉\n"
+                f"財布: {reported}円 / 帳簿: {expected}円（ぴったり！）"
             )
             return True
-        # 差分がある場合はペナルティを適用する
+        # 不一致: 説明してからペナルティを適用する
+        diff_desc = f"{abs(diff)}円{'多い' if diff > 0 else '少ない'}"
         penalty = wallet_service.apply_penalty(
             user_conf=user_conf,
             system_conf=system_conf,
@@ -631,10 +744,10 @@ async def _dispatch_by_intent(
         )
         new_balance = wallet_service.get_balance(user_name)
         await message.channel.send(
-            f"{user_name}の残高差分を検知したよ。"
-            f"\n報告残高: {reported}円 / 帳簿残高: {expected}円 / 差分: {diff}円"
-            f"\nペナルティ減額: {penalty}円"
-            f"\n減額後の帳簿残高: {new_balance}円"
+            f"財布と帳簿がずれてたよ。\n"
+            f"財布: {reported}円 / 帳簿: {expected}円（{diff_desc}）\n"
+            f"帳簿をちゃんと合わせるためにペナルティとして {penalty}円 減らしたよ。\n"
+            f"帳簿残高: {new_balance}円"
         )
         return True
 
@@ -644,7 +757,7 @@ async def _dispatch_by_intent(
         current = wallet_service.get_balance(user_name)
         if not goals:
             await message.channel.send(
-                "貯金目標がまだ設定されてないよ。\n`貯金目標 ゲーム機 30000円` の形で設定してね。"
+                "まだ貯金目標が設定されてないよ。\n何か貯めたいものがあったら教えてね！"
             )
         else:
             lines = [f"【{user_name}の貯金目標（残高: {current:,}円）】"]
@@ -663,28 +776,53 @@ async def _dispatch_by_intent(
 
     # --- 貯金目標 設定 ---
     if intent == "goal_set":
-        goal_title = str(entities.get("goal_title") or "").strip()
+        goal_title = str(entities.get("goal_title") or "").strip() or None
         goal_amount = entities.get("amount")
-        # タイトルまたは金額が取れない場合は再入力を促す
-        if not goal_title or not isinstance(goal_amount, (int, float)) or goal_amount <= 0:
+        if isinstance(goal_amount, (int, float)) and goal_amount <= 0:
+            goal_amount = None
+        # タイトルと金額の両方が揃ったら設定する、どちらか欠けたら pending で補完する
+        if goal_title and goal_amount:
+            target_amount = int(goal_amount)
+            success, result = wallet_service.add_savings_goal(user_name, goal_title, target_amount)
+            if not success:
+                await message.channel.send(result)
+                return True
+            # goal_set pending があればクリアする
+            state = wallet_service.load_audit_state()
+            state.get("goal_set_pending_by_user", {}).pop(user_name, None)
+            wallet_service.save_audit_state(state)
+            current = wallet_service.get_balance(user_name)
+            bar = _progress_bar(current, target_amount)
+            action_word = "更新" if result == "updated" else "追加"
             await message.channel.send(
-                "目標のタイトルと金額が分からなかったよ。\n`貯金目標 ゲーム機 30000円` の形で送ってね。"
+                f"貯金目標を{action_word}したよ。\n"
+                f"・目標: {goal_title} {target_amount:,}円\n"
+                f"・現在残高: {current:,}円\n"
+                f"・進捗: {bar}"
             )
-            return True
-        target_amount = int(goal_amount)
-        success, result = wallet_service.add_savings_goal(user_name, goal_title, target_amount)
-        if not success:
-            await message.channel.send(result)
-            return True
-        current = wallet_service.get_balance(user_name)
-        bar = _progress_bar(current, target_amount)
-        action_word = "更新" if result == "updated" else "追加"
-        await message.channel.send(
-            f"貯金目標を{action_word}したよ。\n"
-            f"・目標: {goal_title} {target_amount:,}円\n"
-            f"・現在残高: {current:,}円\n"
-            f"・進捗: {bar}"
-        )
+        elif goal_title:
+            # タイトルはある・金額がない → 保存して金額を聞く
+            state = wallet_service.load_audit_state()
+            gp = state.get("goal_set_pending_by_user", {})
+            if not isinstance(gp, dict):
+                gp = {}
+            gp[user_name] = {"ts": now_jst_iso(), "title": goal_title}
+            state["goal_set_pending_by_user"] = gp
+            wallet_service.save_audit_state(state)
+            await message.channel.send(f"「{goal_title}」いくら貯めたい？")
+        elif goal_amount:
+            # 金額はある・タイトルがない → 保存してタイトルを聞く
+            state = wallet_service.load_audit_state()
+            gp = state.get("goal_set_pending_by_user", {})
+            if not isinstance(gp, dict):
+                gp = {}
+            gp[user_name] = {"ts": now_jst_iso(), "amount": int(goal_amount)}
+            state["goal_set_pending_by_user"] = gp
+            wallet_service.save_audit_state(state)
+            await message.channel.send(f"{int(goal_amount):,}円で何を貯めたいの？")
+        else:
+            # どちらもない → 両方聞く
+            await message.channel.send("何を、いくら貯めたいか教えてね！\n例: 「ゲーム機を30000円貯めたい」")
         return True
 
     # --- 貯金目標 削除 ---
@@ -817,26 +955,46 @@ async def _dispatch_by_intent(
 
     # --- ボットパーソナリティ変更（N-4）---
     if intent == "personality_change":
-        personality = str(entities.get("personality") or "sibling").strip()
-        # 有効な personality 値にフォールバックする
+        personality = str(entities.get("personality") or "").strip()
         valid = {"parent", "sibling", "friend", "teacher"}
-        if personality not in valid:
-            personality = "sibling"
-        ok = update_user_field(user_name, "bot_personality", personality)
         labels = {
             "parent": "親っぽい口調",
             "sibling": "兄姉っぽい口調",
             "friend": "友達口調",
             "teacher": "先生口調",
         }
-        label = labels.get(personality, personality)
+        # 認識できない personality は候補を提示して選んでもらう
+        if personality not in valid:
+            await message.channel.send(
+                "どの話し方にする？\n"
+                "・「親っぽく」→ 親口調\n"
+                "・「兄姉っぽく」→ 兄姉口調（デフォルト）\n"
+                "・「友達みたいに」→ 友達口調\n"
+                "・「先生っぽく」→ 先生口調"
+            )
+            return True
+        ok = update_user_field(user_name, "bot_personality", personality)
+        label = labels[personality]
         if ok:
             await message.channel.send(f"話し方を「{label}」に変えたよ。")
         else:
-            await message.channel.send("設定の変更に失敗したよ。")
+            await message.channel.send("設定の変更に失敗したよ。ごめんね。")
         return True
 
-    # none / allowance_request は査定フローへ落とす
+    # none: 雑談プロンプトで楽しく会話する（査定フローには落とさない）
+    if intent == "none":
+        bot_personality = str(user_conf.get("bot_personality", "sibling"))
+        chat_prompt = build_chat_prompt(
+            user_conf=user_conf,
+            input_text=input_block,
+            bot_personality=bot_personality,
+        )
+        reply = await gemini_service.call_with_progress(message.channel, chat_prompt)
+        if reply:
+            await message.channel.send(reply)
+        return True
+
+    # allowance_request のみ査定フローへ落とす
     return False
 
 
@@ -1018,6 +1176,24 @@ async def on_message(message: discord.Message):
         system_conf=system_conf,
         input_block=input_block,
         gemini_service=gemini_service,
+    ):
+        return
+
+    # 財布チェック pending（金額入力待ち）
+    if await _handle_wallet_check_pending(
+        message=message,
+        user_conf=user_conf,
+        system_conf=system_conf,
+        input_block=input_block,
+    ):
+        return
+
+    # 貯金目標設定 pending（タイトルまたは金額の補完待ち）
+    if await _handle_goal_set_pending(
+        message=message,
+        user_conf=user_conf,
+        system_conf=system_conf,
+        input_block=input_block,
     ):
         return
 
