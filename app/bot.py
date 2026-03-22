@@ -348,8 +348,10 @@ async def _dispatch_by_intent(
 
     # --- 使い方ガイド ---
     if intent == "usage_guide":
-        # 子供向けガイドを送信する
-        await message.channel.send(_usage_guide_text())
+        # user_conf の age を渡して年齢に応じた表記のガイドを送信する
+        age = user_conf.get("age")
+        age_int = int(age) if isinstance(age, int) else (int(age) if isinstance(age, str) and str(age).strip().isdigit() else None)
+        await message.channel.send(_usage_guide_text(age=age_int))
         # 親の場合は親専用コマンド一覧も追加で送信する
         if is_parent(message.author.id):
             await message.channel.send(_usage_guide_text_parent())
