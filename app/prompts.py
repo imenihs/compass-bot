@@ -148,6 +148,7 @@ def build_prompt(
     months_since_last_fixed_increase: int | None = None,
     fixed_increase_count_this_year: int = 0,
     bot_personality: str = "sibling",
+    wallet_check_penalty: dict | None = None,
 ) -> str:
     if not assess_keyword:
         raise ValueError("assess_keyword is required")
@@ -228,6 +229,13 @@ def build_prompt(
 - 固定増額の上限（1回あたり）: +{fixed_increase_cap}円
 - 前回固定増額からの経過月: {months_since_last_fixed_increase}
 - 今年の固定増額回数: {fixed_increase_count_this_year}回
+- 財布チェックペナルティ記録: {
+    (
+        f"前回の財布チェックで {abs(wallet_check_penalty['diff'])}円の記録漏れがあった"
+        f"（財布:{wallet_check_penalty['reported']}円 / 帳簿:{wallet_check_penalty['expected']}円）。"
+        f"査定時にマイナス材料として考慮すること。"
+    ) if wallet_check_penalty else "なし"
+}
 - 入力に一致したキーワード:
   - investment: {json.dumps(hits.get("investment", []), ensure_ascii=False)}
   - fun: {json.dumps(hits.get("fun", []), ensure_ascii=False)}

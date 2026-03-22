@@ -396,6 +396,92 @@ def _get_pending_intent(user_name: str) -> dict | None:
     return pending.get(user_name) if isinstance(pending, dict) else None
 
 
+def _pop_wallet_check_penalty(user_name: str) -> dict | None:
+    """財布チェックペナルティノートを取得して削除する（査定時に1回だけ使用する）"""
+    state = wallet_service.load_audit_state()
+    penalties = state.get("wallet_check_penalties", {})
+    if not isinstance(penalties, dict):
+        return None
+    note = penalties.pop(user_name, None)
+    if note:
+        state["wallet_check_penalties"] = penalties
+        wallet_service.save_audit_state(state)
+    return note
+
+
+async def _do_wallet_check(
+    message: discord.Message,
+    user_conf: dict,
+    system_conf: dict,
+    reported: int,
+) -> None:
+    """財布チェックの照合・帳簿修正・ペナルティ記録の共通処理。
+    1. 帳簿を財布に合わせる（update_balance で差分を修正する）
+    2. 差分があれば次回査定用にペナルティノートを保存する
+    3. 子供にメッセージを送る"""
+    user_name = str(user_conf.get("name", ""))
+    expected = wallet_service.get_balance(user_name)
+    diff = int(reported) - int(expected)
+
+    # 報告済みフラグをクリアする
+    state = wallet_service.load_audit_state()
+    state.get("pending_by_user", {}).pop(user_name, None)
+    state.get("wallet_check_pending_by_user", {}).pop(user_name, None)
+
+    if diff == 0:
+        wallet_service.save_audit_state(state)
+        await message.channel.send(
+            f"財布チェックOK！ぴったり合ってたよ！\n"
+            f"財布: {reported}円 / 帳簿: {expected}円"
+        )
+        return
+
+    # 帳簿を財布の金額に合わせる（update_balance で差分を適用する）
+    wallet_service.update_balance(
+        user_conf=user_conf,
+        system_conf=system_conf,
+        delta=diff,
+        action="wallet_check_correction",
+        note=f"財布チェック修正 差分{diff}円",
+    )
+    new_balance = wallet_service.get_balance(user_name)
+
+    # 次回査定用にペナルティノートを保存する（記録漏れがある場合のみ）
+    penalty_note = None
+    if diff < 0:
+        # 財布が帳簿より少ない = 記録されていない支出がある
+        penalties = state.get("wallet_check_penalties", {})
+        if not isinstance(penalties, dict):
+            penalties = {}
+        penalties[user_name] = {
+            "ts": now_jst_iso(),
+            "diff": diff,
+            "reported": int(reported),
+            "expected": int(expected),
+        }
+        state["wallet_check_penalties"] = penalties
+        penalty_note = f"次のお小遣い相談のときに、記録されていない支出があったことが考慮されるよ。"
+
+    wallet_service.save_audit_state(state)
+
+    # メッセージを送る
+    diff_desc = f"{abs(diff)}円{'多い' if diff > 0 else '少ない'}"
+    correction_note = (
+        "記録漏れの入金があったみたいだね。帳簿に足したよ。"
+        if diff > 0
+        else "記録漏れの支出があったみたいだね。帳簿を修正したよ。"
+    )
+    msg = (
+        f"財布と帳簿がずれてたよ。\n"
+        f"財布: {reported}円 / 帳簿: {expected}円（{diff_desc}）\n"
+        f"{correction_note}\n"
+        f"修正後の帳簿残高: {new_balance}円"
+    )
+    if penalty_note:
+        msg += f"\n\n⚠️ {penalty_note}"
+    await message.channel.send(msg)
+
+
 async def _handle_wallet_check_pending(
     message: discord.Message,
     user_conf: dict,
@@ -409,41 +495,12 @@ async def _handle_wallet_check_pending(
     if not isinstance(wcp, dict) or user_name not in wcp:
         return False
 
-    # 金額を抽出する
     reported = _parse_yen_amount(input_block)
     if reported is None:
         await message.channel.send("金額が読み取れなかったよ。「1500円」のように送ってね。")
         return True
 
-    # 照合してクリアする
-    expected = wallet_service.get_balance(user_name)
-    diff = int(reported) - int(expected)
-    wcp.pop(user_name, None)
-    state["wallet_check_pending_by_user"] = wcp
-    state.get("pending_by_user", {}).pop(user_name, None)
-    wallet_service.save_audit_state(state)
-
-    if diff == 0:
-        await message.channel.send(
-            f"財布チェックOK！ちゃんと合ってたよ！\n"
-            f"財布: {reported}円 / 帳簿: {expected}円（ぴったり！）"
-        )
-        return True
-
-    diff_desc = f"{abs(diff)}円{'多い' if diff > 0 else '少ない'}"
-    penalty = wallet_service.apply_penalty(
-        user_conf=user_conf,
-        system_conf=system_conf,
-        diff=diff,
-        wallet_audit_conf=WALLET_AUDIT,
-    )
-    new_balance = wallet_service.get_balance(user_name)
-    await message.channel.send(
-        f"財布と帳簿がずれてたよ。\n"
-        f"財布: {reported}円 / 帳簿: {expected}円（{diff_desc}）\n"
-        f"帳簿に合わせるためペナルティとして {penalty}円 減らしたよ。\n"
-        f"帳簿残高: {new_balance}円"
-    )
+    await _do_wallet_check(message, user_conf, system_conf, reported)
     return True
 
 
@@ -720,35 +777,7 @@ async def _dispatch_by_intent(
             wallet_service.save_audit_state(state)
             await message.channel.send("今の財布の中身はいくら？")
             return True
-        expected = wallet_service.get_balance(user_name)
-        diff = int(reported) - int(expected)
-        # 残高報告済みフラグをクリアする
-        state = wallet_service.load_audit_state()
-        state.get("pending_by_user", {}).pop(user_name, None)
-        state.get("wallet_check_pending_by_user", {}).pop(user_name, None)
-        wallet_service.save_audit_state(state)
-        if diff == 0:
-            # 一致: 褒める
-            await message.channel.send(
-                f"財布チェックOK！ちゃんと合ってたよ 🎉\n"
-                f"財布: {reported}円 / 帳簿: {expected}円（ぴったり！）"
-            )
-            return True
-        # 不一致: 説明してからペナルティを適用する
-        diff_desc = f"{abs(diff)}円{'多い' if diff > 0 else '少ない'}"
-        penalty = wallet_service.apply_penalty(
-            user_conf=user_conf,
-            system_conf=system_conf,
-            diff=diff,
-            wallet_audit_conf=WALLET_AUDIT,
-        )
-        new_balance = wallet_service.get_balance(user_name)
-        await message.channel.send(
-            f"財布と帳簿がずれてたよ。\n"
-            f"財布: {reported}円 / 帳簿: {expected}円（{diff_desc}）\n"
-            f"帳簿をちゃんと合わせるためにペナルティとして {penalty}円 減らしたよ。\n"
-            f"帳簿残高: {new_balance}円"
-        )
+        await _do_wallet_check(message, user_conf, system_conf, int(reported))
         return True
 
     # --- 貯金目標 確認 ---
@@ -1267,6 +1296,8 @@ async def on_message(message: discord.Message):
         fixed_increase_count_this_year=increase_stats["fixed_increase_count_this_year"],
         # bot_personality は user_conf から読む（N-4）
         bot_personality=str(user_conf.get("bot_personality", "sibling")),
+        # 財布チェックペナルティノート: あれば査定に影響させて使用後にクリアする
+        wallet_check_penalty=_pop_wallet_check_penalty(str(user_conf.get("name", ""))),
     )
     try:
         reply = await gemini_service.call_with_progress(message.channel, prompt)
