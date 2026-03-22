@@ -27,6 +27,7 @@ from app.bot_utils import (
     _rough_word_count,
     _self_compare_message,
     _spending_analysis_for_user,
+    _thinking_message,
     _usage_guide_text,
     _usage_guide_text_parent,
 )
@@ -930,6 +931,11 @@ async def on_message(message: discord.Message):
 
     # --- B案: AI正規化 → ディスパッチャー ---
 
+    # AI 呼び出し前に「考え中」を送って無視されていないことを伝える
+    age = user_conf.get("age")
+    age_int_pre = int(age) if isinstance(age, int) else (int(str(age)) if isinstance(age, str) and str(age).strip().isdigit() else None)
+    await message.channel.send(_thinking_message(age_int_pre))
+
     # Gemini 軽量モデルで intent + entities + confidence を取得する
     intent_result = await intent_normalizer.normalize_intent(input_block, gemini_service)
 
@@ -944,7 +950,6 @@ async def on_message(message: discord.Message):
 
     # none / allowance_request の場合は査定フローへ落ちる
     force_assess_mode = _contains_force_assess_keyword(input_block, FORCE_ASSESS_TEST_KEYWORD)
-    await message.channel.send("考え中だよ...")
 
     log_dir = get_log_dir(system_conf)
     recent_count = count_recent_allowance_requests(
