@@ -348,10 +348,23 @@ async def _dispatch_by_intent(
 
     # --- 使い方ガイド ---
     if intent == "usage_guide":
-        # user_conf の age を渡して年齢に応じた表記のガイドを送信する
+        base_guide = _usage_guide_text()
         age = user_conf.get("age")
-        age_int = int(age) if isinstance(age, int) else (int(age) if isinstance(age, str) and str(age).strip().isdigit() else None)
-        await message.channel.send(_usage_guide_text(age=age_int))
+        age_int = int(age) if isinstance(age, int) else (int(str(age)) if isinstance(age, str) and str(age).strip().isdigit() else None)
+        if age_int is not None and age_int <= 12:
+            # 年齢が設定されている子供向け: Gemini に年齢適応リライトを依頼する
+            rewrite_prompt = (
+                f"以下の使い方ガイドを{age_int}歳の子供向けに書き直してください。\n"
+                f"難しい漢字はひらがなにする、文を短くするなど年齢に合った表現にしてください。\n"
+                f"コマンド例（バッククォートで囲まれた部分）はそのまま残してください。\n"
+                f"余計な説明は不要です。ガイド本文のみ返してください。\n\n"
+                f"{base_guide}"
+            )
+            adapted = await gemini_service.call_silent(rewrite_prompt)
+            await message.channel.send(adapted if adapted else base_guide)
+        else:
+            # 年齢未設定または13歳以上: ベーステキストをそのまま送信する
+            await message.channel.send(base_guide)
         # 親の場合は親専用コマンド一覧も追加で送信する
         if is_parent(message.author.id):
             await message.channel.send(_usage_guide_text_parent())
