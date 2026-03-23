@@ -438,6 +438,12 @@ async def maybe_handle_spending_record_flow(
         return True
 
     # --- 通常 pending（必須項目待ち）の場合 ---
+    # キャンセルワードなら pending を解除して終了する
+    if intent_normalizer.is_no_reply(input_block.strip()):
+        _clear_spending_pending(user_name)
+        await message.channel.send("支出記録をキャンセルしたよ！")
+        return True
+
     # 現メッセージから追加情報を抽出してマージする
     extracted = await _extract_expense_info(input_block, gemini_service) if gemini_service else {}
     item = extracted.get("item") or stored_item
@@ -445,6 +451,25 @@ async def maybe_handle_spending_record_flow(
     reason = extracted.get("reason") or stored_reason
     sat = extracted.get("satisfaction")
     satisfaction = sat if sat is not None else stored_sat
+
+    # item も amount も進展がない場合（関係ない話題 or 曖昧入力の可能性）
+    if item == stored_item and amount == stored_amount:
+        item_label = stored_item or "買ったもの"
+        # 別トピックかどうかを intent で判定する
+        norm = await intent_normalizer.normalize_intent(input_block, gemini_service) if gemini_service else {"intent": "none"}
+        if norm.get("intent", "none") != "none":
+            # 別の用件と判断 → 今は対応できないことを伝えて pending を継続する
+            await message.channel.send(
+                f"今 **{item_label}** の金額を確認してる途中だよ！\n"
+                f"いくらだった？（「やめる」で記録をキャンセルもできるよ）"
+            )
+        else:
+            # 曖昧な入力 → 再促する
+            await message.channel.send(
+                f"ごめん、読み取れなかったよ。{item_label}はいくらだった？\n"
+                f"（「やめる」でキャンセルもできるよ）"
+            )
+        return True
 
     await _process_expense_flow(
         message, user_conf, system_conf, item, amount, reason, satisfaction, gemini_service
