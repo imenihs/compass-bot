@@ -354,13 +354,13 @@ async def _process_expense_flow(
     if not item:
         suffix = "と金額" if amount is None else ""
         _save_spending_pending(user_name, item, amount, reason, satisfaction)
-        await message.channel.send(f"何を買ったか{suffix}教えてね！")
+        await message.channel.send(f"何を買ったか{suffix}教えてね！（「やめる」でキャンセルもできるよ）")
         return
 
     # 必須: amount がない
     if amount is None:
         _save_spending_pending(user_name, item, amount, reason, satisfaction)
-        await message.channel.send(f"{item}を買ったんだね！いくらだった？")
+        await message.channel.send(f"{item}を買ったんだね！いくらだった？（「やめる」でキャンセルもできるよ）")
         return
 
     # item + amount 揃い → 即記録する
@@ -1338,7 +1338,8 @@ async def on_message(message: discord.Message):
     intent_result = await intent_normalizer.normalize_intent(input_block, gemini_service)
 
     # 低信頼度の場合は確認メッセージを送って終了する（確認は1回のみ）
-    if intent_result.get("confidence") == "low":
+    # intent:none は確認しても意味がないのでスキップする
+    if intent_result.get("confidence") == "low" and intent_result.get("intent") != "none":
         await _ask_intent_confirmation(message, user_conf, intent_result, input_block)
         return
 
