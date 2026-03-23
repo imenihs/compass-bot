@@ -16,9 +16,9 @@ _NORMALIZE_PROMPT = """\
 - balance_check: 残高・所持金の確認（「いくら持ってる？」「残高おしえて」「おこづかいいくら」）
 - usage_guide: 使い方の説明（「つかいかたおしえて」「何ができるの？」「ヘルプ」）
 - initial_setup: 初期設定の要求（「初期設定」「しょきせってい」「最初の設定したい」）
-- spending_record: 支出記録フロー開始（「支出記録したい」「使ったものを記録したい」「ししゅつきろく」）
-- manual_expense: 金額明示の即時支出記録（「支出 500円 お菓子」「500円つかった お菓子」）
-- manual_income: 臨時収入の記録（「お年玉3000円もらった」「3000円入金した」）
+- spending_record: 支出記録（「支出記録したい」「お菓子を買った」「本かった」「何か買って使った」など。金額不明でもOK）
+- manual_expense: 金額明示の即時支出記録（「支出 500円 お菓子」「500円つかった お菓子」— 金額とアイテムの両方が明示されている場合）
+- manual_income: 臨時収入の記録（「お年玉3000円もらった」「3000円入金した」「もらった」「お金もらった」— 金額なしでもOK）
 - balance_report: 残高報告・照合（「いまのお金は1500円だよ」「残高は1500円です」）
 - goal_check: 貯金目標の確認（「目標どのくらい？」「いくら貯まった？」「もくひょうかくにん」）
 - goal_set: 貯金目標の設定（「ゲーム機のために30000円貯める」— タイトルと金額の両方が必要）
@@ -39,9 +39,10 @@ _NORMALIZE_PROMPT = """\
 【判定ルール】
 - intent が明確に判断できない場合は confidence を "low" にする
 - goal_set は goal_title と amount の両方が読み取れる場合のみ（どちらか欠けたら none か goal_check）
-- manual_expense は金額とアイテムが明示されている場合のみ（あいまいなら allowance_request か none）
-- personality の値: "parent"（親っぽく）/ "sibling"（兄姉っぽく）/ "friend"（友達っぽく）/ "teacher"（先生っぽく）
+- manual_expense は金額とアイテムの両方が明示されている場合のみ。金額がなければ spending_record を使う
+- item はメッセージ中に買ったものが読み取れれば必ず抽出する（intent に関わらず）
 - amount は整数（円）で返す。読み取れない場合は null
+- personality の値: "parent"（親っぽく）/ "sibling"（兄姉っぽく）/ "friend"（友達っぽく）/ "teacher"（先生っぽく）
 - target_name は分析・台帳対象のユーザー名。読み取れない場合は null
 - 説明文不要。JSONのみ返す
 
