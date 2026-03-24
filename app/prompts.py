@@ -233,7 +233,11 @@ def build_prompt(
     (
         f"前回の財布チェックで {abs(wallet_check_penalty['diff'])}円の記録漏れがあった"
         f"（財布:{wallet_check_penalty['reported']}円 / 帳簿:{wallet_check_penalty['expected']}円）。"
-        f"査定時にマイナス材料として考慮すること。"
+        + (
+            "支出の記録漏れのため、査定時にマイナス材料として重く考慮すること。"
+            if wallet_check_penalty.get("type") == "spending_leak"
+            else "収入の記録漏れのため、査定時に軽めの指摘として触れること。"
+        )
     ) if wallet_check_penalty else "なし"
 }
 - 入力に一致したキーワード:

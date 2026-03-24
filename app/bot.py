@@ -538,21 +538,28 @@ async def _do_wallet_check(
     )
     new_balance = wallet_service.get_balance(user_name)
 
-    # 次回査定用にペナルティノートを保存する（記録漏れがある場合のみ）
+    # 次回査定用にペナルティノートを保存する（差分がある場合は方向に関わらず記録する）
+    # diff < 0（支出漏れ）= 重いペナルティ / diff > 0（収入漏れ）= 軽いペナルティ
     penalty_note = None
+    penalties = state.get("wallet_check_penalties", {})
+    if not isinstance(penalties, dict):
+        penalties = {}
     if diff < 0:
-        # 財布が帳簿より少ない = 記録されていない支出がある
-        penalties = state.get("wallet_check_penalties", {})
-        if not isinstance(penalties, dict):
-            penalties = {}
-        penalties[user_name] = {
-            "ts": now_jst_iso(),
-            "diff": diff,
-            "reported": int(reported),
-            "expected": int(expected),
-        }
-        state["wallet_check_penalties"] = penalties
-        penalty_note = f"次のお小遣い相談のときに、記録されていない支出があったことが考慮されるよ。"
+        # 財布が帳簿より少ない = 記録されていない支出がある（重大な管理不備）
+        penalty_type = "spending_leak"
+        penalty_note = "⚠️ 次のお小遣い相談のときに、記録されていない支出があったことが考慮されるよ。"
+    else:
+        # 財布が帳簿より多い = 記録されていない収入がある（収入管理の不備）
+        penalty_type = "income_leak"
+        penalty_note = "📝 もらったお金が記録されていないよ。入金コマンドで記録しておこう。次のお小遣い相談でも触れるよ。"
+    penalties[user_name] = {
+        "ts": now_jst_iso(),
+        "type": penalty_type,
+        "diff": diff,
+        "reported": int(reported),
+        "expected": int(expected),
+    }
+    state["wallet_check_penalties"] = penalties
 
     wallet_service.save_audit_state(state)
 
