@@ -4,6 +4,7 @@
     222222222222222222
   ],
   "gemini_model": "models/gemini-2.5-flash",
+  "bot_personality": "sibling",
   "assess_keyword": "査定し金額を変更します。",
   "force_assess_test_keyword": "FORCE_ASSESS_TEST-REPLACE_ME",
   "chat": {
@@ -38,5 +39,14 @@
     "enabled": false,
     "day_of_week": 0,
     "notify_time": "19:00"
+  },
+  "proactive_child_nudge": {
+    "enabled": false,
+    "notify_time": "18:30",
+    "no_record_days": 10,
+    "challenge_stale_days": 5,
+    "growth_plan_review_days_before": 2,
+    "min_days_between_nudges": 3,
+    "max_per_run": 20
   }
 }

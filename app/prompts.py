@@ -150,6 +150,64 @@ def _follow_policy_for_prompt(user_conf: dict) -> dict:
     }
 
 
+def _text_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _learning_card_for_prompt(card: dict | None) -> dict | None:
+    if not isinstance(card, dict):
+        return None
+    allowed_keys = (
+        "type",
+        "title",
+        "priority",
+        "evidence",
+        "skill",
+        "parent_question",
+        "child_action",
+        "avoid",
+        "next_observation",
+    )
+    cleaned = {}
+    for key in allowed_keys:
+        value = card.get(key)
+        if value not in ("", None, [], {}):
+            cleaned[key] = value
+    return cleaned or None
+
+
+def _selected_learning_card(learning_context: dict) -> dict | None:
+    for key in ("selected_card", "selected_insight_card", "prompt_card", "selected_prompt_card"):
+        card = _learning_card_for_prompt(learning_context.get(key))
+        if card:
+            return card
+
+    cards = learning_context.get("insight_cards")
+    if not isinstance(cards, list):
+        return None
+
+    cleaned_cards = [_learning_card_for_prompt(card) for card in cards]
+    cleaned_cards = [card for card in cleaned_cards if card]
+    if not cleaned_cards:
+        return None
+
+    def priority_value(card: dict) -> float:
+        raw = card.get("priority")
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return sorted(cleaned_cards, key=priority_value, reverse=True)[0]
+
+
 def build_prompt(
     user_conf: dict,
     system_conf: dict,
@@ -175,6 +233,7 @@ def build_prompt(
     bot_personality: str = "sibling",
     wallet_check_penalty: dict | None = None,
     reflection_context: dict | None = None,
+    learning_insights: dict | None = None,
 ) -> str:
     if not assess_keyword:
         raise ValueError("assess_keyword is required")
@@ -228,13 +287,13 @@ def build_prompt(
             f"有効 / focus_area={follow_policy['focus_area']} / "
             f"nudge_strength={follow_policy['nudge_strength']} / "
             f"frequency={follow_policy['frequency']} / "
-            f"parent_note={follow_policy['parent_note'] or 'なし'}"
+            f"親専用内部メモ（子どもへの引用禁止）={follow_policy['parent_note'] or 'なし'}"
         )
     )
-    reflection = reflection_context or {}
-    reflection_prompt_points = reflection.get("prompt_points") if isinstance(reflection, dict) else []
-    if not isinstance(reflection_prompt_points, list):
-        reflection_prompt_points = []
+    learning_context = learning_insights if isinstance(learning_insights, dict) else reflection_context
+    learning_context = learning_context if isinstance(learning_context, dict) else {}
+    reflection_prompt_points = _text_list(learning_context.get("prompt_points"))
+    selected_learning_card = _selected_learning_card(learning_context)
 
     return f"""
 あなたは家庭内のお小遣いサポートBot「Compass」です。日本語で返答します。
@@ -273,6 +332,8 @@ def build_prompt(
 - AIフォロー方針: {follow_policy_text}
 - 支出・記録の振り返りシグナル:
 {json.dumps(reflection_prompt_points, ensure_ascii=False, indent=2) if reflection_prompt_points else "なし"}
+- 選択済み学習カード（1枚のみ。必要な場面だけ使う）:
+{json.dumps(selected_learning_card, ensure_ascii=False, indent=2) if selected_learning_card else "なし"}
 - 財布チェック記録漏れメモ: {
     (
         f"前回の財布チェックで {abs(wallet_check_penalty['diff'])}円の記録漏れがあった"
@@ -303,7 +364,10 @@ def build_prompt(
 - 追加要求回数が多い場合は、理由と計画が弱いときに臨時金額を慎重にする
 - 比較コメントは「過去の本人比」のみ。兄弟比較・他人比較はしない
 - 親からの方針メモは内部文脈として扱い、子どもへの返信ではそのまま引用しない
+- 選択済み学習カードの `parent_question` は親向け設計情報なので、子どもへの返信にそのまま出さない
+- 選択済み学習カードを使う場合も、子ども向けには `child_action` から小さな行動を1つだけ短く伝える
 - AIフォロー方針が無効、または情報取得・単純記録の場面では、無理にコーチングを足さない
+- 残高確認・履歴確認・記録完了では、学習カードや振り返りシグナルがあっても不要なコーチングを追加しない
 - AIフォローを入れる場合も、子どもを責めず、1回の返答につき小さな行動提案を1つまでにする
 - 支出・記録の振り返りシグナルは、罰ではなく「次に良くするための材料」として使う
 - 「お小遣いを増やしたい」「もっとお金がほしい」という相談は、家族で合意できる役割・継続行動・貯金計画・支出見直しに接続する

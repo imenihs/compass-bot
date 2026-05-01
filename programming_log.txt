@@ -3943,3 +3943,91 @@ CommitID: 未コミット（並列実装開始）
     - PASS。
 
 CommitID: コミット後に最終回答で提示
+
+================================================================================
+[技術事業部長] 2026/05/02 00:56:56 JST、社長応対トーン規約の追記
+================================================================================
+【思考】
+  社長から、ユーザー応対だけをより口語的にし、完璧すぎるAI文体や主語を置きすぎる癖を減らしたいという指示を受けた。
+
+  判断:
+  - チャット応対は短く口語寄りにする。
+  - 一方で、仕様書、作業ログ、コードコメント、UI、テスト記録は後から読む資料なので、従来どおり明確で丁寧な日本語を維持する。
+  - 内部処理英語化の規約とは衝突しない。対人間の応答スタイルだけを追加規約として切り出す。
+
+【実施】
+  - `CLAUDE.md` に `社長への応対` セクションを追加した。
+  - 社長とのチャットでは、文脈で分かる主語や前提を省略し、短く口語的に返すことを明記した。
+  - AIっぽい定型句の多用を避けることを明記した。
+
+CommitID: 未コミット（応対規約追記のみ）
+
+================================================================================
+[技術事業部長] 2026/05/02 01:01:00 JST、学習支援N-5/N-6実装・テスト・実データ復元確認
+================================================================================
+【思考】
+  社長より、未実装の全実装、仕様チェックリスト化、テストとPDCA、実データ書き込み確認時の復元、ワーカー最大展開を指示された。
+
+  判断:
+  - 画一的な学習シグナルでは目的に沿わないため、`learning_insights` で品目・金額・理由・満足度・記録完全率・貯金目標影響を構造化し、親向け会話カードと子ども向けチャレンジへ変換する。
+  - 親が「どうフォローしてほしいか」をAIへ伝えられるように、Webフォームに加えてDiscord親コマンドを追加する。
+  - 増額相談は、金額をAIが確定するのではなく、親が確認した成長行動プランとして保存する。
+  - 実データ書き込み確認は社長指示どおり、バックアップ、書き込み、内容確認、復元、差分一致まで実施する。
+  - `CLAUDE.md` を再読し、テスト正本 `テスト実施結果.md`、README、作業ログ、コミットID記録、systemctl再起動の規約を以降の作業に反映する。
+
+【実施】
+  - `app/learning_insights.py` に会話カード生成、購買単位マージ、カード種別判定、方針重み、フォロー履歴による抑制を実装した。
+  - `app/server.py` と `templates/dashboard.html` に、今週の会話カード、子どもの小さなチャレンジ、カード反応API、チャレンジ反応API、成長行動プランAPIを追加した。
+  - `app/bot.py` / `app/prompts.py` に `learning_insights.prompt_points` と選択カード1枚のプロンプト連携を追加した。
+  - `app/handlers_parent.py` に `フォロー方針` / `フォロー強さ` / `フォロー頻度` のDiscord親コマンドを追加した。
+  - `実装仕様.md` と `学習支援要件再定義.md` の未チェック項目を実装状態に合わせて [x] 管理へ整理した。
+  - `README.md` と `テスト実施結果.md` を新機能とテスト正本に合わせて更新した。
+
+【PDCA】
+  - 1周目の疑似Discordテストで、`フォロー強さ りか 普通` が頻度まで `normal` に変える不具合を検出した。
+  - コマンド種別ごとに更新対象を絞る修正を行い、再実行でPASSを確認した。
+  - HTMLテンプレートを `py_compile` 対象に含める誤ったテスト指定を一度行ったが、テストコマンドの誤りとして正しい対象で再実行した。
+
+【確認】
+  - `python3 -m py_compile app/learning_insights.py app/server.py app/bot.py app/handlers_parent.py tests/learning_insights_tests.py tests/learning_support_tests.py tests/fake_discord_flow_tests.py`
+  - `python3 tests/learning_insights_tests.py` 6/6 PASS
+  - `python3 tests/learning_support_tests.py` 6/6 PASS
+  - `python3 tests/fake_discord_flow_tests.py` 39/39 PASS
+  - 実データ書き込み復元スモーク: 対象 `りひと`、書き込み確認後に復元し `after_matches_before=true`。バックアップ: `/tmp/compass-learning-write-backup-1777651155`
+
+CommitID: コミット後に追記
+
+================================================================================
+[技術事業部長] 2026/05/02 01:09:00 JST、能動的な子ども伴走メッセージの追加
+================================================================================
+【思考】
+  社長より、子どもが話しかけてくるのを受け身で待つだけでなく、最近記録がない、チャレンジが放置されている、といった状態をBot側が見て軽くつつけないか指示を受けた。
+
+  判断:
+  - 既存の週次支出記録リマインドは単純な記録促しに留まるため、新しく `proactive_child_nudge` として日次の能動伴走を分離する。
+  - 監視や詰問に見えないよう、理由は1つだけ選び、文面は戻りやすい小さな行動に絞る。
+  - 送信先は `allow_channel_ids` のメンバーから子ども本人のチャンネルを推定し、送信先が分からない場合は送らない。
+  - 同じ子へ短期間に連投しないよう、`reminder_state.json` に最終送信時刻と理由を保存する。
+
+【実施】
+  - `app/config.py` に `get_proactive_child_nudge_setting` を追加した。
+  - `settings/setting.example.json` と本番 `settings/setting.json` に `proactive_child_nudge` を追加した。本番設定は `enabled=true`、`notify_time=18:30`。
+  - `app/reminder_service.py` に `maybe_send_proactive_child_nudges` / `send_proactive_child_nudges` と、記録空白・未反応チャレンジ・成長行動プラン確認日の判定を追加した。
+  - `app/bot.py` で新設定を読み込み、ReminderServiceへ渡すようにした。
+  - `実装仕様.md` と `学習支援要件再定義.md` に Phase N-7 / 能動伴走要件を追加した。
+  - `README.md` と `テスト実施結果.md` を更新した。
+
+【PDCA】
+  - 能動伴走テスト1周目で、テスト側の状態ファイル名がURLエンコード形式に合っておらず2件失敗した。
+  - 実装仕様どおり `service._user_key(user)` を使って状態ファイルを作るようテストを修正し、再実行でPASSを確認した。
+
+【確認】
+  - `python3 -m py_compile app/config.py app/bot.py app/reminder_service.py tests/proactive_nudge_tests.py`
+  - `python3 tests/proactive_nudge_tests.py` 4/4 PASS
+  - `python3 -m json.tool settings/setting.json`
+  - `python3 -m json.tool settings/setting.example.json`
+  - `python3 - <<'PY' ... get_proactive_child_nudge_setting() ... PY` で本番設定読み込みを確認
+  - 既存回帰として `python3 tests/learning_insights_tests.py`、`python3 tests/learning_support_tests.py`、`python3 tests/fake_discord_flow_tests.py` を再実行しPASS
+  - `python3 tests/gemini_discord_replay_tests.py --match G31 --markdown /tmp/compass-gemini-nudge-check-escalated.md` をネットワーク許可ありで再実行し、実Gemini応答PASS
+
+CommitID: コミット後に追記

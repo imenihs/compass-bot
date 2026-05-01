@@ -190,6 +190,27 @@ def test_dashboard_template_renders_policy_form() -> None:
                     "signals": ["低満足の支出は次回の判断材料になります。"],
                     "parent_hints": ["買う前に一度待つ声かけが向いています。"],
                 },
+                "learning_insights": {
+                    "source": "learning_insights",
+                    "summary_text": "今週は買う前に待つ練習が向いています。",
+                    "metrics": [{"label": "記録件数", "value": "2件"}],
+                    "insight_cards": [
+                        {
+                            "card_id": "card-1",
+                            "type": "repeated_small_spending",
+                            "title": "少額の反復支出",
+                            "evidence_lines": ["お菓子 3回"],
+                            "skill": "待つ",
+                            "parent_question": "次に買う前に一回待ってみる？",
+                            "parent_action": "予算を一緒に決める",
+                            "child_action": "買う前に残り予算を見る",
+                            "avoid": "叱責しない",
+                            "policy_match": "方針に合っています",
+                            "next_observation": "次の記録で見る",
+                        }
+                    ],
+                },
+                "active_growth_plan": None,
                 "ai_follow_policy": {
                     "enabled": True,
                     "focus_area": "income_balance",
@@ -207,8 +228,186 @@ def test_dashboard_template_renders_policy_form() -> None:
         flash_error="",
     )
     assert "/compass-bot/op/followup_policy" in html
+    assert "/compass-bot/op/learning_card_feedback" in html
+    assert "/compass-bot/op/growth_plan" in html
+    assert "今週の会話カード" in html
     assert 'option value="income_balance" selected' in html
     assert "買う前に待つ" in html
+
+
+def test_learning_card_and_growth_plan_endpoints_write_isolated_state() -> None:
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_state_dir = server.LEARNING_SUPPORT_STATE_DIR
+    old_plan_dir = server.GROWTH_PLANS_DIR
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "parent"
+
+    with tempfile.TemporaryDirectory(prefix="compass-web-state-") as d:
+        root = Path(d)
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server.load_all_users = lambda: [{"name": "りか"}]
+            server.LEARNING_SUPPORT_STATE_DIR = root / "learning_support_state"
+            server.GROWTH_PLANS_DIR = root / "growth_plans"
+
+            card_response = asyncio.run(
+                server.op_learning_card_feedback(
+                    session_token="token",
+                    target="りか",
+                    card_id="card-1",
+                    feedback="use_this_week",
+                    card_type="record_habit",
+                    parent_question="次の買い物で一言理由を足す？",
+                    child_action="理由を一言書く",
+                )
+            )
+            assert card_response.status_code == 303
+            state_files = list((root / "learning_support_state").glob("*.json"))
+            assert len(state_files) == 1
+            state = json.loads(state_files[0].read_text(encoding="utf-8"))
+            assert state["last_card_id"] == "card-1"
+            assert state["last_parent_question"] == "次の買い物で一言理由を足す？"
+
+            plan_response = asyncio.run(
+                server.op_growth_plan(
+                    session_token="token",
+                    target="りか",
+                    plan_id="",
+                    action="save",
+                    status="active",
+                    request_type="allowance_increase",
+                    child_reason="本を買いたい",
+                    parent_condition="1週間記録する",
+                    agreed_action="毎日1つ記録する",
+                    review_at="2026-05-10",
+                    reward_amount="100",
+                    notes="親確認済み",
+                )
+            )
+            assert plan_response.status_code == 303
+            plan_files = list((root / "growth_plans").glob("*.json"))
+            assert len(plan_files) == 1
+            plans = json.loads(plan_files[0].read_text(encoding="utf-8"))
+            assert plans["plans"][0]["agreed_action"] == "毎日1つ記録する"
+            assert plans["plans"][0]["reward_amount"] == 100
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.LEARNING_SUPPORT_STATE_DIR = old_state_dir
+            server.GROWTH_PLANS_DIR = old_plan_dir
+
+
+def test_child_challenge_feedback_and_template_do_not_expose_parent_policy() -> None:
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_state_dir = server.LEARNING_SUPPORT_STATE_DIR
+    old_build_learning_insights = server.build_learning_insights
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "りか"
+
+    with tempfile.TemporaryDirectory(prefix="compass-child-state-") as d:
+        root = Path(d)
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: False
+            server.load_all_users = lambda: [{"name": "りか"}]
+            server.LEARNING_SUPPORT_STATE_DIR = root / "learning_support_state"
+
+            def fake_build_learning_insights(**_kwargs) -> dict:
+                return {
+                    "summary_text": "テスト",
+                    "metrics": [],
+                    "insight_cards": [],
+                    "child_challenge": {
+                        "challenge_id": "challenge-1",
+                        "title": "親メモからのチャレンジ",
+                        "action": "買う前に一度待つ練習を軽く促してほしい",
+                    },
+                    "source_notes": [],
+                }
+
+            server.build_learning_insights = fake_build_learning_insights
+            insights = server._normalize_learning_insights(
+                "りか",
+                {"log_dir": str(root / "logs")},
+                {
+                    "name": "りか",
+                    "ai_follow_policy": {
+                        "enabled": True,
+                        "parent_note": "買う前に一度待つ練習を軽く促してほしい",
+                    },
+                },
+                [],
+                {},
+            )
+            assert "親メモ" not in insights["child_challenge"]["title"]
+            assert "買う前に一度待つ練習" not in insights["child_challenge"]["action"]
+
+            response = asyncio.run(
+                server.op_child_challenge_feedback(
+                    session_token="token",
+                    challenge_id="challenge-1",
+                    feedback="done",
+                    target="",
+                    child_action="理由を一言書く",
+                )
+            )
+            assert response.status_code == 303
+            state_files = list((root / "learning_support_state").glob("*.json"))
+            assert len(state_files) == 1
+            state_text = state_files[0].read_text(encoding="utf-8")
+            assert "parent_note" not in state_text
+            assert "ai_follow_policy" not in state_text
+
+            env = Environment(
+                loader=FileSystemLoader(str(REPO_ROOT / "templates")),
+                autoescape=select_autoescape(["html", "xml"]),
+            )
+            template = env.get_template("dashboard.html")
+            html = template.render(
+                username="りか",
+                is_admin=False,
+                my_child_challenge={
+                    "challenge_id": "challenge-1",
+                    "title": "記録に一言足す",
+                    "action": "理由を一言書く",
+                    "expected_time": "5分以内",
+                },
+                my_learning_summary={
+                    "signals": ["親メモ: 買う前に一度待つ練習を軽く促してほしい"],
+                    "child_hints": ["内部方針"],
+                },
+                my_balance=1200,
+                my_low_balance=False,
+                my_goals=[],
+                my_month_spending=300,
+                my_month_count=2,
+                my_recent_items=[],
+                flash_msg="",
+                flash_error="",
+            )
+            assert "次の小さなチャレンジ" in html
+            assert "買う前に一度待つ練習" not in html
+            assert "内部方針" not in html
+            assert "/compass-bot/op/followup_policy" not in html
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.LEARNING_SUPPORT_STATE_DIR = old_state_dir
+            server.build_learning_insights = old_build_learning_insights
 
 
 def main() -> int:
@@ -217,6 +416,8 @@ def main() -> int:
         test_prompt_receives_policy_and_learning_context,
         test_followup_policy_endpoint_writes_valid_policy_and_rejects_harmful_note,
         test_dashboard_template_renders_policy_form,
+        test_learning_card_and_growth_plan_endpoints_write_isolated_state,
+        test_child_challenge_feedback_and_template_do_not_expose_parent_policy,
     ]
     failures = []
     for test in tests:

@@ -34,6 +34,73 @@ _client = None
 _reminder_service = None
 _allowance_reminder_conf: dict = {}
 
+_FOLLOW_POLICY_DEFAULT = {
+    "enabled": True,
+    "focus_area": "balanced",
+    "nudge_strength": "light",
+    "frequency": "low",
+    "parent_note": "",
+}
+
+_FOLLOW_POLICY_FOCUS_LABELS = {
+    "balanced": "バランス",
+    "satisfaction_reflection": "満足度の振り返り",
+    "impulse_spending": "買う前チェック",
+    "saving_goal": "貯金目標",
+    "record_habit": "記録習慣",
+    "income_balance": "収入と支出のバランス",
+}
+
+_FOLLOW_POLICY_FOCUS_ALIASES = {
+    "バランス": "balanced",
+    "全体": "balanced",
+    "満足度": "satisfaction_reflection",
+    "振り返り": "satisfaction_reflection",
+    "ふりかえり": "satisfaction_reflection",
+    "衝動": "impulse_spending",
+    "買う前": "impulse_spending",
+    "一度待つ": "impulse_spending",
+    "使いすぎ": "impulse_spending",
+    "貯金": "saving_goal",
+    "目標": "saving_goal",
+    "記録": "record_habit",
+    "記録習慣": "record_habit",
+    "収入": "income_balance",
+    "お小遣い増": "income_balance",
+    "行動プラン": "income_balance",
+}
+
+_FOLLOW_POLICY_STRENGTH_ALIASES = {
+    "軽め": "light",
+    "やさしく": "light",
+    "弱め": "light",
+    "普通": "normal",
+    "通常": "normal",
+    "しっかり": "normal",
+}
+
+_FOLLOW_POLICY_FREQUENCY_ALIASES = {
+    "必要なとき": "low",
+    "少なめ": "low",
+    "低め": "low",
+    "ふつう": "normal",
+    "普通": "normal",
+    "毎回": "normal",
+}
+
+_FOLLOW_POLICY_UNSAFE_WORDS = (
+    "兄弟と比べ",
+    "姉妹と比べ",
+    "比較して叱",
+    "厳しく叱",
+    "罰",
+    "ペナルティ",
+    "減額で脅",
+    "だらしない",
+    "浪費家",
+    "嘘つき",
+)
+
 
 def init(wallet_service, client, reminder_service, allowance_reminder_conf: dict) -> None:
     """bot.py の起動時に依存オブジェクトを注入する。on_ready で呼ぶ。"""
@@ -47,6 +114,85 @@ def init(wallet_service, client, reminder_service, allowance_reminder_conf: dict
 def _is_parent(user_id: int) -> bool:
     """Discord ユーザーIDが親（管理者）かどうかを判定する"""
     return user_id in get_parent_ids()
+
+
+def _command_body(content: str) -> str:
+    """メンションあり/なしの親コマンド本文を返す"""
+    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
+    return (mention_body if mention_body is not None else (content or "")).strip()
+
+
+def _normalize_follow_policy(raw_policy: dict | None) -> dict:
+    """子ども別AIフォロー方針を保存可能な形にそろえる"""
+    policy = dict(_FOLLOW_POLICY_DEFAULT)
+    if isinstance(raw_policy, dict):
+        policy.update({k: raw_policy.get(k, v) for k, v in policy.items()})
+    policy["enabled"] = bool(policy.get("enabled", True))
+    if policy.get("focus_area") not in _FOLLOW_POLICY_FOCUS_LABELS:
+        policy["focus_area"] = "balanced"
+    if policy.get("nudge_strength") not in {"light", "normal"}:
+        policy["nudge_strength"] = "light"
+    if policy.get("frequency") not in {"low", "normal"}:
+        policy["frequency"] = "low"
+    policy["parent_note"] = str(policy.get("parent_note") or "").strip()[:300]
+    return policy
+
+
+def _follow_policy_note_error(note: str) -> str | None:
+    """親メモが罰・比較・人格評価に寄りすぎていないか確認する"""
+    text = (note or "").strip()
+    if len(text) > 300:
+        return "AIフォロー方針は300文字以内で入力してね。"
+    if any(word in text for word in _FOLLOW_POLICY_UNSAFE_WORDS):
+        return "叱責・兄弟比較・罰を前提にした方針は保存しないよ。買う前チェック、記録習慣、親子で一緒に確認する表現に直してね。"
+    return None
+
+
+def _parse_follow_policy_updates(text: str) -> tuple[dict, str]:
+    """自然文に近い親コマンドから方針フィールドを抽出する"""
+    body = (text or "").strip()
+    normalized = _normalize_japanese_command(body)
+    updates: dict = {}
+
+    if any(token in normalized for token in ("無効", "オフ", "off", "OFF")):
+        updates["enabled"] = False
+    elif any(token in normalized for token in ("有効", "オン", "on", "ON")):
+        updates["enabled"] = True
+
+    for needle, value in _FOLLOW_POLICY_FOCUS_ALIASES.items():
+        if needle in body or needle in normalized:
+            updates["focus_area"] = value
+            break
+
+    for needle, value in _FOLLOW_POLICY_STRENGTH_ALIASES.items():
+        if needle in body or needle in normalized:
+            updates["nudge_strength"] = value
+            break
+
+    for needle, value in _FOLLOW_POLICY_FREQUENCY_ALIASES.items():
+        if needle in body or needle in normalized:
+            updates["frequency"] = value
+            break
+
+    note = body
+    note = re.sub(r"\b(enabled|focus|strength|frequency)\s*=\s*\S+", "", note, flags=re.IGNORECASE)
+    note = note.replace("有効", "").replace("無効", "").replace("オン", "").replace("オフ", "").strip()
+    return updates, note
+
+
+def _follow_policy_summary(name: str, policy: dict) -> str:
+    state = "有効" if policy["enabled"] else "無効"
+    focus = _FOLLOW_POLICY_FOCUS_LABELS.get(policy["focus_area"], "バランス")
+    strength = "軽め" if policy["nudge_strength"] == "light" else "通常"
+    frequency = "必要なときだけ" if policy["frequency"] == "low" else "通常"
+    note = policy["parent_note"] or "なし"
+    return (
+        f"{name}のAIフォロー方針: {state}\n"
+        f"- 重視: {focus}\n"
+        f"- 強さ: {strength}\n"
+        f"- 頻度: {frequency}\n"
+        f"- 親メモ: {note}"
+    )
 
 
 # ------------------------------------------------------------------
@@ -397,6 +543,64 @@ async def maybe_handle_user_setting_change(message: discord.Message, content: st
         f"{target_name}の{label}を変更したよ。"
         f"\n{old_value}円 → {amount}円"
     )
+    return True
+
+
+async def maybe_handle_followup_policy(message: discord.Message, content: str) -> bool:
+    """親がDiscordから子ども別AIフォロー方針を確認・変更する"""
+    body = _command_body(content)
+    m = re.match(r"^(?:AI)?フォロー(?:方針|設定)\s+(\S+)(?:\s+(.+))?$", body, re.IGNORECASE | re.DOTALL)
+    strength_m = re.match(r"^(?:AI)?フォロー強さ\s+(\S+)(?:\s+(.+))?$", body, re.IGNORECASE | re.DOTALL)
+    frequency_m = re.match(r"^(?:AI)?フォロー頻度\s+(\S+)(?:\s+(.+))?$", body, re.IGNORECASE | re.DOTALL)
+    command_match = m or strength_m or frequency_m
+    if not command_match:
+        return False
+
+    if not _is_parent(message.author.id):
+        await message.channel.send("AIフォロー方針の変更は親のみできるよ。")
+        return True
+
+    target_name = command_match.group(1).strip()
+    target_conf = find_user_by_name(target_name)
+    if target_conf is None:
+        await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
+        return True
+
+    current_policy = _normalize_follow_policy(target_conf.get("ai_follow_policy"))
+    rest = (command_match.group(2) or "").strip()
+    if not rest:
+        await message.channel.send(_follow_policy_summary(target_name, current_policy))
+        return True
+
+    updates, note = _parse_follow_policy_updates(rest)
+    if strength_m:
+        if "nudge_strength" not in updates:
+            await message.channel.send("フォロー強さは `軽め` または `普通` で指定してね。")
+            return True
+        updates = {"nudge_strength": updates["nudge_strength"]}
+        note = current_policy["parent_note"]
+    if frequency_m:
+        if "frequency" not in updates:
+            await message.channel.send("フォロー頻度は `必要なときだけ` または `普通` で指定してね。")
+            return True
+        updates = {"frequency": updates["frequency"]}
+        note = current_policy["parent_note"]
+
+    note_error = _follow_policy_note_error(note)
+    if note_error:
+        await message.channel.send(note_error)
+        return True
+
+    new_policy = dict(current_policy)
+    new_policy.update(updates)
+    new_policy["parent_note"] = note
+    new_policy = _normalize_follow_policy(new_policy)
+
+    if not update_user_field(target_name, "ai_follow_policy", new_policy):
+        await message.channel.send(f"{target_name}のAIフォロー方針の保存に失敗したよ。")
+        return True
+
+    await message.channel.send("AIフォロー方針を保存したよ。\n" + _follow_policy_summary(target_name, new_policy))
     return True
 
 

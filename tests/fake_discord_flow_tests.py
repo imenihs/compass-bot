@@ -233,6 +233,7 @@ class Harness:
         handlers_parent.find_user_by_name = self.find_user_by_name
         handlers_parent.get_parent_ids = lambda: {PARENT_ID}
         handlers_parent.get_allow_channel_ids = lambda: None
+        handlers_parent.update_user_field = self.update_user_field
 
     def find_parent_by_discord_id(self, user_id: int) -> dict | None:
         return next((u for u in self.parents if int(u["discord_user_id"]) == int(user_id)), None)
@@ -246,6 +247,13 @@ class Harness:
     def find_user_by_name(self, name: str) -> dict | None:
         target = (name or "").strip()
         return next((u for u in self.children + self.parents if u["name"] == target), None)
+
+    def update_user_field(self, name: str, field: str, value: Any) -> bool:
+        user = self.find_user_by_name(name)
+        if user is None:
+            return False
+        user[field] = value
+        return True
 
     async def normalize_intent(self, text: str, gemini_service: Any) -> dict:
         body = (text or "").strip()
@@ -937,6 +945,150 @@ async def case_wallet_penalty_in_assessment_prompt(h: Harness) -> tuple[list[str
     return outputs, passed, reason, not passed
 
 
+async def case_spending_entry_id_and_optional_merge(h: Harness) -> tuple[list[str], bool, str, bool]:
+    class ExpenseSupplementGemini(StubGeminiService):
+        async def call_silent(self, prompt: str) -> str:
+            if "テスト勉強" in prompt:
+                return json.dumps(
+                    {"item": None, "amount": None, "reason": "テスト勉強で使った", "satisfaction": 8},
+                    ensure_ascii=False,
+                )
+            return "{}"
+
+    async def expense_intent(text: str, gemini_service: Any) -> dict:
+        if "ノート" in text:
+            return {
+                "intent": "spending_record",
+                "confidence": "high",
+                "entities": {"item": "ノート", "reason": None, "satisfaction": None},
+            }
+        return {"intent": "none", "confidence": "high", "entities": {}}
+
+    h.bot.gemini_service = ExpenseSupplementGemini()
+    h.bot.intent_normalizer.normalize_intent = expense_intent
+    channel = FakeChannel(179, "りか-おこづかい", [FakeAuthor(RIKA_ID, "りか")])
+
+    first = await h.send(RIKA_ID, "りか", channel, "@compass-bot ノートを150円で買った")
+    pending_after_first = h.bot.wallet_service.load_audit_state().get("spending_record_pending_by_user", {})
+    stored_entry_id = str(pending_after_first.get("りか", {}).get("entry_id") or "")
+    second = await h.send(RIKA_ID, "りか", channel, "@compass-bot テスト勉強で使った。満足度8")
+
+    journal_path = h.tmp / "logs" / "りか_pocket_journal.jsonl"
+    ledger_path = h.tmp / "logs" / "りか_wallet_ledger.jsonl"
+    journal_rows = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    ledger_rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    row = journal_rows[0] if journal_rows else {}
+    ledger_entry_id = str((ledger_rows[-1].get("extra") or {}).get("entry_id") or "") if ledger_rows else ""
+    pending_after_second = h.bot.wallet_service.load_audit_state().get("spending_record_pending_by_user", {})
+    outputs = ["[record] " + x for x in first] + ["[supplement] " + x for x in second]
+    joined = "\n".join(outputs)
+    passed = (
+        len(journal_rows) == 1
+        and stored_entry_id
+        and row.get("entry_id") == stored_entry_id
+        and ledger_entry_id == stored_entry_id
+        and row.get("reason") == "テスト勉強で使った"
+        and row.get("satisfaction") == 8
+        and row.get("action") == "spending_record"
+        and "りか" not in pending_after_second
+        and "記録に追加したよ" in joined
+        and "次に" not in joined
+    )
+    reason = "新規支出にentry_idが付与され、任意補足が別行ではなく同じ支出行へマージされているため" if passed else "entry_id付与または補足マージが期待どおりでない"
+    return outputs, passed, reason, not passed
+
+
+async def case_learning_insight_card_in_assessment_prompt(h: Harness) -> tuple[list[str], bool, str, bool]:
+    capturing = CapturingGeminiService("査定しました")
+    h.bot.gemini_service = capturing
+    h.children[1]["ai_follow_policy"] = {
+        "enabled": True,
+        "focus_area": "planning",
+        "nudge_strength": "light",
+        "frequency": "low",
+        "parent_note": "買う前に一度待つ練習を軽く促してほしい",
+    }
+
+    async def allowance_request_intent(text: str, gemini_service: Any) -> dict:
+        return {"intent": "allowance_request", "confidence": "high", "entities": {}}
+
+    def fake_learning_insights(user_conf: dict, system_conf: dict, audit_state: dict) -> dict:
+        return {
+            "prompt_points": ["低満足の支出は買う前チェックにつなげる"],
+            "insight_cards": [
+                {
+                    "type": "low_priority",
+                    "priority": 1,
+                    "title": "低優先カード",
+                    "child_action": "低優先の行動",
+                },
+                {
+                    "type": "high_value_low_satisfaction",
+                    "priority": 10,
+                    "title": "高額低満足",
+                    "evidence": "ゲームソフト 2,900円 満足度3/10",
+                    "skill": "比較",
+                    "parent_question": "次に買う前、何と比べる？",
+                    "child_action": "同じ目的のものを2つ比べて、値段以外の違いを1つ書く",
+                    "avoid": "叱責や兄弟比較",
+                },
+            ],
+        }
+
+    h.bot.intent_normalizer.normalize_intent = allowance_request_intent
+    old_learning_insights = h.bot.build_learning_insights
+    h.bot.build_learning_insights = fake_learning_insights
+    try:
+        channel = FakeChannel(180, "りの-おこづかい", [FakeAuthor(RINO_ID, "りの")])
+        outputs = await h.send(RINO_ID, "りの", channel, "@compass-bot お小遣い増やしてほしい")
+    finally:
+        h.bot.build_learning_insights = old_learning_insights
+
+    prompt = "\n".join(capturing.progress_prompts)
+    passed = (
+        has_all(outputs, "査定しました")
+        and "低満足の支出は買う前チェックにつなげる" in prompt
+        and "選択済み学習カード" in prompt
+        and "高額低満足" in prompt
+        and "同じ目的のものを2つ比べて" in prompt
+        and "低優先カード" not in prompt
+        and "親専用内部メモ" in prompt
+        and "高リスク投機" in prompt
+    )
+    reason = "learning_insightsのprompt_pointsと優先度が高いカード1枚だけが査定プロンプトへ渡っているため" if passed else "learning_insightsのプロンプト連携が期待どおりでない"
+    return outputs, passed, reason, not passed
+
+
+async def case_parent_followup_policy_command(h: Harness) -> tuple[list[str], bool, str, bool]:
+    channel = FakeChannel(181, "親チャンネル", [FakeAuthor(PARENT_ID, "親")])
+    before = await h.send(PARENT_ID, "親", channel, "@compass-bot フォロー方針 りか")
+    update = await h.send(PARENT_ID, "親", channel, "@compass-bot フォロー方針 りか 記録習慣を重視 必要なときだけ")
+    strength = await h.send(PARENT_ID, "親", channel, "@compass-bot フォロー強さ りか 普通")
+    saved = dict(h.children[0].get("ai_follow_policy") or {})
+    bad = await h.send(PARENT_ID, "親", channel, "@compass-bot フォロー方針 りか 兄弟と比べて厳しく叱る")
+    after_bad = dict(h.children[0].get("ai_follow_policy") or {})
+
+    outputs = (
+        ["[before] " + x for x in before]
+        + ["[update] " + x for x in update]
+        + ["[strength] " + x for x in strength]
+        + ["[bad] " + x for x in bad]
+    )
+    joined = "\n".join(outputs)
+    passed = (
+        "AIフォロー方針: 有効" in joined
+        and "AIフォロー方針を保存したよ" in joined
+        and saved.get("focus_area") == "record_habit"
+        and saved.get("nudge_strength") == "normal"
+        and saved.get("frequency") == "low"
+        and "記録習慣を重視" in saved.get("parent_note", "")
+        and "保存しない" in joined
+        and after_bad == saved
+    )
+    reason = "Discord親コマンドでAIフォロー方針を確認・更新でき、比較/叱責寄りメモは保存されないため" if passed else "Discord親コマンドの確認・更新・危険表現拒否が期待どおりでない"
+    return outputs, passed, reason, not passed
+
+
 async def case_chat_gemini_failure_returns_message(h: Harness) -> tuple[list[str], bool, str, bool]:
     h.bot.gemini_service = FailingGeminiService()
     channel = FakeChannel(17, "りか-おこづかい", [FakeAuthor(RIKA_ID, "りか")])
@@ -998,6 +1150,9 @@ async def main(markdown_path: Path | None = None) -> int:
         ("robustness_misc_inputs", "@compass-bot a / 長文 / 特殊文字 / JSON風入力", case_robustness_misc_inputs),
         ("missing_entities_pending_and_unregistered", "@compass-bot 貯金目標を設定したい / 未登録ユーザー", case_missing_entities_pending_and_unregistered),
         ("wallet_penalty_in_assessment_prompt", "@compass-bot お小遣い増やしてほしい", case_wallet_penalty_in_assessment_prompt),
+        ("spending_entry_id_and_optional_merge", "@compass-bot ノートを150円で買った / 満足度8", case_spending_entry_id_and_optional_merge),
+        ("learning_insight_card_in_assessment_prompt", "@compass-bot お小遣い増やしてほしい", case_learning_insight_card_in_assessment_prompt),
+        ("parent_followup_policy_command", "@compass-bot フォロー方針 りか 記録習慣を重視", case_parent_followup_policy_command),
         ("chat_gemini_failure_returns_message", "@compass-bot ねむたい", case_chat_gemini_failure_returns_message),
         ("assessment_gemini_failure_returns_message", "@compass-bot 攻略本を買いたいからお小遣い増やして", case_assessment_gemini_failure_returns_message),
     ]

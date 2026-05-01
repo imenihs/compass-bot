@@ -299,6 +299,445 @@ def _try_build_reflection_context(
     return None
 
 
+def _short_text(value: Any, max_len: int = 500) -> str:
+    """画面・状態保存に使う短い文字列へ正規化する"""
+    if type(value).__module__ == "fastapi.params" and hasattr(value, "default"):
+        value = value.default
+    text = str(value or "").replace("\r\n", "\n").strip()
+    if len(text) > max_len:
+        return text[:max_len].rstrip()
+    return text
+
+
+def _coerce_text_list(value: Any, max_items: int = 5, max_len: int = 240) -> list[str]:
+    """文字列・配列・dict をテンプレート表示用の短い配列にする"""
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        lines = []
+        for key, item in value.items():
+            if item in (None, "", [], {}):
+                continue
+            key_text = _short_text(key, 40)
+            if isinstance(item, list):
+                item_text = "・".join(_short_text(x, 80) for x in item if _short_text(x, 80))
+            else:
+                item_text = _short_text(item, max_len)
+            if item_text:
+                lines.append(f"{key_text}: {item_text}")
+            if len(lines) >= max_items:
+                break
+        return lines
+    if isinstance(value, list):
+        lines = []
+        for item in value:
+            if isinstance(item, dict):
+                lines.extend(_coerce_text_list(item, max_items=max_items - len(lines), max_len=max_len))
+            else:
+                text = _short_text(item, max_len)
+                if text:
+                    lines.append(text)
+            if len(lines) >= max_items:
+                break
+        return lines[:max_items]
+    text = _short_text(value, max_len)
+    if not text:
+        return []
+    return [line.strip(" ・-") for line in text.splitlines() if line.strip(" ・-")][:max_items]
+
+
+def _metric_label(key: str) -> str:
+    labels = {
+        "count": "記録件数",
+        "total_amount": "支出合計",
+        "average_satisfaction": "満足度平均",
+        "completion_rate": "記録完全率",
+        "allowance_ratio": "固定お小遣い比",
+        "goal_impact": "目標影響",
+    }
+    return labels.get(key, key)
+
+
+def _normalize_learning_metrics(metrics: Any) -> list[dict]:
+    """learning_insights の metrics をテンプレート共通形式へ変換する"""
+    normalized: list[dict] = []
+    if isinstance(metrics, dict):
+        iterable = [{"label": _metric_label(str(k)), "value": v} for k, v in metrics.items()]
+    elif isinstance(metrics, list):
+        iterable = metrics
+    else:
+        iterable = []
+
+    for item in iterable:
+        if isinstance(item, dict):
+            label = _short_text(item.get("label") or item.get("name") or item.get("key"), 40)
+            value = item.get("value")
+            if value is None:
+                value = item.get("text")
+        else:
+            label = "指標"
+            value = item
+        value_text = _short_text(value, 80)
+        if label and value_text:
+            normalized.append({"label": label, "value": value_text})
+        if len(normalized) >= 6:
+            break
+    return normalized
+
+
+def _insight_type_label(card_type: str) -> str:
+    labels = {
+        "low_satisfaction_high_amount": "高額低満足",
+        "repeated_small_spending": "少額の反復支出",
+        "positive_planned_purchase": "よい判断の言語化",
+        "saving_goal_impact": "目標貯金への影響",
+        "record_habit": "記録習慣",
+        "income_balance": "収入と支出のバランス",
+        "online_risk": "オンライン支出の確認",
+    }
+    return labels.get(card_type, "会話カード")
+
+
+def _normalize_insight_card(raw_card: Any, index: int) -> dict:
+    """親向け会話カードを、親画面で安全に扱う形へそろえる"""
+    card = raw_card if isinstance(raw_card, dict) else {"title": raw_card}
+    card_type = _short_text(card.get("type") or "record_habit", 80)
+    card_id = _short_text(card.get("card_id") or card.get("id") or f"{card_type}-{index + 1}", 120)
+    title = _short_text(card.get("title") or _insight_type_label(card_type), 80)
+    parent_question = _short_text(
+        card.get("parent_question") or card.get("question") or "次の買い物で、何を試すか一緒に1つだけ決めてみる？",
+        220,
+    )
+    parent_action = _short_text(
+        card.get("parent_action") or card.get("today_action") or card.get("next_action") or "5分だけ一緒に記録を見返す。",
+        220,
+    )
+    child_action = _short_text(card.get("child_action") or card.get("action") or parent_action, 220)
+    policy_match_raw = card.get("policy_match")
+    if isinstance(policy_match_raw, bool):
+        policy_match = "方針に合っています" if policy_match_raw else ""
+    else:
+        policy_match = _short_text(policy_match_raw, 80)
+
+    return {
+        "card_id": card_id,
+        "type": card_type,
+        "title": title,
+        "evidence_lines": _coerce_text_list(card.get("evidence"), max_items=4),
+        "skill": _short_text(card.get("skill") or "記録", 80),
+        "parent_question": parent_question,
+        "parent_action": parent_action,
+        "child_action": child_action,
+        "avoid": _short_text(card.get("avoid") or "叱責・人格評価・兄弟比較は避ける。", 180),
+        "policy_match": policy_match,
+        "next_observation": _short_text(card.get("next_observation"), 180),
+    }
+
+
+def _normalize_child_challenge(raw_challenge: Any, cards: list[dict]) -> dict:
+    """子ども向けチャレンジだけを切り出す。親メモや内部方針は含めない"""
+    if isinstance(raw_challenge, dict):
+        challenge_id = _short_text(
+            raw_challenge.get("challenge_id") or raw_challenge.get("card_id") or raw_challenge.get("id"),
+            120,
+        )
+        title = _short_text(raw_challenge.get("title") or "次の小さなチャレンジ", 80)
+        action = _short_text(
+            raw_challenge.get("action") or raw_challenge.get("child_action") or raw_challenge.get("text"),
+            220,
+        )
+        expected_time = _short_text(raw_challenge.get("expected_time") or raw_challenge.get("time") or "5分以内", 40)
+        source_card_id = _short_text(raw_challenge.get("source_card_id") or raw_challenge.get("card_id"), 120)
+    else:
+        challenge_id = ""
+        title = "次の小さなチャレンジ"
+        action = _short_text(raw_challenge, 220)
+        expected_time = "5分以内"
+        source_card_id = ""
+
+    if not action and cards:
+        action = cards[0].get("child_action", "")
+        source_card_id = cards[0].get("card_id", "")
+    if not challenge_id:
+        challenge_id = source_card_id or "child-challenge"
+    if not action:
+        action = "次の買い物を記録するとき、買った理由を一言だけ足してみよう。"
+
+    return {
+        "challenge_id": challenge_id,
+        "title": title,
+        "action": action,
+        "expected_time": expected_time,
+        "source_card_id": source_card_id,
+    }
+
+
+def _sanitize_child_challenge(challenge: dict, user_conf: dict) -> dict:
+    """子ども画面へ渡す文面から親メモ・内部方針らしさを排除する"""
+    sanitized = dict(challenge)
+    policy = _normalize_follow_policy(user_conf or {})
+    parent_note = _short_text(policy.get("parent_note"), 300)
+    blocked_fragments = [parent_note] if len(parent_note) >= 4 else []
+    blocked_terms = (
+        "親メモ",
+        "内部方針",
+        "AIフォロー方針",
+        "ai_follow_policy",
+        "parent_note",
+        "focus_area",
+        "nudge_strength",
+        "frequency",
+    )
+
+    for key, fallback in (
+        ("title", "次の小さなチャレンジ"),
+        ("action", "次の買い物を記録するとき、買った理由を一言だけ足してみよう。"),
+    ):
+        text = _short_text(sanitized.get(key), 220)
+        has_blocked_fragment = any(fragment and fragment in text for fragment in blocked_fragments)
+        has_blocked_term = any(term in text for term in blocked_terms)
+        sanitized[key] = fallback if has_blocked_fragment or has_blocked_term else text
+    return sanitized
+
+
+def _try_build_learning_insights(
+    user_conf: dict,
+    system_conf: dict,
+    audit_state: Optional[dict] = None,
+) -> Optional[dict]:
+    """提供された learning_insights があれば呼び出す"""
+    if build_learning_insights is None:
+        return None
+    try:
+        name = str(user_conf.get("name", "")).strip()
+        analysis_state = dict(audit_state or {})
+        analysis_state["learning_support_state"] = _load_learning_support_state(user_conf, name)
+        insights = build_learning_insights(
+            user_conf=user_conf,
+            system_conf=system_conf,
+            audit_state=analysis_state,
+            days=90,
+        )
+    except Exception:
+        return None
+    if isinstance(insights, dict):
+        return insights
+    return None
+
+
+def _build_fallback_learning_insights(
+    name: str,
+    system_conf: dict,
+    user_conf: dict,
+    journal_rows: Optional[list[dict]] = None,
+    audit_state: Optional[dict] = None,
+) -> dict:
+    """learning_insights 未提供時のSSRフォールバック。実ログは書き換えない"""
+    summary = _build_learning_support_summary(name, system_conf, user_conf, journal_rows, audit_state)
+    parent_hint = summary["parent_hints"][0] if summary.get("parent_hints") else "買い物の理由を1つだけ聞く。"
+    child_hint = summary["child_hints"][0] if summary.get("child_hints") else "買った理由を一言だけ記録する。"
+    signal = summary["signals"][0] if summary.get("signals") else "記録を増やすと会話カードが具体的になります。"
+    return {
+        "summary_text": signal,
+        "metrics": summary.get("metrics", []),
+        "insight_cards": [
+            {
+                "card_id": "fallback-record-habit",
+                "type": "record_habit",
+                "title": "記録を会話につなげる",
+                "evidence": [signal],
+                "skill": "記録",
+                "parent_question": "次の買い物で、何を選んだ理由だけ一緒に確認してみる？",
+                "parent_action": parent_hint,
+                "child_action": child_hint,
+                "avoid": "責める言い方や、他の子との比較は避ける。",
+                "policy_match": "",
+                "next_observation": "理由と満足度が次の記録に残るかを見る。",
+            }
+        ],
+        "child_challenge": {
+            "challenge_id": "fallback-record-habit",
+            "title": "記録に一言足す",
+            "action": child_hint,
+            "expected_time": "5分以内",
+        },
+        "source_notes": ["learning_insights が未提供のため簡易集計から表示しています。"],
+        "_legacy_summary": summary,
+    }
+
+
+def _normalize_learning_insights(
+    name: str,
+    system_conf: dict,
+    user_conf: dict,
+    journal_rows: Optional[list[dict]] = None,
+    audit_state: Optional[dict] = None,
+) -> dict:
+    """親カード・子どもチャレンジをSSRで扱いやすい形にする"""
+    raw = _try_build_learning_insights(user_conf, system_conf, audit_state)
+    source = "learning_insights" if raw is not None else "dashboard_fallback"
+    if raw is None:
+        raw = _build_fallback_learning_insights(name, system_conf, user_conf, journal_rows, audit_state)
+
+    cards = [_normalize_insight_card(card, idx) for idx, card in enumerate(raw.get("insight_cards") or [])]
+    if not cards and source == "learning_insights":
+        fallback = _build_fallback_learning_insights(name, system_conf, user_conf, journal_rows, audit_state)
+        cards = [_normalize_insight_card(card, idx) for idx, card in enumerate(fallback.get("insight_cards") or [])]
+
+    metrics = _normalize_learning_metrics(raw.get("metrics"))
+    if not metrics and isinstance(raw.get("_legacy_summary"), dict):
+        metrics = _normalize_learning_metrics(raw["_legacy_summary"].get("metrics"))
+
+    summary_text = _short_text(raw.get("summary_text"), 240)
+    if not summary_text and cards:
+        evidence = cards[0].get("evidence_lines") or []
+        summary_text = evidence[0] if evidence else cards[0].get("title", "")
+
+    child_challenge = _sanitize_child_challenge(
+        _normalize_child_challenge(raw.get("child_challenge"), cards),
+        user_conf,
+    )
+    legacy_summary = raw.get("_legacy_summary")
+    if not isinstance(legacy_summary, dict):
+        legacy_summary = {
+            "source": source,
+            "source_label": "会話カード" if source == "learning_insights" else "簡易集計",
+            "metrics": metrics,
+            "signals": [summary_text] if summary_text else [],
+            "parent_hints": [card["parent_question"] for card in cards[:2] if card.get("parent_question")],
+            "child_hints": [child_challenge["action"]] if child_challenge.get("action") else [],
+        }
+
+    return {
+        "source": source,
+        "summary_text": summary_text,
+        "metrics": metrics,
+        "insight_cards": cards[:2],
+        "child_challenge": child_challenge,
+        "source_notes": _coerce_text_list(raw.get("source_notes"), max_items=3),
+        "legacy_summary": legacy_summary,
+    }
+
+
+def _user_key_for_storage(user_conf: dict, fallback_name: str) -> str:
+    """ユーザー名をファイル名として安全なキーへ変換する"""
+    raw_key = str(user_conf.get("user_key") or user_conf.get("name") or fallback_name or "").strip()
+    key = quote(raw_key, safe="-_.")
+    return key[:120] if key else "unknown"
+
+
+def _read_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+    return data
+
+
+def _write_json_file(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    tmp_path.replace(path)
+
+
+def _learning_support_state_path(user_conf: dict, fallback_name: str) -> Path:
+    return LEARNING_SUPPORT_STATE_DIR / f"{_user_key_for_storage(user_conf, fallback_name)}.json"
+
+
+def _growth_plans_path(user_conf: dict, fallback_name: str) -> Path:
+    return GROWTH_PLANS_DIR / f"{_user_key_for_storage(user_conf, fallback_name)}.json"
+
+
+def _default_learning_support_state(user_conf: dict, fallback_name: str) -> dict:
+    return {
+        "user_key": _user_key_for_storage(user_conf, fallback_name),
+        "last_card_type": "",
+        "last_card_id": "",
+        "last_nudge_at": "",
+        "last_parent_question": "",
+        "last_child_action": "",
+        "child_response": {},
+        "suppressed_card_types": [],
+        "feedback_events": [],
+        "child_challenge_events": [],
+        "active_growth_plan_id": "",
+    }
+
+
+def _load_learning_support_state(user_conf: dict, fallback_name: str) -> dict:
+    default = _default_learning_support_state(user_conf, fallback_name)
+    loaded = _read_json_file(_learning_support_state_path(user_conf, fallback_name), default)
+    if not isinstance(loaded, dict):
+        return default
+    merged = {**default, **loaded}
+    if not isinstance(merged.get("feedback_events"), list):
+        merged["feedback_events"] = []
+    if not isinstance(merged.get("child_challenge_events"), list):
+        merged["child_challenge_events"] = []
+    if not isinstance(merged.get("suppressed_card_types"), list):
+        merged["suppressed_card_types"] = []
+    if not isinstance(merged.get("child_response"), dict):
+        merged["child_response"] = {}
+    return merged
+
+
+def _save_learning_support_state(user_conf: dict, fallback_name: str, state: dict) -> None:
+    state["user_key"] = _user_key_for_storage(user_conf, fallback_name)
+    state["updated_at"] = now_jst_iso()
+    _write_json_file(_learning_support_state_path(user_conf, fallback_name), state)
+
+
+def _load_growth_plans(user_conf: dict, fallback_name: str) -> dict:
+    default = {"user_key": _user_key_for_storage(user_conf, fallback_name), "plans": []}
+    loaded = _read_json_file(_growth_plans_path(user_conf, fallback_name), default)
+    if isinstance(loaded, list):
+        return {**default, "plans": loaded}
+    if not isinstance(loaded, dict):
+        return default
+    plans = loaded.get("plans")
+    if not isinstance(plans, list):
+        plans = []
+    return {**default, **loaded, "plans": plans}
+
+
+def _save_growth_plans(user_conf: dict, fallback_name: str, data: dict) -> None:
+    data["user_key"] = _user_key_for_storage(user_conf, fallback_name)
+    data["updated_at"] = now_jst_iso()
+    _write_json_file(_growth_plans_path(user_conf, fallback_name), data)
+
+
+def _active_growth_plan(user_conf: dict, fallback_name: str) -> Optional[dict]:
+    plans_data = _load_growth_plans(user_conf, fallback_name)
+    for plan in plans_data.get("plans", []):
+        if isinstance(plan, dict) and plan.get("status") == "active":
+            return plan
+    return None
+
+
+def _append_capped_event(container: dict, key: str, event: dict, limit: int = 50) -> None:
+    events = container.get(key)
+    if not isinstance(events, list):
+        events = []
+    events.append(event)
+    container[key] = events[-limit:]
+
+
+def _find_child_user_conf(name: str) -> Optional[dict]:
+    target_name = str(name or "").strip()
+    if not target_name:
+        return None
+    return next(
+        (u for u in load_all_users() if str(u.get("name", "")).strip() == target_name),
+        None,
+    )
+
+
 def _build_learning_support_summary(
     name: str,
     system_conf: dict,
@@ -512,13 +951,17 @@ def _build_user_stats(name: str, system_conf: dict, user_conf: Optional[dict] = 
         audit_reported = name not in pending
 
     follow_policy = _normalize_follow_policy(user_conf or {})
+    learning_insights = _normalize_learning_insights(name, system_conf, user_conf or {}, rows, audit_state)
 
     return {
         "name": name,
         "fixed_allowance": int((user_conf or {}).get("fixed_allowance", 0)),
         "parent_followup_note": follow_policy["parent_note"],
         "ai_follow_policy": follow_policy,
-        "learning_summary": _build_learning_support_summary(name, system_conf, user_conf or {}, rows, audit_state),
+        "learning_summary": learning_insights["legacy_summary"],
+        "learning_insights": learning_insights,
+        "child_challenge": learning_insights["child_challenge"],
+        "active_growth_plan": _active_growth_plan(user_conf or {}, name),
         "balance": balance,
         "has_wallet": has_wallet,
         "low_balance": low_balance,
@@ -773,10 +1216,7 @@ async def get_dashboard(
             "request": request,
             "username": username,
             "is_admin": False,
-            "my_learning_summary": stats["learning_summary"],
-            "follow_focus_choices": FOLLOW_FOCUS_CHOICES,
-            "follow_strength_choices": FOLLOW_STRENGTH_CHOICES,
-            "follow_frequency_choices": FOLLOW_FREQUENCY_CHOICES,
+            "my_child_challenge": stats["child_challenge"],
             "my_balance": stats["balance"],
             "my_low_balance": stats["low_balance"],
             "my_goals": stats["goals"],
@@ -1017,6 +1457,202 @@ async def op_followup_note(
         frequency=current_policy["frequency"],
         parent_note=parent_followup_note,
     )
+
+
+@app.post("/compass-bot/op/learning_card_feedback")
+async def op_learning_card_feedback(
+    session_token: Optional[str] = Cookie(default=None),
+    target: str = Form(...),
+    card_id: str = Form(...),
+    feedback: str = Form(...),
+    card_type: str = Form(default=""),
+    parent_question: str = Form(default=""),
+    child_action: str = Form(default=""),
+):
+    """親が今週の会話カードへの反応を保存する"""
+    current_user = await _get_current_user(session_token)
+    if not current_user or not _is_admin(current_user):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    target_name = target.strip()
+    target_conf = _find_child_user_conf(target_name)
+    if target_conf is None:
+        return _op_redirect(error=f"「{target_name}」は子供ユーザー設定に見つかりませんでした。")
+
+    feedback_value = _short_text(feedback, 40)
+    if feedback_value not in LEARNING_CARD_FEEDBACK_CHOICES:
+        return _op_redirect(error="会話カードの反応が正しくありません。")
+
+    now = now_jst_iso()
+    state = _load_learning_support_state(target_conf, target_name)
+    event = {
+        "ts": now,
+        "actor": current_user,
+        "feedback": feedback_value,
+        "card_id": _short_text(card_id, 120),
+        "card_type": _short_text(card_type, 80),
+    }
+    _append_capped_event(state, "feedback_events", event)
+
+    if feedback_value == "use_this_week":
+        state["last_card_id"] = event["card_id"]
+        state["last_card_type"] = event["card_type"]
+        state["last_nudge_at"] = now
+        state["last_parent_question"] = _short_text(parent_question, 220)
+        state["last_child_action"] = _short_text(child_action, 220)
+    elif feedback_value == "suppress_week":
+        suppressed = state.get("suppressed_card_types")
+        if not isinstance(suppressed, list):
+            suppressed = []
+        suppressed.append({
+            "card_id": event["card_id"],
+            "card_type": event["card_type"],
+            "ts": now,
+        })
+        state["suppressed_card_types"] = suppressed[-20:]
+
+    _save_learning_support_state(target_conf, target_name, state)
+    label = LEARNING_CARD_FEEDBACK_CHOICES[feedback_value]
+    return _op_redirect(msg=f"{target_name}の会話カード反応を保存しました（{label}）。")
+
+
+@app.post("/compass-bot/op/child_challenge_feedback")
+async def op_child_challenge_feedback(
+    session_token: Optional[str] = Cookie(default=None),
+    challenge_id: str = Form(...),
+    feedback: str = Form(...),
+    target: str = Form(default=""),
+    child_action: str = Form(default=""),
+):
+    """子どものチャレンジ反応を保存する。親メモや内部方針はレスポンスに含めない"""
+    current_user = await _get_current_user(session_token)
+    if not current_user:
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    is_admin = _is_admin(current_user)
+    target_value = _short_text(target, 120)
+    target_name = target_value if is_admin and target_value else current_user
+    if target_value and target_value != current_user and not is_admin:
+        return _op_redirect(error="自分以外のチャレンジ反応は保存できません。")
+
+    target_conf = _find_child_user_conf(target_name)
+    if target_conf is None:
+        return _op_redirect(error=f"「{target_name}」は子供ユーザー設定に見つかりませんでした。")
+
+    feedback_value = _short_text(feedback, 40)
+    if feedback_value not in CHILD_CHALLENGE_FEEDBACK_CHOICES:
+        return _op_redirect(error="チャレンジの反応が正しくありません。")
+
+    now = now_jst_iso()
+    state = _load_learning_support_state(target_conf, target_name)
+    event = {
+        "ts": now,
+        "actor": current_user,
+        "feedback": feedback_value,
+        "challenge_id": _short_text(challenge_id, 120),
+        "child_action": _short_text(child_action, 220),
+    }
+    _append_capped_event(state, "child_challenge_events", event)
+    state["child_response"] = {
+        "challenge_id": event["challenge_id"],
+        "feedback": feedback_value,
+        "responded_at": now,
+    }
+    if event["child_action"]:
+        state["last_child_action"] = event["child_action"]
+
+    _save_learning_support_state(target_conf, target_name, state)
+    label = CHILD_CHALLENGE_FEEDBACK_CHOICES[feedback_value]
+    return _op_redirect(msg=f"チャレンジの反応を保存しました（{label}）。")
+
+
+@app.post("/compass-bot/op/growth_plan")
+async def op_growth_plan(
+    session_token: Optional[str] = Cookie(default=None),
+    target: str = Form(...),
+    plan_id: str = Form(default=""),
+    action: str = Form(default="save"),
+    status: str = Form(default="active"),
+    request_type: str = Form(default="allowance_increase"),
+    child_reason: str = Form(default=""),
+    parent_condition: str = Form(default=""),
+    agreed_action: str = Form(default=""),
+    review_at: str = Form(default=""),
+    reward_amount: str = Form(default=""),
+    notes: str = Form(default=""),
+):
+    """親が成長行動プランを作成・更新・終了する"""
+    current_user = await _get_current_user(session_token)
+    if not current_user or not _is_admin(current_user):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    target_name = target.strip()
+    target_conf = _find_child_user_conf(target_name)
+    if target_conf is None:
+        return _op_redirect(error=f"「{target_name}」は子供ユーザー設定に見つかりませんでした。")
+
+    action_value = _short_text(action, 40)
+    status_value = _short_text(status, 40)
+    if action_value in {"done", "cancelled", "cancel"}:
+        status_value = "cancelled" if action_value == "cancel" else action_value
+    if status_value not in GROWTH_PLAN_STATUS_CHOICES:
+        return _op_redirect(error="成長行動プランの状態が正しくありません。")
+
+    request_type_value = _short_text(request_type, 80)
+    if request_type_value not in GROWTH_PLAN_REQUEST_TYPES:
+        return _op_redirect(error="成長行動プランの種類が正しくありません。")
+
+    reward_text = _short_text(reward_amount, 40).replace(",", "").replace("円", "").strip()
+    reward_value = None
+    if reward_text:
+        try:
+            reward_value = int(reward_text)
+        except ValueError:
+            return _op_redirect(error="報酬額が正しくありません。")
+        if reward_value < 0:
+            return _op_redirect(error="報酬額は0円以上を入力してください。")
+
+    now = now_jst_iso()
+    plans_data = _load_growth_plans(target_conf, target_name)
+    plans = [p for p in plans_data.get("plans", []) if isinstance(p, dict)]
+    target_plan_id = _short_text(plan_id, 120)
+    existing_index = next(
+        (idx for idx, plan in enumerate(plans) if str(plan.get("plan_id", "")) == target_plan_id),
+        None,
+    )
+
+    if existing_index is None:
+        target_plan_id = target_plan_id or f"gp-{uuid.uuid4().hex[:12]}"
+        plan = {"plan_id": target_plan_id, "created_at": now, "created_by": current_user}
+        plans.append(plan)
+    else:
+        plan = plans[existing_index]
+
+    plan.update({
+        "plan_id": target_plan_id,
+        "status": status_value,
+        "request_type": request_type_value,
+        "child_reason": _short_text(child_reason, 300),
+        "parent_condition": _short_text(parent_condition, 300),
+        "agreed_action": _short_text(agreed_action, 300),
+        "review_at": _short_text(review_at, 40),
+        "reward_amount": reward_value,
+        "notes": _short_text(notes, 500),
+        "updated_at": now,
+        "updated_by": current_user,
+    })
+
+    plans_data["plans"] = plans
+    _save_growth_plans(target_conf, target_name, plans_data)
+
+    state = _load_learning_support_state(target_conf, target_name)
+    if status_value == "active":
+        state["active_growth_plan_id"] = target_plan_id
+    elif state.get("active_growth_plan_id") == target_plan_id:
+        state["active_growth_plan_id"] = ""
+    _save_learning_support_state(target_conf, target_name, state)
+
+    return _op_redirect(msg=f"{target_name}の成長行動プランを保存しました。")
 
 
 @app.post("/compass-bot/op/adjust")

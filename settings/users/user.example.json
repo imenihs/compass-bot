@@ -3,6 +3,7 @@
   "discord_user_id": 333333333333333333,
   "age": 12,
   "gender": "unspecified",
+  "bot_personality": "sibling",
   "fixed_allowance": 500,
   "temporary_max": 3000,
   "fixed_increase_cap": 100,
