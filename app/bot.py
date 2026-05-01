@@ -593,17 +593,21 @@ async def _commit_expense_record(
     amount,
     reason,
     satisfaction,
-) -> bool:
+) -> tuple[bool, str]:
     """支出情報を pocket_journal に記録し、金額があれば残高を更新して完了メッセージを送信する。
-    成功時 True、残高不足で記録のみの場合 False を返す。"""
+    成功フラグと entry_id を返す。残高不足でも記録行には entry_id を残す。"""
     user_name = str(user_conf.get("name", ""))
     log_dir = get_log_dir(system_conf)
     journal_path = log_dir / f"{user_name}_pocket_journal.jsonl"
+    entry_id = wallet_service.new_entry_id("expense")
     reason_words = _rough_word_count(reason or "")
     append_jsonl(journal_path, {
         "ts": now_jst_iso(),
+        "entry_id": entry_id,
         "discord_user_id": message.author.id,
         "name": user_name,
+        "action": "spending_record",
+        "source": "normal_record",
         "item": item,
         "reason": reason or "",
         "reason_word_count": reason_words,
@@ -621,13 +625,14 @@ async def _commit_expense_record(
                 f"でも残高が足りないよ！今の残高は {before}円 で、{int(amount):,}円 は使えないよ。\n"
                 "残高の変更はしなかったよ。"
             )
-            return False
+            return False, entry_id
         new_balance, _ = wallet_service.update_balance(
             user_conf=user_conf,
             system_conf=system_conf,
             delta=-int(amount),
             action="spending_record",
             note=item,
+            extra={"entry_id": entry_id, "discord_user_id": int(message.author.id)},
         )
         balance_line = f"\n残高: {before}円 → {new_balance}円"
         await handlers_child.maybe_send_low_balance_alert(user_conf=user_conf, new_balance=new_balance)
@@ -657,7 +662,7 @@ async def _commit_expense_record(
         f"{opt_hint}"
     )
     # 記録成功を呼び出し元に伝える
-    return True
+    return True, entry_id
 
 
 async def _process_expense_flow(
@@ -689,12 +694,16 @@ async def _process_expense_flow(
         return
 
     # item + amount 揃い → 即記録する
-    success = await _commit_expense_record(message, user_conf, system_conf, item, amount, reason, satisfaction)
+    success, entry_id = await _commit_expense_record(
+        message, user_conf, system_conf, item, amount, reason, satisfaction
+    )
 
     if success and (not reason or satisfaction is None):
         # optional が不足している場合は soft pending を設定する（次メッセージで受け付ける）
         # ブロッキングではないので別トピックが来たら自動解除される
-        _save_spending_pending(user_name, item, amount, reason, satisfaction, asked_optional=True)
+        _save_spending_pending(
+            user_name, item, amount, reason, satisfaction, asked_optional=True, entry_id=entry_id
+        )
     else:
         # optional 込みで完了 or 残高不足の場合は pending を解除する
         _clear_spending_pending(user_name)
@@ -729,6 +738,7 @@ async def maybe_handle_spending_record_flow(
     stored_reason = partial.get("reason") if isinstance(partial, dict) else None
     stored_sat = partial.get("satisfaction") if isinstance(partial, dict) else None
     asked_optional = partial.get("asked_optional", False) if isinstance(partial, dict) else False
+    stored_entry_id = str(partial.get("entry_id") or "") if isinstance(partial, dict) else ""
 
     # --- soft pending（記録済み・optional 待ち）の場合 ---
     if asked_optional:
@@ -745,8 +755,10 @@ async def maybe_handle_spending_record_flow(
         satisfaction = sat if sat is not None else stored_sat
 
         if reason or satisfaction is not None:
-            # optional 情報が取れた → 補足エントリを書き込んで完了する
-            _write_expense_optional(user_conf, system_conf, stored_item, reason, satisfaction)
+            # optional 情報が取れた → 元の支出 entry_id に紐づけて完了する
+            _write_expense_optional(
+                user_conf, system_conf, stored_item, reason, satisfaction, entry_id=stored_entry_id or None
+            )
             _clear_spending_pending(user_name)
             await message.channel.send("教えてくれてありがとう！記録に追加したよ！")
             return True
