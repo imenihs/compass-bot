@@ -32,8 +32,10 @@ from app.bot_utils import (
     _usage_guide_text_parent,
 )
 from app.config import (
+    find_parent_by_discord_id,
     find_user_by_discord_id,
     find_user_by_name,
+    get_discord_id_conflicts,
     get_allow_channel_ids,
     get_assess_keyword,
     get_allowance_reminder_setting,
@@ -60,6 +62,11 @@ from app.message_parser import (
     parse_proxy_request,
 )
 from app.prompts import build_chat_prompt, build_prompt
+from app.reflection_context import build_reflection_context
+try:
+    from app.reflection_context import build_learning_insights
+except ImportError:
+    build_learning_insights = None
 from app.reminder_service import ReminderService
 from app.storage import append_jsonl, now_jst_iso, JST
 from app.wallet_service import WalletService
@@ -79,6 +86,11 @@ FORCE_ASSESS_TEST_KEYWORD = get_force_assess_test_keyword()
 LOW_BALANCE_ALERT = get_low_balance_alert_setting()
 MONTHLY_SUMMARY = get_monthly_summary_setting()
 POCKET_JOURNAL_REMINDER = get_pocket_journal_reminder_setting()
+
+# 初期設定・財布チェックで受け付ける現実的な財布上限。Discord ID等の誤入力を拒否する。
+MAX_WALLET_INPUT_AMOUNT = 1_000_000
+# 貯金目標の補完入力で受け付ける上限。通常の子供向け目標として十分な範囲にする。
+MAX_GOAL_INPUT_AMOUNT = 10_000_000
 
 
 gemini_service = GeminiService(
@@ -106,6 +118,265 @@ reminder_service = ReminderService(
 def is_parent(user_id: int) -> bool:
     """ユーザーIDが親（管理者）かどうかを判定する"""
     return user_id in PARENT_IDS
+
+def _find_channel_child_user_conf(message: discord.Message) -> dict | None:
+    """親が子ども用チャンネルで発言した場合の対象子ユーザーを推定する"""
+    child_users = load_all_users()
+    channel_name = str(getattr(message.channel, "name", "") or "")
+
+    # チャンネル名に子どもの名前が1人だけ含まれる場合は、その子を優先する
+    name_matches = [
+        u for u in child_users
+        if str(u.get("name", "")).strip()
+        and str(u.get("name", "")).strip() in channel_name
+    ]
+    if len(name_matches) == 1:
+        return name_matches[0]
+
+    # チャンネルメンバーから登録済み子ユーザーを探す
+    member_ids = {
+        int(member.id)
+        for member in getattr(message.channel, "members", [])
+        if getattr(member, "id", None) is not None
+    }
+    if not member_ids:
+        return None
+
+    member_matches = [
+        u for u in child_users
+        if u.get("discord_user_id") and int(u.get("discord_user_id")) in member_ids
+    ]
+    if len(member_matches) == 1:
+        return member_matches[0]
+
+    # 複数候補または候補なしの場合は誤操作防止のため自動補正しない
+    return None
+
+
+def _extract_child_name_from_text(input_block: str) -> str | None:
+    """本文に登録済み子ユーザー名が1人だけ含まれる場合、その名前を返す"""
+    matches = [
+        str(u.get("name", "")).strip()
+        for u in load_all_users()
+        if str(u.get("name", "")).strip()
+        and _child_name_mentioned_in_text(input_block, str(u.get("name", "")).strip())
+    ]
+    unique_matches = sorted(set(matches))
+    return unique_matches[0] if len(unique_matches) == 1 else None
+
+
+def _find_child_names_in_text(input_block: str) -> list[str]:
+    """本文に含まれる登録済み子ユーザー名を重複なしで返す"""
+    matches = [
+        str(u.get("name", "")).strip()
+        for u in load_all_users()
+        if str(u.get("name", "")).strip()
+        and _child_name_mentioned_in_text(input_block, str(u.get("name", "")).strip())
+    ]
+    return sorted(set(matches))
+
+
+def _child_name_mentioned_in_text(input_block: str, child_name: str) -> bool:
+    """短い名前が普通の単語の一部に偶然入っただけの場合は名前扱いしない"""
+    body = input_block or ""
+    name = (child_name or "").strip()
+    if not body or not name:
+        return False
+    prefix = r"(^|[\s　、。,.!！?？:：`'\"「」『』（）\(\)\[\]【】]|[はがをにへとで])"
+    suffix = r"(?:さん|ちゃん|くん)?(?=$|[\s　、。,.!！?？:：`'\"「」『』（）\(\)\[\]【】]|[のはがをにへとで]|について)"
+    return bool(re.search(prefix + re.escape(name) + suffix, body))
+
+
+def _is_child_user_name(name: str) -> bool:
+    """名前が登録済み子ユーザーかどうかを判定する"""
+    target = (name or "").strip()
+    return any(str(u.get("name", "")).strip() == target for u in load_all_users())
+
+
+def _coerce_positive_amount(value, max_amount: int) -> int | None:
+    """Gemini等から来た金額を正の整数かつ上限内に丸める"""
+    if value is None:
+        return None
+    try:
+        amount = int(value)
+    except Exception:
+        return None
+    if amount <= 0 or amount > int(max_amount):
+        return None
+    return amount
+
+
+def _looks_uncertain_money_statement(input_block: str) -> bool:
+    """金額が概算・未確定に見える入力かどうかを判定する"""
+    compact = re.sub(r"\s+", "", input_block or "").lower()
+    if not compact:
+        return False
+    uncertain_keywords = [
+        "くらい", "ぐらい", "位", "くらいかな", "ぐらいかな", "たぶん", "多分",
+        "かも", "かもしれない", "気がする", "きがする", "だと思う", "約",
+        "およそ", "だいたい", "大体", "わからない", "分からない", "わかんない",
+        "忘れた", "あとで",
+    ]
+    return any(k.lower() in compact for k in uncertain_keywords)
+
+
+def _extract_confirmed_yen_amount(input_block: str, max_amount: int) -> int | None:
+    """残高を変更してよい、単位付きかつ未確定表現でない金額だけを返す"""
+    if _looks_uncertain_money_statement(input_block):
+        return None
+    return _parse_yen_amount(input_block, require_yen=True, max_amount=max_amount)
+
+
+def _looks_like_bare_amount_reply(input_block: str) -> bool:
+    """数字はあるが円/えん/万円の単位がない返答かどうか"""
+    body = input_block or ""
+    return bool(re.search(r"\d", body)) and _parse_yen_amount(body, require_yen=True) is None
+
+
+def _parent_natural_management_guide(input_block: str) -> str | None:
+    """親の自然文による管理要求を明示コマンドへ誘導する文面を返す"""
+    body = input_block or ""
+    child_names = _find_child_names_in_text(body)
+    if len(child_names) != 1:
+        return None
+
+    child_name = child_names[0]
+    subject_keywords = [
+        "お小遣い", "小遣い", "金額", "固定", "臨時", "上限", "支給額", "残高",
+    ]
+    action_keywords = [
+        "変え", "変更", "設定", "増や", "減ら", "上げ", "下げ", "にして", "にする", "調整",
+    ]
+    if not (
+        _contains_any_keyword(body, subject_keywords)
+        and _contains_any_keyword(body, action_keywords)
+    ):
+        return None
+
+    return (
+        "親向けの金額変更は、誤操作防止のため明示コマンドで実行してね。\n"
+        f"- 固定お小遣い変更: `設定変更 {child_name} 固定 300円`\n"
+        f"- 臨時上限変更: `設定変更 {child_name} 臨時 1000円`\n"
+        f"- 残高を直接増減: `残高調整 {child_name} +500円` / `残高調整 {child_name} -300円`"
+    )
+
+
+def _looks_like_parent_only_command(input_block: str) -> bool:
+    """子どもの入力を親専用コマンドとして誤って査定/雑談へ流さないための判定"""
+    body = (input_block or "").strip()
+    if not body:
+        return False
+    parent_prefixes = [
+        "支給", "残高調整", "設定変更", "一括支給", "アナウンス", "web承認",
+        "全体確認", "全員の分析", "残高チェック送信", "月頭案内送信",
+        "reminder test", "reminder-test", "リマインダーテスト",
+    ]
+    if any(body.lower().startswith(prefix.lower()) for prefix in parent_prefixes):
+        return True
+    return bool(re.match(r"^.+の分析\s*$", body))
+
+
+def _short_log_text(value, limit: int = 1200) -> str:
+    """診断ログ用に長すぎる文字列を切り詰める"""
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...(truncated)"
+
+
+def _compact_intent_result(intent_result: dict | None) -> dict:
+    """intent_result を診断ログに保存しやすい形へ整える"""
+    if not isinstance(intent_result, dict):
+        return {}
+    return {
+        "intent": str(intent_result.get("intent", "")),
+        "confidence": str(intent_result.get("confidence", "")),
+        "entities": intent_result.get("entities") or {},
+    }
+
+
+def _diagnostic_issue_tags(
+    input_block: str,
+    intent_result: dict | None = None,
+    reply: str | None = None,
+    selected_user_source: str | None = None,
+    author_is_parent: bool = False,
+) -> list[str]:
+    """後で運用課題を探しやすいように会話上の違和感タグを付ける"""
+    tags: list[str] = []
+    intent = str((intent_result or {}).get("intent", ""))
+    confidence = str((intent_result or {}).get("confidence", ""))
+    money_keywords = [
+        "残高", "ざんだか", "所持金", "お金", "おこづかい", "お小遣い",
+        "買った", "かった", "使った", "つかった", "支出", "入金", "もらった",
+        "財布", "貯金", "目標", "支給", "金額",
+    ]
+    clarification_keywords = [
+        "どういうこと", "もう少し詳しく", "教えてくれる", "教えてね",
+        "どんなこと", "どちら", "かな？", "かな", "一緒に考え",
+    ]
+
+    if confidence == "low":
+        tags.append("gemini_low_confidence")
+    if intent == "none" and _contains_any_keyword(input_block, money_keywords):
+        tags.append("money_related_but_intent_none")
+    if reply and _contains_any_keyword(reply, clarification_keywords):
+        tags.append("reply_asks_clarification")
+    if author_is_parent and selected_user_source == "author_discord_id":
+        tags.append("parent_message_used_author_context")
+    if selected_user_source == "parent_channel_context":
+        tags.append("parent_message_used_child_channel_context")
+    return tags
+
+
+def _log_runtime_event(
+    system_conf: dict | None,
+    message: discord.Message,
+    user_conf: dict | None,
+    input_block: str,
+    event: str,
+    details: dict | None = None,
+) -> None:
+    """運用診断用のJSONLログを追記する"""
+    try:
+        conf = system_conf or load_system()
+        log_dir = get_log_dir(conf)
+        channel = getattr(message, "channel", None)
+        record = {
+            "ts": now_jst_iso(),
+            "event": event,
+            "discord_user_id": int(message.author.id),
+            "author_is_parent": is_parent(message.author.id),
+            "channel_id": int(getattr(channel, "id", 0) or 0),
+            "channel_name": str(getattr(channel, "name", "") or ""),
+            "selected_user": str((user_conf or {}).get("name", "")),
+            "input": _short_log_text(input_block),
+            "details": details or {},
+        }
+        append_jsonl(log_dir / "runtime_diagnostics.jsonl", record)
+    except Exception as e:
+        print(f"[runtime_diagnostics] log error: {type(e).__name__}: {e}")
+
+
+def _log_system_diagnostic(event: str, details: dict | None = None) -> None:
+    """メッセージに紐づかない設定診断ログを追記する"""
+    try:
+        system_conf = load_system()
+        log_dir = get_log_dir(system_conf)
+        append_jsonl(log_dir / "runtime_diagnostics.jsonl", {
+            "ts": now_jst_iso(),
+            "event": event,
+            "discord_user_id": None,
+            "author_is_parent": None,
+            "channel_id": None,
+            "channel_name": "",
+            "selected_user": "",
+            "input": "",
+            "details": details or {},
+        })
+    except Exception as e:
+        print(f"[runtime_diagnostics] system log error: {type(e).__name__}: {e}")
+
 
 def _is_initial_setup_pending(user_name: str) -> bool:
     state = wallet_service.load_audit_state()
@@ -137,10 +408,10 @@ async def _handle_initial_setup_pending(
         return False
 
     # pending 状態: 金額入力を待っている
-    amount = _parse_yen_amount(input_block)
+    amount = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
     if amount is None:
         await message.channel.send(
-            "初期設定を続けるよ。\nいまの所持金を `1234円` の形で送ってね。"
+            "初期設定を続けるよ。\nいまの所持金を `1234円` の形で送ってね。（円まで書いてね）"
         )
         return True
 
@@ -209,7 +480,13 @@ async def _extract_expense_info(text: str, gemini_service) -> dict:
 
 
 def _save_spending_pending(
-    user_name: str, item, amount, reason, satisfaction, asked_optional: bool = False
+    user_name: str,
+    item,
+    amount,
+    reason,
+    satisfaction,
+    asked_optional: bool = False,
+    entry_id: str | None = None,
 ) -> None:
     """支出記録フローの partial データを pending 状態として保存する。
     asked_optional=True の場合は記録済みで optional 待ちの soft pending を示す。"""
@@ -224,6 +501,7 @@ def _save_spending_pending(
         "reason": reason,
         "satisfaction": satisfaction,
         "asked_optional": asked_optional,
+        "entry_id": entry_id,
     }
     state["spending_record_pending_by_user"] = pending
     wallet_service.save_audit_state(state)
@@ -239,19 +517,66 @@ def _clear_spending_pending(user_name: str) -> None:
     wallet_service.save_audit_state(state)
 
 
+def _merge_expense_optional_into_entry(journal_path, entry_id: str, reason, satisfaction) -> bool:
+    """entry_id が一致する支出行へ理由・満足度を追記する。"""
+    if not entry_id or not journal_path.exists():
+        return False
+
+    try:
+        raw_lines = journal_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    changed = False
+    rewritten: list[str] = []
+    for line in raw_lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            rewritten.append(line)
+            continue
+
+        if isinstance(row, dict) and str(row.get("entry_id") or "") == str(entry_id):
+            if reason:
+                row["reason"] = reason
+                row["reason_word_count"] = _rough_word_count(reason)
+            if satisfaction is not None:
+                row["satisfaction"] = int(satisfaction)
+            row["supplemented_at"] = now_jst_iso()
+            changed = True
+        rewritten.append(json.dumps(row, ensure_ascii=False) if isinstance(row, dict) else line)
+
+    if not changed:
+        return False
+
+    try:
+        journal_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def _write_expense_optional(
-    user_conf: dict, system_conf: dict, item, reason, satisfaction
+    user_conf: dict, system_conf: dict, item, reason, satisfaction, entry_id: str | None = None
 ) -> None:
-    """optional 情報（理由・満足度）の補足エントリを pocket_journal に追記する。
-    残高変更は伴わない。"""
+    """optional 情報（理由・満足度）を元支出へ紐づける。"""
     user_name = str(user_conf.get("name", ""))
     log_dir = get_log_dir(system_conf)
     journal_path = log_dir / f"{user_name}_pocket_journal.jsonl"
+    if entry_id and _merge_expense_optional_into_entry(journal_path, entry_id, reason, satisfaction):
+        return
+
+    # 旧pendingなど entry_id が取れない場合だけ互換用の補足行を残す。
     append_jsonl(journal_path, {
         "ts": now_jst_iso(),
+        "entry_id": entry_id,
+        "linked_entry_id": entry_id,
         "discord_user_id": None,
         "name": user_name,
         "action": "expense_supplement",
+        "source": "supplement",
         "item": item or "",
         "reason": reason or "",
         "reason_word_count": _rough_word_count(reason or ""),
@@ -447,10 +772,18 @@ async def maybe_handle_spending_record_flow(
     # 現メッセージから追加情報を抽出してマージする
     extracted = await _extract_expense_info(input_block, gemini_service) if gemini_service else {}
     item = extracted.get("item") or stored_item
-    amount = extracted.get("amount") if extracted.get("amount") is not None else stored_amount
+    input_amount = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
+    amount = input_amount if input_amount is not None else stored_amount
     reason = extracted.get("reason") or stored_reason
     sat = extracted.get("satisfaction")
     satisfaction = sat if sat is not None else stored_sat
+
+    if stored_amount is None and input_amount is None and re.search(r"\d", input_block or ""):
+        item_label = item or stored_item or "買ったもの"
+        await message.channel.send(
+            f"金額は `100円` のように円まで書いてね。{item_label}はいくらだった？"
+        )
+        return True
 
     # item も amount も進展がない場合（関係ない話題 or 曖昧入力の可能性）
     if item == stored_item and amount == stored_amount:
@@ -577,7 +910,7 @@ async def _do_wallet_check(
         f"修正後の帳簿残高: {new_balance}円"
     )
     if penalty_note:
-        msg += f"\n\n⚠️ {penalty_note}"
+        msg += f"\n\n{penalty_note}"
     await message.channel.send(msg)
 
 
@@ -594,13 +927,107 @@ async def _handle_wallet_check_pending(
     if not isinstance(wcp, dict) or user_name not in wcp:
         return False
 
-    reported = _parse_yen_amount(input_block)
+    reported = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
     if reported is None:
-        await message.channel.send("金額が読み取れなかったよ。「1500円」のように送ってね。")
+        await message.channel.send("金額が読み取れなかったよ。「1500円」のように円まで書いて送ってね。")
         return True
 
     await _do_wallet_check(message, user_conf, system_conf, reported)
     return True
+
+
+def _save_manual_income_pending(user_name: str, item: str | None = None) -> None:
+    """臨時入金の金額待ち状態を保存する"""
+    state = wallet_service.load_audit_state()
+    pending = state.get("manual_income_pending_by_user", {})
+    if not isinstance(pending, dict):
+        pending = {}
+    pending[user_name] = {
+        "ts": now_jst_iso(),
+        "item": item or "",
+    }
+    state["manual_income_pending_by_user"] = pending
+    wallet_service.save_audit_state(state)
+
+
+def _clear_manual_income_pending(user_name: str) -> None:
+    """臨時入金の金額待ち状態を解除する"""
+    state = wallet_service.load_audit_state()
+    pending = state.get("manual_income_pending_by_user", {})
+    if isinstance(pending, dict):
+        pending.pop(user_name, None)
+    state["manual_income_pending_by_user"] = pending
+    wallet_service.save_audit_state(state)
+
+
+async def _handle_manual_income_pending(
+    message: discord.Message,
+    user_conf: dict,
+    system_conf: dict,
+    input_block: str,
+) -> bool:
+    """manual_income pending 状態を処理する。金額入力を受け取って入金記録する。"""
+    user_name = str(user_conf.get("name", ""))
+    state = wallet_service.load_audit_state()
+    pending = state.get("manual_income_pending_by_user", {})
+    if not isinstance(pending, dict) or user_name not in pending:
+        return False
+
+    if intent_normalizer.is_no_reply(input_block.strip()):
+        _clear_manual_income_pending(user_name)
+        await message.channel.send("入金記録をキャンセルしたよ。")
+        return True
+
+    amount = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
+    if amount is None:
+        if _looks_like_bare_amount_reply(input_block):
+            await message.channel.send("金額は `500円` のように円まで書いて送ってね。")
+        else:
+            await message.channel.send("いくらもらったか、`500円` の形で教えてね。（「やめる」でキャンセルもできるよ）")
+        return True
+
+    partial = pending.get(user_name) if isinstance(pending.get(user_name), dict) else {}
+    item = str(partial.get("item") or "").strip()
+    before = wallet_service.get_balance(user_name)
+    new_balance, achieved_goals = wallet_service.update_balance(
+        user_conf=user_conf,
+        system_conf=system_conf,
+        delta=int(amount),
+        action="manual_income",
+        note=item,
+    )
+    _clear_manual_income_pending(user_name)
+    await message.channel.send(
+        f"入金を記録したよ。"
+        f"\n- 金額: {amount}円"
+        f"\n- メモ: {item if item else 'なし'}"
+        f"\n残高: {before}円 → {new_balance}円"
+    )
+    for achieved_goal in achieved_goals:
+        await message.channel.send(
+            _build_goal_achieved_message(user_conf=user_conf, goal=achieved_goal)
+        )
+    return True
+
+
+def _looks_like_non_goal_title_input(input_block: str) -> bool:
+    """貯金目標のタイトル待ち中に、別コマンドらしい文を目標名にしないための判定"""
+    body = (input_block or "").strip()
+    if not body:
+        return True
+    if re.fullmatch(r"[\d,\s万円えん]+", body):
+        return True
+
+    command_like_keywords = [
+        "残高", "所持金", "財布", "お金", "いくら", "教えて", "確認", "見せて",
+        "使い方", "ヘルプ", "初期設定", "支出", "買った", "使った", "入金",
+        "支給", "設定変更", "残高調整", "一括支給", "ダッシュボード", "分析",
+        "代理", "アナウンス", "web承認", "査定", "履歴", "はい", "ちがう",
+        "違う", "うん", "そう", "ok", "OK", "わからない", "分からない",
+        "わかんない", "あとで", "それで", "くらい", "ぐらい", "たぶん",
+        "かも", "やっぱいい", "やめる", "キャンセル",
+    ]
+    return _contains_any_keyword(body, command_like_keywords)
 
 
 async def _handle_goal_set_pending(
@@ -620,9 +1047,26 @@ async def _handle_goal_set_pending(
     stored_title = partial.get("title")
     stored_amount = partial.get("amount")
 
+    if intent_normalizer.is_no_reply(input_block.strip()) or _contains_any_keyword(input_block, ["やっぱいい", "やっぱりいい"]):
+        gp.pop(user_name, None)
+        state["goal_set_pending_by_user"] = gp
+        wallet_service.save_audit_state(state)
+        await message.channel.send("貯金目標の設定をキャンセルしたよ。")
+        return True
+
     # 補完情報を input_block から抽出する
-    new_amount = _parse_yen_amount(input_block)
+    new_amount = _extract_confirmed_yen_amount(input_block, MAX_GOAL_INPUT_AMOUNT)
     new_title = input_block.strip() if not new_amount else None
+    if stored_amount and not stored_title and new_title and _looks_like_non_goal_title_input(new_title):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "goal_set_pending_title_rejected",
+            {"reason": "looks_like_command_or_reply", "stored_amount": int(stored_amount)},
+        )
+        await message.channel.send(
+            f"{int(stored_amount):,}円で何を貯めたいか、目標名だけ教えてね。（例: ゲーム機）"
+        )
+        return True
 
     title = stored_title or new_title
     amount = stored_amount or new_amount
@@ -745,8 +1189,45 @@ async def _dispatch_by_intent(
 
     # --- 残高確認 ---
     if intent == "balance_check":
-        balance = wallet_service.get_balance(user_name)
-        await message.channel.send(f"{user_name}さんの現在の所持金は {balance}円 だよ。")
+        view_conf = user_conf
+        raw_target_name = str(entities.get("target_name") or "").strip()
+        text_child_name = _extract_child_name_from_text(input_block) or ""
+        # 本文に登録済み子ども名があればそれを優先し、AIの過剰抽出を避ける
+        if text_child_name:
+            target_name = text_child_name
+        elif raw_target_name and _is_child_user_name(raw_target_name):
+            target_name = raw_target_name
+        else:
+            target_name = ""
+            if raw_target_name:
+                _log_runtime_event(
+                    system_conf, message, user_conf, input_block,
+                    "target_name_ignored",
+                    {
+                        "intent": intent,
+                        "raw_target_name": raw_target_name,
+                        "reason": "not_registered_user",
+                    },
+                )
+
+        if is_parent(message.author.id) and not _is_child_user_name(user_name) and not target_name:
+            await message.channel.send("どの子の残高を確認するか分からなかったよ。`りかの残高おしえて` のように子どもの名前を入れてね。")
+            return True
+
+        # 親だけが明示された別ユーザーの残高を確認できる
+        if target_name and target_name != user_name:
+            if not is_parent(message.author.id):
+                await message.channel.send("他のユーザーの残高確認は親のみできるよ。")
+                return True
+            target_conf = find_user_by_name(target_name)
+            if target_conf is None:
+                await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
+                return True
+            view_conf = target_conf
+
+        view_name = str(view_conf.get("name", ""))
+        balance = wallet_service.get_balance(view_name)
+        await message.channel.send(f"{view_name}さんの現在の所持金は {balance}円 だよ。")
         return True
 
     # --- 使い方ガイド ---
@@ -766,7 +1247,15 @@ async def _dispatch_by_intent(
                 f"余計な説明は不要です。ガイド本文のみ返してください。\n\n"
                 f"{base_guide}"
             )
-            adapted = await gemini_service.call_silent(rewrite_prompt)
+            try:
+                adapted = await gemini_service.call_silent(rewrite_prompt)
+            except Exception as e:
+                _log_runtime_event(
+                    system_conf, message, user_conf, input_block,
+                    "usage_guide_age_rewrite_failed",
+                    {"error": f"{type(e).__name__}: {e}"},
+                )
+                adapted = ""
             await message.channel.send(adapted if adapted else base_guide)
         else:
             # 年齢未設定または13歳以上: ベーステキストをそのまま送信する
@@ -778,15 +1267,13 @@ async def _dispatch_by_intent(
 
     # --- 初期設定（トリガー）---
     if intent == "initial_setup":
-        # AI が金額を entities に持っている場合は即設定、なければフロー開始
-        amount = entities.get("amount")
-        if amount is None:
-            amount = _parse_yen_amount(input_block)
+        # Discord IDなどの裸数字を防ぐため、Gemini抽出額ではなく本文の「円」付き金額だけ採用する
+        amount = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
         if amount is None:
             # 金額不明 → pending 状態にして入力を促す
             _set_initial_setup_pending(user_name, True)
             await message.channel.send(
-                "初期設定をはじめるよ。\nいまの所持金を `1234円` の形で送ってね。"
+                "初期設定をはじめるよ。\nいまの所持金を `1234円` の形で送ってね。（円まで書いてね）"
             )
         else:
             before = wallet_service.get_balance(user_name)
@@ -811,7 +1298,7 @@ async def _dispatch_by_intent(
     if intent in ("spending_record", "manual_expense"):
         # entities から初期情報を取得してフローを開始する
         item = str(entities.get("item") or "").strip() or None
-        amount = entities.get("amount")
+        amount = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
         reason = str(entities.get("reason") or "").strip() or None
         satisfaction = entities.get("satisfaction")
         # satisfaction は 0〜10 の範囲に丸める
@@ -828,15 +1315,12 @@ async def _dispatch_by_intent(
 
     # --- 臨時入金 ---
     if intent == "manual_income":
-        amount = entities.get("amount")
+        amount = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
         # item・reason どちらかをメモとして使う
         item = str(entities.get("item") or entities.get("reason") or "").strip()
-        if amount is None:
-            m = re.match(r"(\d[\d,]*)\s*円", input_block)
-            if m:
-                amount = int(m.group(1).replace(",", ""))
         if not amount:
-            await message.channel.send("いくらもらったか教えてくれる？")
+            _save_manual_income_pending(user_name, item)
+            await message.channel.send("いくらもらったか、`500円` の形で教えてくれる？（「やめる」でキャンセルもできるよ）")
             return True
         before = wallet_service.get_balance(user_name)
         new_balance, achieved_goals = wallet_service.update_balance(
@@ -861,9 +1345,9 @@ async def _dispatch_by_intent(
 
     # --- 財布チェック（残高照合）---
     if intent == "balance_report":
-        # AI が抽出した amount を優先し、なければ regex で parse する
-        reported = entities.get("amount")
-        if reported is None:
+        # Geminiが裸数字を amount として返しても、本文に「円」がなければ採用しない
+        reported = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
+        if reported is None and not _looks_uncertain_money_statement(input_block):
             reported = parse_balance_report(input_block)
         if reported is None:
             # 金額がない → pending にして財布の中身を聞く
@@ -905,9 +1389,7 @@ async def _dispatch_by_intent(
     # --- 貯金目標 設定 ---
     if intent == "goal_set":
         goal_title = str(entities.get("goal_title") or "").strip() or None
-        goal_amount = entities.get("amount")
-        if isinstance(goal_amount, (int, float)) and goal_amount <= 0:
-            goal_amount = None
+        goal_amount = _extract_confirmed_yen_amount(input_block, MAX_GOAL_INPUT_AMOUNT)
         # タイトルと金額の両方が揃ったら設定する、どちらか欠けたら pending で補完する
         if goal_title and goal_amount:
             target_amount = int(goal_amount)
@@ -964,7 +1446,10 @@ async def _dispatch_by_intent(
             else:
                 await message.channel.send(f"目標「{goal_title}」は見つからなかったよ。")
         else:
-            # タイトル不明 → 全削除
+            if not _contains_any_keyword(input_block, ["全部", "全て", "すべて", "ぜんぶ", "全削除", "全消し"]):
+                await message.channel.send("どの目標を削除するか分からなかったよ。`目標削除 ゲーム機` のように目標名を入れてね。全部消すなら `目標を全部削除` と送ってね。")
+                return True
+            # 明示的な全削除だけ実行する
             wallet_service.clear_all_savings_goals(user_name)
             await message.channel.send(f"{user_name}の貯金目標を全て削除したよ。")
         return True
@@ -1027,7 +1512,8 @@ async def _dispatch_by_intent(
     # --- ダッシュボード（親専用）---
     if intent == "dashboard":
         if not is_parent(message.author.id):
-            return False
+            await message.channel.send("全体確認は親のみできるよ。")
+            return True
         log_dir = get_log_dir(load_system())
         users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
         audit_state = wallet_service.load_audit_state()
@@ -1058,7 +1544,8 @@ async def _dispatch_by_intent(
     # --- 支出傾向分析（親専用）---
     if intent in ("analysis_all", "analysis_user"):
         if not is_parent(message.author.id):
-            return False
+            await message.channel.send("支出傾向分析は親のみできるよ。")
+            return True
         log_dir = get_log_dir(load_system())
         now_dt = datetime.now(JST)
         if intent == "analysis_all":
@@ -1117,9 +1604,41 @@ async def _dispatch_by_intent(
             input_text=input_block,
             bot_personality=bot_personality,
         )
-        reply = await gemini_service.call_with_progress(message.channel, chat_prompt)
+        try:
+            reply = await gemini_service.call_with_progress(
+                message.channel,
+                chat_prompt,
+                timeout_reply="ごめん、今AIの返事が遅いみたい。少し短くしてもう一度送ってね。",
+            )
+        except Exception as e:
+            print("Gemini chat error:", e)
+            _log_runtime_event(
+                system_conf, message, user_conf, input_block,
+                "gemini_chat_error",
+                {
+                    "intent_result": _compact_intent_result(intent_result),
+                    "error_type": type(e).__name__,
+                    "error": _short_log_text(e, limit=600),
+                },
+            )
+            await message.channel.send("ごめん、今AIの返事が不安定みたい。少し短くしてもう一度送ってね。")
+            return True
         if reply:
             await message.channel.send(reply)
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "gemini_chat_result",
+            {
+                "intent_result": _compact_intent_result(intent_result),
+                "reply_excerpt": _short_log_text(reply, limit=1200),
+                "issue_tags": _diagnostic_issue_tags(
+                    input_block=input_block,
+                    intent_result=intent_result,
+                    reply=reply,
+                    author_is_parent=is_parent(message.author.id),
+                ),
+            },
+        )
         return True
 
     # allowance_request のみ査定フローへ落とす
@@ -1180,6 +1699,20 @@ async def send_assessment_change_notice(
 @client.event
 async def on_ready():
     print(f"Compass logged in as {client.user}")
+    conflicts = get_discord_id_conflicts()
+    for conflict in conflicts:
+        print(
+            "[config_warning] discord_user_id duplicated between child and parent: "
+            f"{conflict}"
+        )
+    if conflicts:
+        _log_system_diagnostic(
+            "config_duplicate_discord_id",
+            {
+                "conflicts": conflicts,
+                "policy": "parent_lookup_takes_precedence; use proxy or channel context for child operations",
+            },
+        )
     # 分割したハンドラモジュールに依存オブジェクトを注入する
     handlers_parent.init(
         wallet_service=wallet_service,
@@ -1265,6 +1798,7 @@ async def on_message(message: discord.Message):
 
     system_conf = load_system()
     user_conf = find_user_by_discord_id(message.author.id)
+    selected_user_source = "author_discord_id" if user_conf is not None else "unresolved_author"
     proxy_name, input_block = parse_proxy_request(mention_input)
 
     if not input_block:
@@ -1276,15 +1810,64 @@ async def on_message(message: discord.Message):
             await message.channel.send("`代理登録` は親のみ使用できるよ。")
             return
         user_conf = find_user_by_name(proxy_name)
+        selected_user_source = "proxy"
         if user_conf is None:
             await message.channel.send(
                 f"`{proxy_name}` はユーザー設定に見つからなかったよ。`settings/users/*.json` の `name` を確認してね。"
             )
             return
+    elif is_parent(message.author.id):
+        # 親が子ども用チャンネルで自然言語入力した場合は、そのチャンネルの子を対象にする
+        channel_child_conf = _find_channel_child_user_conf(message)
+        if channel_child_conf is not None:
+            user_conf = channel_child_conf
+            selected_user_source = "parent_channel_context"
+        elif user_conf is not None:
+            selected_user_source = "author_discord_id"
 
     if user_conf is None:
         await message.channel.send("設定にあなたのDiscord IDが登録されてないみたい。親に `settings/users/*.json` を追加してもらってね。")
         return
+
+    if not is_parent(message.author.id) and _looks_like_parent_only_command(input_block):
+        await message.channel.send("その操作は親のみできるよ。")
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "parent_only_command_rejected",
+            {"selected_user_source": selected_user_source},
+        )
+        return
+
+    _log_runtime_event(
+        system_conf=system_conf,
+        message=message,
+        user_conf=user_conf,
+        input_block=input_block,
+        event="message_context_resolved",
+        details={
+            "proxy_name": proxy_name,
+            "selected_user_source": selected_user_source,
+            "issue_tags": _diagnostic_issue_tags(
+                input_block=input_block,
+                selected_user_source=selected_user_source,
+                author_is_parent=is_parent(message.author.id),
+            ),
+        },
+    )
+
+    if is_parent(message.author.id) and not proxy_name:
+        parent_guide = _parent_natural_management_guide(input_block)
+        if parent_guide:
+            await message.channel.send(parent_guide)
+            _log_runtime_event(
+                system_conf, message, user_conf, input_block,
+                "parent_natural_management_guided",
+                {
+                    "selected_user_source": selected_user_source,
+                    "issue_tags": ["parent_natural_management_request"],
+                },
+            )
+            return
 
     # --- B案フロー: pending 状態の処理（AI正規化をスキップして直接処理する）---
 
@@ -1295,6 +1878,11 @@ async def on_message(message: discord.Message):
         system_conf=system_conf,
         input_block=input_block,
     ):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "handled_by_pending",
+            {"handler": "initial_setup_pending", "selected_user_source": selected_user_source},
+        )
         return
 
     # 支出記録フロー（pending 状態のみ AI 前にキャッチする）
@@ -1305,6 +1893,25 @@ async def on_message(message: discord.Message):
         input_block=input_block,
         gemini_service=gemini_service,
     ):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "handled_by_pending",
+            {"handler": "spending_record_pending", "selected_user_source": selected_user_source},
+        )
+        return
+
+    # 臨時入金 pending（金額入力待ち）
+    if await _handle_manual_income_pending(
+        message=message,
+        user_conf=user_conf,
+        system_conf=system_conf,
+        input_block=input_block,
+    ):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "handled_by_pending",
+            {"handler": "manual_income_pending", "selected_user_source": selected_user_source},
+        )
         return
 
     # 財布チェック pending（金額入力待ち）
@@ -1314,6 +1921,11 @@ async def on_message(message: discord.Message):
         system_conf=system_conf,
         input_block=input_block,
     ):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "handled_by_pending",
+            {"handler": "wallet_check_pending", "selected_user_source": selected_user_source},
+        )
         return
 
     # 貯金目標設定 pending（タイトルまたは金額の補完待ち）
@@ -1323,6 +1935,11 @@ async def on_message(message: discord.Message):
         system_conf=system_conf,
         input_block=input_block,
     ):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "handled_by_pending",
+            {"handler": "goal_set_pending", "selected_user_source": selected_user_source},
+        )
         return
 
     # pending_intent の確認返答を処理する（confidence:low 確認フロー）
@@ -1332,6 +1949,11 @@ async def on_message(message: discord.Message):
         system_conf=system_conf,
         input_block=input_block,
     ):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "handled_by_pending",
+            {"handler": "pending_intent_reply", "selected_user_source": selected_user_source},
+        )
         return
 
     # --- B案: AI正規化 → ディスパッチャー ---
@@ -1343,18 +1965,63 @@ async def on_message(message: discord.Message):
 
     # Gemini 軽量モデルで intent + entities + confidence を取得する
     intent_result = await intent_normalizer.normalize_intent(input_block, gemini_service)
+    intent_issue_tags = _diagnostic_issue_tags(
+        input_block=input_block,
+        intent_result=intent_result,
+        selected_user_source=selected_user_source,
+        author_is_parent=is_parent(message.author.id),
+    )
+    _log_runtime_event(
+        system_conf=system_conf,
+        message=message,
+        user_conf=user_conf,
+        input_block=input_block,
+        event="gemini_intent_result",
+        details={
+            "intent_result": _compact_intent_result(intent_result),
+            "selected_user_source": selected_user_source,
+            "issue_tags": intent_issue_tags,
+        },
+    )
 
     # 低信頼度の場合は確認メッセージを送って終了する（確認は1回のみ）
     # intent:none は確認しても意味がないのでスキップする
     if intent_result.get("confidence") == "low" and intent_result.get("intent") != "none":
         await _ask_intent_confirmation(message, user_conf, intent_result, input_block)
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "gemini_low_confidence_confirmation",
+            {
+                "intent_result": _compact_intent_result(intent_result),
+                "selected_user_source": selected_user_source,
+                "issue_tags": intent_issue_tags,
+            },
+        )
         return
 
     # ディスパッチャー（all child コマンドを intent ベースで処理する）
     if await _dispatch_by_intent(message, user_conf, system_conf, input_block, intent_result):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "handled_by_intent",
+            {
+                "intent_result": _compact_intent_result(intent_result),
+                "selected_user_source": selected_user_source,
+                "issue_tags": intent_issue_tags,
+            },
+        )
         return
 
     # none / allowance_request の場合は査定フローへ落ちる
+    _log_runtime_event(
+        system_conf, message, user_conf, input_block,
+        "assessment_flow_started",
+        {
+            "intent_result": _compact_intent_result(intent_result),
+            "selected_user_source": selected_user_source,
+            "issue_tags": intent_issue_tags,
+        },
+    )
     force_assess_mode = _contains_force_assess_keyword(input_block, FORCE_ASSESS_TEST_KEYWORD)
 
     log_dir = get_log_dir(system_conf)
@@ -1372,6 +2039,23 @@ async def on_message(message: discord.Message):
     current_month_text = f"{now_dt.month}月"
     next_month_num = 1 if now_dt.month == 12 else now_dt.month + 1
     next_month_text = f"{next_month_num}月"
+    reflection_context = {}
+    try:
+        reflection_context = build_reflection_context(
+            user_conf=user_conf,
+            system_conf=system_conf,
+            audit_state=wallet_service.load_audit_state(),
+        )
+    except Exception as e:
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "reflection_context_error",
+            {
+                "error_type": type(e).__name__,
+                "error": _short_log_text(e, limit=300),
+            },
+        )
+    wallet_check_penalty = _pop_wallet_check_penalty(str(user_conf.get("name", "")))
     prompt = build_prompt(
         user_conf=user_conf,
         system_conf=system_conf,
@@ -1397,13 +2081,33 @@ async def on_message(message: discord.Message):
         # bot_personality は user_conf から読む（N-4）
         bot_personality=str(user_conf.get("bot_personality", "sibling")),
         # 財布チェックペナルティノート: あれば査定に影響させて使用後にクリアする
-        wallet_check_penalty=_pop_wallet_check_penalty(str(user_conf.get("name", ""))),
+        wallet_check_penalty=wallet_check_penalty,
+        reflection_context=reflection_context,
     )
     try:
-        reply = await gemini_service.call_with_progress(message.channel, prompt)
+        assessment_timeout_reply = (
+            f"「{_short_log_text(input_block, limit=40)}」の相談は受け取ったよ。"
+            "ごめん、今AIの応答が遅くて査定できなかったよ。少し短くしてもう一度送ってね。"
+        )
+        reply = await gemini_service.call_with_progress(
+            message.channel,
+            prompt,
+            timeout_reply=assessment_timeout_reply,
+        )
     except Exception as e:
         print("Gemini error:", e)
-        await message.channel.send(f"ごめん、査定でエラーが出たよ。原因: {type(e).__name__}: {e}")
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "gemini_assessment_error",
+            {
+                "error_type": type(e).__name__,
+                "error": _short_log_text(e, limit=600),
+            },
+        )
+        await message.channel.send(
+            f"「{_short_log_text(input_block, limit=40)}」の相談は受け取ったよ。"
+            "ごめん、今AIの応答が不安定で査定できなかったよ。少し短くしてもう一度送ってね。"
+        )
         return
 
     if force_assess_mode and ASSESS_KEYWORD not in (reply or ""):
@@ -1436,6 +2140,23 @@ async def on_message(message: discord.Message):
 
     previous_assessed = _latest_assessed_amount(log_dir, str(user_conf.get("name", "")))
     assessed = _normalize_assessed_amounts(user_conf=user_conf, assessed=assessed, previous_assessed=previous_assessed)
+    _log_runtime_event(
+        system_conf, message, user_conf, input_block,
+        "gemini_assessment_result",
+        {
+            "assessed": assessed,
+            "previous_assessed": previous_assessed,
+            "reply_excerpt": _short_log_text(reply, limit=1200),
+            "force_assess_mode": force_assess_mode,
+            "issue_tags": _diagnostic_issue_tags(
+                input_block=input_block,
+                intent_result=intent_result,
+                reply=reply,
+                selected_user_source=selected_user_source,
+                author_is_parent=is_parent(message.author.id),
+            ),
+        },
+    )
 
     log_path = log_dir / f"{user_conf['name']}_events.jsonl"
     append_jsonl(

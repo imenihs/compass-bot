@@ -46,12 +46,26 @@ def load_all_parents() -> list[dict]:
         parents.append(_load_json(p))
     return parents
 
-def find_user_by_discord_id(discord_user_id: int) -> Optional[dict]:
-    """discord_user_id でユーザーを検索する。子供→親の順で両ディレクトリを検索する"""
-    for u in load_all_users() + load_all_parents():
+def find_child_user_by_discord_id(discord_user_id: int) -> Optional[dict]:
+    """discord_user_id で子供ユーザーだけを検索する"""
+    for u in load_all_users():
         if int(u.get("discord_user_id", -1)) == int(discord_user_id):
             return u
     return None
+
+def find_parent_by_discord_id(discord_user_id: int) -> Optional[dict]:
+    """discord_user_id で親ユーザーだけを検索する"""
+    for u in load_all_parents():
+        if int(u.get("discord_user_id", -1)) == int(discord_user_id):
+            return u
+    return None
+
+def find_user_by_discord_id(discord_user_id: int) -> Optional[dict]:
+    """discord_user_id でユーザーを検索する。親IDの誤作動防止のため親→子供の順で検索する"""
+    parent = find_parent_by_discord_id(discord_user_id)
+    if parent is not None:
+        return parent
+    return find_child_user_by_discord_id(discord_user_id)
 
 def find_user_by_name(name: str) -> Optional[dict]:
     """名前でユーザーを検索する。子供→親の順で両ディレクトリを検索する"""
@@ -71,6 +85,26 @@ def get_parent_ids() -> set[int]:
         if uid:
             ids.add(int(uid))
     return ids
+
+def get_discord_id_conflicts() -> list[dict]:
+    """子供・親設定間で discord_user_id が重複している組み合わせを返す"""
+    conflicts: list[dict] = []
+    children = load_all_users()
+    parents = load_all_parents()
+    for child in children:
+        child_id = child.get("discord_user_id")
+        if not child_id:
+            continue
+        for parent in parents:
+            parent_id = parent.get("discord_user_id")
+            if parent_id and int(child_id) == int(parent_id):
+                conflicts.append({
+                    "discord_user_id": int(child_id),
+                    "child_name": str(child.get("name", "")),
+                    "parent_name": str(parent.get("name", "")),
+                })
+    return conflicts
+
 
 def get_web_base_url() -> str:
     """WebダッシュボードのベースURL（URLのハードコードを避けるため設定から読む）"""

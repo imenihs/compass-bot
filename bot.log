@@ -1,0 +1,76 @@
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/web/documents/compass-bot/app/bot.py", line 84, in <module>
+    gemini_service = GeminiService(
+  File "/web/documents/compass-bot/app/gemini_service.py", line 17, in __init__
+    self.client = genai.Client(api_key=api_key)
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/google/genai/client.py", line 426, in __init__
+    self._api_client = self._get_api_client(
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/google/genai/client.py", line 474, in _get_api_client
+    return BaseApiClient(
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/google/genai/_api_client.py", line 700, in __init__
+    raise ValueError(
+ValueError: Missing key inputs argument! To use the Google AI API, provide (`api_key`) arguments. To use the Google Cloud API, provide (`vertexai`, `project` & `location`) arguments.
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/web/documents/compass-bot/app/bot.py", line 84, in <module>
+    gemini_service = GeminiService(
+  File "/web/documents/compass-bot/app/gemini_service.py", line 17, in __init__
+    self.client = genai.Client(api_key=api_key)
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/google/genai/client.py", line 426, in __init__
+    self._api_client = self._get_api_client(
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/google/genai/client.py", line 474, in _get_api_client
+    return BaseApiClient(
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/google/genai/_api_client.py", line 700, in __init__
+    raise ValueError(
+ValueError: Missing key inputs argument! To use the Google AI API, provide (`api_key`) arguments. To use the Google Cloud API, provide (`vertexai`, `project` & `location`) arguments.
+ERROR:    [Errno 98] error while attempting to bind on address ('127.0.0.1', 8765): address already in use
+Task exception was never retrieved
+future: <Task finished name='Task-1' coro=<_main() done, defined at /web/documents/compass-bot/app/bot.py:1501> exception=SystemExit(1)>
+Traceback (most recent call last):
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/uvicorn/server.py", line 172, in startup
+    server = await loop.create_server(
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1519, in create_server
+    raise OSError(err.errno, 'error while attempting '
+OSError: [Errno 98] error while attempting to bind on address ('127.0.0.1', 8765): address already in use
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/asyncio/runners.py", line 47, in run
+    _cancel_all_tasks(loop)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 63, in _cancel_all_tasks
+    loop.run_until_complete(tasks.gather(*to_cancel, return_exceptions=True))
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/web/documents/compass-bot/app/bot.py", line 1515, in _main
+    await asyncio.gather(
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/uvicorn/server.py", line 79, in serve
+    await self._serve(sockets)
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/uvicorn/server.py", line 94, in _serve
+    await self.startup(sockets=sockets)
+  File "/web/documents/compass-bot/.venv/lib/python3.10/site-packages/uvicorn/server.py", line 182, in startup
+    sys.exit(1)
+SystemExit: 1
