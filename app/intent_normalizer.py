@@ -19,7 +19,7 @@ _NORMALIZE_PROMPT = """\
 - spending_record: 支出記録（「支出記録したい」「お菓子を買った」「本かった」「何か買って使った」など。金額不明でもOK）
 - manual_expense: 金額明示の即時支出記録（「支出 500円 お菓子」「500円つかった お菓子」— 金額とアイテムの両方が明示されている場合）
 - manual_income: 臨時収入の記録（「お年玉3000円もらった」「3000円入金した」「もらった」「お金もらった」— 金額なしでもOK）
-- balance_report: 残高報告・照合（「いまのお金は1500円だよ」「残高は1500円です」）
+- balance_report: 財布の中身と帳簿の照合・残高報告（「いまのお金は1500円だよ」「残高は1500円です」「財布チェック」「財布の中身確認」— 金額なしでもOK）
 - goal_check: 貯金目標の確認（「目標どのくらい？」「いくら貯まった？」「もくひょうかくにん」）
 - goal_set: 貯金目標の設定（「ゲーム機のために30000円貯める」— タイトルと金額の両方が必要）
 - goal_clear: 貯金目標の削除（「目標やめる」「もくひょうぜんさくじょ」「目標取り消して」）
@@ -87,6 +87,182 @@ _NO_KEYWORDS = {
 }
 
 
+def _entities(**overrides) -> dict:
+    """intent 正規化の entities デフォルト値を作る"""
+    base = {
+        "target_name": None,
+        "amount": None,
+        "item": None,
+        "reason": None,
+        "satisfaction": None,
+        "goal_title": None,
+        "personality": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _amount_from_text(text: str) -> int | None:
+    body = text or ""
+    patterns: list[tuple[str, int]] = [
+        (r"(\d[\d,]*)\s*万\s*(?:円|えん)", 10_000),
+        (r"(\d[\d,]*)\s*(?:円|えん)", 1),
+    ]
+    for pattern, multiplier in patterns:
+        m = re.search(pattern, body)
+        if not m:
+            continue
+        try:
+            amount = int(m.group(1).replace(",", "")) * multiplier
+        except ValueError:
+            return None
+        return amount if amount > 0 else None
+    return None
+
+
+def _rough_expense_item(text: str) -> str | None:
+    """支出っぽい短文から商品名だけを保守的に抜き出す"""
+    body = re.sub(r"\d[\d,]*\s*万\s*(?:円|えん)(?:分)?", " ", text or "")
+    body = re.sub(r"\d[\d,]*\s*(?:円|えん)(?:分)?", " ", body)
+    body = re.sub(r"(自分で|支出|記録|買った|かった|使った|つかった|つかた|使いました|買いました)", " ", body)
+    body = re.sub(r"[。！？!?,，、]", " ", body)
+    item = " ".join(part for part in body.split() if part)
+    return item or None
+
+
+def _rough_goal_title(text: str) -> str | None:
+    body = re.sub(r"\d[\d,]*\s*万\s*(?:円|えん)", " ", text or "")
+    body = re.sub(r"\d[\d,]*\s*(?:円|えん)", " ", body)
+    for marker in ["のために", "のため", "を貯めたい", "をためたい", "貯めたい", "ためたい", "貯金目標"]:
+        if marker in body:
+            body = body.split(marker)[0] if marker.startswith("のため") or marker.startswith("を") else body.replace(marker, " ")
+            break
+    body = re.sub(r"[。！？!?,，、]", " ", body)
+    title = " ".join(part for part in body.split() if part)
+    return title or None
+
+
+def _rough_goal_clear_title(text: str) -> str | None:
+    body = text or ""
+    for marker in ["の目標やめ", "の目標削除", "の目標をやめ", "の目標を削除"]:
+        if marker in body:
+            title = body.split(marker, 1)[0]
+            title = re.sub(r"[。！？!?,，、]", " ", title)
+            return " ".join(part for part in title.split() if part) or None
+    return None
+
+
+def _rule_based_intent_fallback(text: str) -> dict | None:
+    """Geminiが失敗/noneでも明確に処理できるお金系入力の保険"""
+    body = (text or "").strip()
+    if not body:
+        return None
+    compact = re.sub(r"\s+", "", body).lower()
+    amount = _amount_from_text(body)
+
+    if any(k in compact for k in ["使い方", "つかいかた", "ヘルプ", "なにができる"]):
+        return {"intent": "usage_guide", "entities": _entities(), "confidence": "high"}
+
+    if any(k in compact for k in ["どう記録", "記録方法", "やり方", "どうやって"]):
+        return {"intent": "usage_guide", "entities": _entities(), "confidence": "high"}
+
+    if any(k in compact for k in ["査定履歴", "さていれきし", "過去の査定", "前回いくら"]):
+        return {"intent": "assessment_history", "entities": _entities(), "confidence": "high"}
+
+    if any(k in compact for k in ["入出金履歴", "にゅうしゅつきんりれき", "台帳見せて", "台帳みせて"]):
+        return {"intent": "ledger_history", "entities": _entities(), "confidence": "high"}
+
+    if any(k in compact for k in ["振り返り", "ふりかえり", "今月どうだった", "先月どうだった"]):
+        return {"intent": "child_review", "entities": _entities(), "confidence": "high"}
+
+    if any(k in compact for k in ["初期設定", "しょきせってい", "最初の設定"]):
+        return {"intent": "initial_setup", "entities": _entities(amount=amount), "confidence": "high"}
+
+    if any(k in compact for k in ["みんなの状況", "全員の残高", "ダッシュボード", "全体確認", "ぜんたいかくにん"]):
+        return {"intent": "dashboard", "entities": _entities(), "confidence": "high"}
+
+    if any(k in compact for k in ["全体の傾向", "全員の分析", "みんなの使い方", "全体を分析"]):
+        return {"intent": "analysis_all", "entities": _entities(), "confidence": "high"}
+
+    m_analysis = re.search(r"(.+?)の分析", body)
+    if m_analysis:
+        return {"intent": "analysis_user", "entities": _entities(target_name=m_analysis.group(1).strip()), "confidence": "high"}
+
+    if any(k in compact for k in ["友達みたい", "友だちみたい"]):
+        return {"intent": "personality_change", "entities": _entities(personality="friend"), "confidence": "high"}
+    if any(k in compact for k in ["先生っぽ", "先生みたい"]):
+        return {"intent": "personality_change", "entities": _entities(personality="teacher"), "confidence": "high"}
+    if any(k in compact for k in ["お兄ちゃん", "お姉ちゃん", "兄姉っぽ", "兄っぽ", "姉っぽ"]):
+        return {"intent": "personality_change", "entities": _entities(personality="sibling"), "confidence": "high"}
+    if any(k in compact for k in ["親っぽ", "お母さんみたい", "お父さんみたい"]):
+        return {"intent": "personality_change", "entities": _entities(personality="parent"), "confidence": "high"}
+    if "話して" in compact or "モード" in compact:
+        return {"intent": "personality_change", "entities": _entities(), "confidence": "high"}
+
+    if any(k in compact for k in ["お小遣い増やして", "おこづかい増やして", "増額して"]):
+        return {"intent": "allowance_request", "entities": _entities(), "confidence": "high"}
+
+    income_words = [
+        "もらった", "もらいました", "もらた", "入金", "にゅうきん", "加算",
+        "増えた", "ふえた", "お年玉", "おとしだま",
+    ]
+    if any(k in compact for k in income_words):
+        item = None
+        if "お年玉" in compact or "おとしだま" in compact:
+            item = "お年玉"
+        elif "お小遣い" in compact or "おこづかい" in compact:
+            item = "お小遣い"
+        return {"intent": "manual_income", "entities": _entities(amount=amount, item=item), "confidence": "high"}
+
+    expense_words = ["買った", "かった", "使った", "つかった", "つかた", "支出"]
+    if any(k in compact for k in expense_words):
+        item = _rough_expense_item(body)
+        intent = "manual_expense" if amount and item else "spending_record"
+        return {
+            "intent": intent,
+            "entities": _entities(amount=amount, item=item),
+            "confidence": "high",
+        }
+
+    if (
+        "残高報告" in compact
+        or "財布チェック" in compact
+        or "さいふチェック" in compact
+        or "ざいふチェック" in compact
+        or "財布の中身" in compact
+        or "さいふの中身" in compact
+        or ("いまのお金" in compact and amount is not None)
+        or ("今のお金" in compact and amount is not None)
+    ):
+        return {"intent": "balance_report", "entities": _entities(amount=amount), "confidence": "high"}
+
+    balance_markers = ["残高", "ざんだか", "ざんがく", "所持金"]
+    fuzzy_balance_markers = ["残方", "ざんかた", "残り", "のこり", "あといくら"]
+    if (
+        any(k in compact for k in balance_markers)
+        or (
+            any(k in compact for k in ["お金", "お小遣い", "おこづかい"])
+            and any(k in compact for k in ["いくら", "教えて", "知りたい"] + fuzzy_balance_markers)
+        )
+    ):
+        return {"intent": "balance_check", "entities": _entities(), "confidence": "high"}
+
+    if any(k in compact for k in ["目標確認", "もくひょうかくにん", "もくひょかくにん", "目標どのくらい"]):
+        return {"intent": "goal_check", "entities": _entities(), "confidence": "high"}
+
+    if any(k in compact for k in ["目標やめ", "目標削除", "目標取り消", "もくひょうやめ", "もくひょうさくじょ"]):
+        return {"intent": "goal_clear", "entities": _entities(goal_title=_rough_goal_clear_title(body)), "confidence": "high"}
+
+    if any(k in compact for k in ["貯めたい", "貯金目標", "もくひょう", "もくひょ", "ためたい"]):
+        return {
+            "intent": "goal_set",
+            "entities": _entities(amount=amount, goal_title=_rough_goal_title(body)),
+            "confidence": "high",
+        }
+
+    return None
+
+
 async def normalize_intent(text: str, gemini_service) -> dict:
     """ユーザーメッセージを AI 正規化して intent・entities・confidence を返す。
     戻り値例: {"intent": "balance_check", "entities": {...}, "confidence": "high"}
@@ -96,6 +272,7 @@ async def normalize_intent(text: str, gemini_service) -> dict:
     if not text or not text.strip():
         return {"intent": "none", "entities": {}, "confidence": "high"}
 
+    fallback = _rule_based_intent_fallback(text)
     prompt = _NORMALIZE_PROMPT.format(message=text.strip())
     try:
         # call_silent は「考え中...」を表示しない軽量呼び出し（コスト節約）
@@ -107,14 +284,25 @@ async def normalize_intent(text: str, gemini_service) -> dict:
             if isinstance(result, dict) and result.get("intent"):
                 # entities が None の場合は空 dict に正規化する
                 entities = result.get("entities") or {}
-                return {
+                normalized = {
                     "intent": str(result["intent"]).strip(),
                     "entities": entities,
                     "confidence": str(result.get("confidence", "high")).strip(),
                 }
+                strict_fallback_intents = {"assessment_history", "ledger_history", "child_review"}
+                if fallback is not None and fallback["intent"] in strict_fallback_intents and normalized["intent"] != fallback["intent"]:
+                    return fallback
+                if normalized["intent"] == "none" and fallback is not None:
+                    return fallback
+                if normalized["confidence"] == "low" and fallback is not None:
+                    return fallback
+                return normalized
     except Exception as e:
         # 正規化失敗はボット動作を止めないためログのみとする
         print(f"[intent_normalizer] error: {e}")
+
+    if fallback is not None:
+        return fallback
 
     # フォールバック: 査定フローに渡す
     return {"intent": "none", "entities": {}, "confidence": "high"}

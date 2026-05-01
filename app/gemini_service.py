@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -14,29 +16,88 @@ class GeminiService:
     def __init__(self, api_key: str, model_name: str, assess_keyword: str):
         self.model_name = model_name
         self.assess_keyword = assess_keyword
-        self.client = genai.Client(api_key=api_key)
+        try:
+            timeout_ms = int(os.environ.get("GEMINI_TIMEOUT_MS", "15000"))
+        except ValueError:
+            timeout_ms = 15000
+        try:
+            self.retry_attempts = max(1, int(os.environ.get("GEMINI_RETRY_ATTEMPTS", "2")))
+        except ValueError:
+            self.retry_attempts = 2
+        try:
+            self.silent_timeout_sec = max(1.0, float(os.environ.get("GEMINI_SILENT_TIMEOUT_SEC", "8")))
+        except ValueError:
+            self.silent_timeout_sec = 8.0
+        try:
+            self.progress_interval_sec = max(1.0, float(os.environ.get("GEMINI_PROGRESS_INTERVAL_SEC", "8")))
+        except ValueError:
+            self.progress_interval_sec = 8.0
+        try:
+            self.max_wait_sec = max(5.0, float(os.environ.get("GEMINI_MAX_WAIT_SEC", "40")))
+        except ValueError:
+            self.max_wait_sec = 40.0
+        self.client = genai.Client(api_key=api_key, http_options={"timeout": timeout_ms})
 
     def call(self, prompt: str) -> str:
-        resp = self.client.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-        )
-        return resp.text or "ごめん、空の応答だったよ。"
+        last_error = None
+        for attempt in range(self.retry_attempts):
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                )
+                return resp.text or "ごめん、空の応答だったよ。"
+            except Exception as e:
+                last_error = e
+                text = str(e)
+                transient = any(
+                    marker in text
+                    for marker in [
+                        "408", "429", "500", "502", "503", "504",
+                        "UNAVAILABLE", "RESOURCE_EXHAUSTED", "Timeout", "timed out",
+                    ]
+                )
+                if not transient or attempt >= self.retry_attempts - 1:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+        raise last_error
 
     async def call_silent(self, prompt: str) -> str:
         """「考え中...」を表示せずに非同期でGeminiを呼び出す（コマンド判定等の軽量用途）"""
-        return await asyncio.to_thread(self.call, prompt)
+        return await asyncio.wait_for(
+            asyncio.to_thread(self.call, prompt),
+            timeout=self.silent_timeout_sec,
+        )
 
-    async def call_with_progress(self, channel: discord.abc.Messageable, prompt: str) -> str:
+    async def call_with_progress(
+        self,
+        channel: discord.abc.Messageable,
+        prompt: str,
+        timeout_reply: str | None = None,
+    ) -> str:
         task = asyncio.create_task(asyncio.to_thread(self.call, prompt))
+        started = time.monotonic()
+        wait_notice_sent = False
         while True:
+            elapsed = time.monotonic() - started
+            remaining = self.max_wait_sec - elapsed
+            if remaining <= 0:
+                task.cancel()
+                if timeout_reply is not None:
+                    return timeout_reply
+                raise TimeoutError(f"Gemini response exceeded {self.max_wait_sec:.0f} seconds")
             try:
-                return await asyncio.wait_for(asyncio.shield(task), timeout=10)
+                return await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=min(self.progress_interval_sec, remaining),
+                )
             except asyncio.TimeoutError:
-                try:
-                    await channel.send("考え中... ちょっと待ってね。")
-                except Exception:
-                    pass
+                if not wait_notice_sent:
+                    wait_notice_sent = True
+                    try:
+                        await channel.send("時間がかかってるから、もう少しだけ待ってね。")
+                    except Exception:
+                        pass
 
     def extract_assessed_amounts(self, reply: str) -> dict | None:
         text = reply or ""

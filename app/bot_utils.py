@@ -334,16 +334,30 @@ def _normalize_japanese_command(text: str) -> str:
     return body
 
 
-def _parse_yen_amount(text: str) -> int | None:
-    """テキストから円金額を抽出して整数で返す。見つからなければ None を返す"""
+def _parse_yen_amount(text: str, require_yen: bool = False, max_amount: int | None = None) -> int | None:
+    """テキストから円金額を抽出して整数で返す。条件に合わなければ None を返す"""
     body = (text or "").strip()
-    m = re.search(r"(\d[\d,]*)\s*円?", body)
-    if not m:
-        return None
-    try:
-        return int(m.group(1).replace(",", ""))
-    except ValueError:
-        return None
+    patterns: list[tuple[str, int]] = [
+        (r"(\d[\d,]*)\s*万\s*(?:円|えん)", 10_000),
+        (r"(\d[\d,]*)\s*(?:円|えん)", 1),
+    ]
+    if not require_yen:
+        patterns.append((r"(\d[\d,]*)", 1))
+
+    for pattern, multiplier in patterns:
+        m = re.search(pattern, body)
+        if not m:
+            continue
+        try:
+            amount = int(m.group(1).replace(",", "")) * multiplier
+        except ValueError:
+            return None
+        if amount <= 0:
+            return None
+        if max_amount is not None and amount > int(max_amount):
+            return None
+        return amount
+    return None
 
 
 def _is_same_month(ts_str, year: int, month: int) -> bool:

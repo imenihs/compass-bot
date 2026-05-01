@@ -125,6 +125,31 @@ def _gender_text_ja(gender: str) -> str:
     return mapping.get(gender.lower(), "未設定")
 
 
+def _follow_policy_for_prompt(user_conf: dict) -> dict:
+    """子ども別AIフォロー方針をプロンプト用に正規化する"""
+    raw_policy = user_conf.get("ai_follow_policy")
+    policy = raw_policy if isinstance(raw_policy, dict) else {}
+    legacy_note = str(user_conf.get("parent_followup_note") or "").strip()
+    if isinstance(raw_policy, dict) and "parent_note" in policy:
+        parent_note = str(policy.get("parent_note") or "").strip()
+    else:
+        parent_note = legacy_note
+
+    focus_area = str(policy.get("focus_area") or "").strip()
+    if not focus_area and isinstance(policy.get("focus_areas"), list):
+        focus_area = str(next((x for x in policy["focus_areas"] if str(x).strip()), "")).strip()
+    if not focus_area:
+        focus_area = "record_habit"
+
+    return {
+        "enabled": bool(policy.get("enabled", bool(parent_note))),
+        "focus_area": focus_area,
+        "nudge_strength": str(policy.get("nudge_strength") or "light").strip(),
+        "frequency": str(policy.get("frequency") or "low").strip(),
+        "parent_note": parent_note,
+    }
+
+
 def build_prompt(
     user_conf: dict,
     system_conf: dict,
@@ -149,6 +174,7 @@ def build_prompt(
     fixed_increase_count_this_year: int = 0,
     bot_personality: str = "sibling",
     wallet_check_penalty: dict | None = None,
+    reflection_context: dict | None = None,
 ) -> str:
     if not assess_keyword:
         raise ValueError("assess_keyword is required")
@@ -194,6 +220,21 @@ def build_prompt(
     personality = str(user_conf.get("bot_personality") or bot_personality or "sibling").strip()
     personality_tone_rule = _personality_tone_rule(personality)
     coaching_rule = _coaching_rule()
+    follow_policy = _follow_policy_for_prompt(user_conf)
+    follow_policy_text = (
+        "無効"
+        if not follow_policy["enabled"]
+        else (
+            f"有効 / focus_area={follow_policy['focus_area']} / "
+            f"nudge_strength={follow_policy['nudge_strength']} / "
+            f"frequency={follow_policy['frequency']} / "
+            f"parent_note={follow_policy['parent_note'] or 'なし'}"
+        )
+    )
+    reflection = reflection_context or {}
+    reflection_prompt_points = reflection.get("prompt_points") if isinstance(reflection, dict) else []
+    if not isinstance(reflection_prompt_points, list):
+        reflection_prompt_points = []
 
     return f"""
 あなたは家庭内のお小遣いサポートBot「Compass」です。日本語で返答します。
@@ -229,14 +270,17 @@ def build_prompt(
 - 固定増額の上限（1回あたり）: +{fixed_increase_cap}円
 - 前回固定増額からの経過月: {months_since_last_fixed_increase}
 - 今年の固定増額回数: {fixed_increase_count_this_year}回
-- 財布チェックペナルティ記録: {
+- AIフォロー方針: {follow_policy_text}
+- 支出・記録の振り返りシグナル:
+{json.dumps(reflection_prompt_points, ensure_ascii=False, indent=2) if reflection_prompt_points else "なし"}
+- 財布チェック記録漏れメモ: {
     (
         f"前回の財布チェックで {abs(wallet_check_penalty['diff'])}円の記録漏れがあった"
         f"（財布:{wallet_check_penalty['reported']}円 / 帳簿:{wallet_check_penalty['expected']}円）。"
         + (
-            "支出の記録漏れのため、査定時にマイナス材料として重く考慮すること。"
+            "支出の記録漏れとして、責めずに記録習慣の改善材料として扱うこと。繰り返しや大きな差額なら臨時分を控えめにする理由として明示してよい。"
             if wallet_check_penalty.get("type") == "spending_leak"
-            else "収入の記録漏れのため、査定時に軽めの指摘として触れること。"
+            else "収入の記録漏れとして、入金記録の習慣づけを軽く促すこと。"
         )
     ) if wallet_check_penalty else "なし"
 }
@@ -258,6 +302,12 @@ def build_prompt(
   - danger 一致がある場合は臨時を抑え、注意コメントを必ず入れる
 - 追加要求回数が多い場合は、理由と計画が弱いときに臨時金額を慎重にする
 - 比較コメントは「過去の本人比」のみ。兄弟比較・他人比較はしない
+- 親からの方針メモは内部文脈として扱い、子どもへの返信ではそのまま引用しない
+- AIフォロー方針が無効、または情報取得・単純記録の場面では、無理にコーチングを足さない
+- AIフォローを入れる場合も、子どもを責めず、1回の返答につき小さな行動提案を1つまでにする
+- 支出・記録の振り返りシグナルは、罰ではなく「次に良くするための材料」として使う
+- 「お小遣いを増やしたい」「もっとお金がほしい」という相談は、家族で合意できる役割・継続行動・貯金計画・支出見直しに接続する
+- 高リスク投機、ギャンブル、借金、衝動買いを正当化しない
 - 固定増額は相談に乗ってよいが、目安は3か月に1回程度
 - 固定増額には安易に乗りすぎない
 - ただし年1回までは、比較的緩やかな固定増額を許可してよい

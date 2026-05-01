@@ -143,7 +143,14 @@ def parse_usage_report_flexible(text: str) -> dict | None:
 
 def parse_balance_report(text: str) -> int | None:
     body = (text or "").strip()
-    m = re.match(r"^残高報告\s*[：:\s]\s*(\d+)\s*円?\s*$", body)
+    m = re.match(r"^残高報告\s*[：:\s]\s*(\d[\d,]*)\s*万\s*(?:円|えん)\s*$", body)
+    multiplier = 10_000
+    if not m:
+        m = re.match(r"^残高報告\s*[：:\s]\s*(\d[\d,]*)\s*(?:円|えん)\s*$", body)
+        multiplier = 1
     if not m:
         return None
-    return int(m.group(1))
+    amount = int(m.group(1).replace(",", "")) * multiplier
+    if amount > 1_000_000:
+        return None
+    return amount

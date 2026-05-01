@@ -1,4 +1,5 @@
 import json
+import uuid
 from pathlib import Path
 
 from app.config import get_log_dir
@@ -13,6 +14,12 @@ class WalletService:
         root = Path(__file__).resolve().parents[1]
         self.wallet_state_path = root / "data" / "wallet_state.json"
         self.wallet_audit_state_path = root / "data" / "wallet_audit_state.json"
+
+    @staticmethod
+    def new_entry_id(prefix: str = "expense") -> str:
+        """支出・台帳をひも付けるための短い一意IDを生成する。"""
+        safe_prefix = "".join(ch for ch in str(prefix or "entry") if ch.isalnum() or ch in {"_", "-"})
+        return f"{safe_prefix or 'entry'}_{uuid.uuid4().hex}"
 
     # ------------------------------------------------------------------
     # 旧形式マイグレーション

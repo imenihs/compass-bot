@@ -19,6 +19,7 @@
     <thead>
       <tr>
         <th>名前</th>
+        <th>月額</th>
         <th>残高</th>
         <th>今月支出</th>
         <th>最終支出日</th>
@@ -30,6 +31,13 @@
     {% for u in users %}
       <tr>
         <td>{{ u.name }}</td>
+        <td>
+          {% if u.fixed_allowance is defined and u.fixed_allowance is not none %}
+            {{ "{:,}".format(u.fixed_allowance|int) }}円
+          {% else %}
+            <span style="color:#aaa;">—</span>
+          {% endif %}
+        </td>
         <td style="font-weight:600;">
           {% if u.balance is not none %}
             {{ "{:,}".format(u.balance) }}円
@@ -73,6 +81,100 @@
   {% endif %}
 </div>
 
+<!-- 学習支援サマリー / AIフォロー方針 -->
+<div class="card">
+  <h2>🧭 学習支援サマリー / AIフォロー方針</h2>
+  {% if users %}
+    {% for u in users %}
+      <div style="padding:{% if loop.first %}0 0 18px{% else %}18px 0{% endif %}; {% if not loop.first %}border-top:1px solid #eee;{% endif %}">
+        <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">
+          <h3 style="font-size:1rem; color:#444; margin:0;">{{ u.name }}</h3>
+          <span class="badge badge-ok">{{ u.learning_summary.source_label }}</span>
+        </div>
+
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); gap:8px; margin-bottom:12px;">
+          {% for metric in u.learning_summary.metrics %}
+            <div style="background:#f7f8fb; border:1px solid #eceef5; border-radius:6px; padding:8px 10px;">
+              <div style="font-size:0.75rem; color:#777; margin-bottom:2px;">{{ metric.label }}</div>
+              <div style="font-weight:600; color:#333;">{{ metric.value }}</div>
+            </div>
+          {% endfor %}
+        </div>
+
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:14px; margin-bottom:14px;">
+          <div>
+            <div style="font-size:0.85rem; font-weight:600; color:#555; margin-bottom:6px;">学習シグナル</div>
+            {% if u.learning_summary.signals %}
+              <ul style="margin-left:18px; color:#555; line-height:1.6; font-size:0.9rem;">
+                {% for signal in u.learning_summary.signals %}
+                  <li>{{ signal }}</li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <div style="color:#aaa; font-size:0.9rem;">まだ表示できるシグナルがありません</div>
+            {% endif %}
+          </div>
+          <div>
+            <div style="font-size:0.85rem; font-weight:600; color:#555; margin-bottom:6px;">フォローのヒント</div>
+            {% if u.learning_summary.parent_hints %}
+              <ul style="margin-left:18px; color:#555; line-height:1.6; font-size:0.9rem;">
+                {% for hint in u.learning_summary.parent_hints %}
+                  <li>{{ hint }}</li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <div style="color:#aaa; font-size:0.9rem;">ヒントはまだありません</div>
+            {% endif %}
+          </div>
+        </div>
+
+        <form method="post" action="/compass-bot/op/followup_policy">
+          <input type="hidden" name="target" value="{{ u.name }}">
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; align-items:end; margin-bottom:10px;">
+            <label style="display:flex; gap:8px; align-items:center; color:#555; font-size:0.9rem; min-height:36px;">
+              <input type="checkbox" name="enabled" value="on" {% if u.ai_follow_policy.enabled %}checked{% endif %}>
+              AIフォロー有効
+            </label>
+            <div>
+              <label style="font-size:0.82rem; display:block; margin-bottom:4px; color:#666;">重視観点</label>
+              <select name="focus_area" style="width:100%; padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.9rem;">
+                {% for choice in follow_focus_choices %}
+                  <option value="{{ choice.value }}" {% if choice.value == u.ai_follow_policy.focus_area %}selected{% endif %}>{{ choice.label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label style="font-size:0.82rem; display:block; margin-bottom:4px; color:#666;">強さ</label>
+              <select name="nudge_strength" style="width:100%; padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.9rem;">
+                {% for choice in follow_strength_choices %}
+                  <option value="{{ choice.value }}" {% if choice.value == u.ai_follow_policy.nudge_strength %}selected{% endif %}>{{ choice.label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label style="font-size:0.82rem; display:block; margin-bottom:4px; color:#666;">頻度</label>
+              <select name="frequency" style="width:100%; padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.9rem;">
+                {% for choice in follow_frequency_choices %}
+                  <option value="{{ choice.value }}" {% if choice.value == u.ai_follow_policy.frequency %}selected{% endif %}>{{ choice.label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+          </div>
+          <label style="font-size:0.85rem; display:block; margin-bottom:4px; color:#666;">親からAIへのメモ</label>
+          <textarea name="parent_note" rows="3"
+                    placeholder="例: 今月は買う前に一度待つ練習を軽く促してほしい。"
+                    style="width:100%; padding:8px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem; resize:vertical;">{{ u.ai_follow_policy.parent_note }}</textarea>
+          <div style="display:flex; justify-content:flex-end; margin-top:8px;">
+            <button type="submit" class="btn btn-primary" style="padding:7px 16px; font-size:0.9rem;">方針を保存</button>
+          </div>
+        </form>
+      </div>
+    {% endfor %}
+  {% else %}
+    <div style="color:#aaa; text-align:center; padding:20px;">ユーザーデータがありません</div>
+  {% endif %}
+</div>
+
 <!-- 親操作パネル -->
 <div class="card">
   <h2>⚙️ お小遣い操作</h2>
@@ -97,6 +199,46 @@
       <button type="submit" class="btn btn-primary">支給する</button>
     </form>
   </div>
+
+  <!-- 月額変更 -->
+  <div style="margin-bottom:24px; padding-top:16px; border-top:1px solid #eee;">
+    <h3 style="font-size:1rem; margin-bottom:6px; color:#555;">📌 月額変更（固定お小遣い）</h3>
+    <p style="font-size:0.82rem; color:#888; margin:0 0 10px;">毎月の固定お小遣い額を変更します。残高は自動では増減しません。</p>
+    <form method="post" action="/compass-bot/op/fixed_allowance" style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
+      <div>
+        <label style="font-size:0.85rem; display:block; margin-bottom:4px;">対象ユーザー</label>
+        <select id="fixed-allowance-target" name="target" required style="padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem;">
+          {% for u in users %}
+            <option value="{{ u.name }}" data-fixed="{{ u.fixed_allowance if u.fixed_allowance is defined and u.fixed_allowance is not none else '' }}">
+              {{ u.name }}（現在 {% if u.fixed_allowance is defined and u.fixed_allowance is not none %}{{ "{:,}".format(u.fixed_allowance|int) }}円{% else %}—{% endif %}）
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label style="font-size:0.85rem; display:block; margin-bottom:4px;">新しい月額（円）</label>
+        <input id="fixed-allowance-amount" type="number" name="amount" min="0"
+               value="{{ users[0].fixed_allowance if users and users[0].fixed_allowance is defined and users[0].fixed_allowance is not none else '' }}"
+               placeholder="例: 800" required
+               style="padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem; width:140px;">
+      </div>
+      <button type="submit" class="btn btn-primary">月額を変更</button>
+    </form>
+  </div>
+
+  <script>
+    (function () {
+      const target = document.getElementById('fixed-allowance-target');
+      const amount = document.getElementById('fixed-allowance-amount');
+      if (!target || !amount) return;
+      const syncAmount = function () {
+        const selected = target.options[target.selectedIndex];
+        amount.value = selected ? selected.dataset.fixed || '' : '';
+      };
+      target.addEventListener('change', syncAmount);
+      syncAmount();
+    })();
+  </script>
 
   <!-- 一括支給 -->
   <div style="margin-bottom:24px; padding-top:16px; border-top:1px solid #eee;">
@@ -180,6 +322,46 @@
     <div class="alert alert-info">残高が未設定です。Discordで初期設定をしてください。</div>
   {% endif %}
 </div>
+
+{% if my_learning_summary %}
+<div class="card">
+  <h2>🧭 学習支援サマリー</h2>
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); gap:8px; margin-bottom:12px;">
+    {% for metric in my_learning_summary.metrics %}
+      <div style="background:#f7f8fb; border:1px solid #eceef5; border-radius:6px; padding:8px 10px;">
+        <div style="font-size:0.75rem; color:#777; margin-bottom:2px;">{{ metric.label }}</div>
+        <div style="font-weight:600; color:#333;">{{ metric.value }}</div>
+      </div>
+    {% endfor %}
+  </div>
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:14px;">
+    <div>
+      <div style="font-size:0.85rem; font-weight:600; color:#555; margin-bottom:6px;">今の記録から見えること</div>
+      {% if my_learning_summary.signals %}
+        <ul style="margin-left:18px; color:#555; line-height:1.6; font-size:0.9rem;">
+          {% for signal in my_learning_summary.signals %}
+            <li>{{ signal }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div style="color:#aaa; font-size:0.9rem;">まだ表示できるサマリーがありません</div>
+      {% endif %}
+    </div>
+    <div>
+      <div style="font-size:0.85rem; font-weight:600; color:#555; margin-bottom:6px;">次にやってみること</div>
+      {% if my_learning_summary.child_hints %}
+        <ul style="margin-left:18px; color:#555; line-height:1.6; font-size:0.9rem;">
+          {% for hint in my_learning_summary.child_hints %}
+            <li>{{ hint }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div style="color:#aaa; font-size:0.9rem;">買い物を記録するとヒントが表示されます</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
 
 {% if my_goals %}
 <div class="card">
