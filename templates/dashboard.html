@@ -81,19 +81,21 @@
   {% endif %}
 </div>
 
-<!-- 学習支援サマリー / AIフォロー方針 -->
+<!-- 今週の会話カード / AIフォロー方針 -->
 <div class="card">
-  <h2>🧭 学習支援サマリー / AIフォロー方針</h2>
+  <h2>🧭 今週の会話カード / AIフォロー方針</h2>
   {% if users %}
     {% for u in users %}
+      {% set insights = u.learning_insights %}
+      {% set plan = u.active_growth_plan %}
       <div style="padding:{% if loop.first %}0 0 18px{% else %}18px 0{% endif %}; {% if not loop.first %}border-top:1px solid #eee;{% endif %}">
         <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">
           <h3 style="font-size:1rem; color:#444; margin:0;">{{ u.name }}</h3>
-          <span class="badge badge-ok">{{ u.learning_summary.source_label }}</span>
+          <span class="badge badge-ok">{{ "分析カード" if insights.source == "learning_insights" else "簡易カード" }}</span>
         </div>
 
         <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); gap:8px; margin-bottom:12px;">
-          {% for metric in u.learning_summary.metrics %}
+          {% for metric in insights.metrics %}
             <div style="background:#f7f8fb; border:1px solid #eceef5; border-radius:6px; padding:8px 10px;">
               <div style="font-size:0.75rem; color:#777; margin-bottom:2px;">{{ metric.label }}</div>
               <div style="font-weight:600; color:#333;">{{ metric.value }}</div>
@@ -101,31 +103,122 @@
           {% endfor %}
         </div>
 
-        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:14px; margin-bottom:14px;">
-          <div>
-            <div style="font-size:0.85rem; font-weight:600; color:#555; margin-bottom:6px;">学習シグナル</div>
+        {% if insights.summary_text %}
+          <div style="color:#555; line-height:1.6; font-size:0.9rem; margin-bottom:12px;">{{ insights.summary_text }}</div>
+        {% endif %}
+
+        {% if insights.insight_cards %}
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px; margin-bottom:14px;">
+            {% for card in insights.insight_cards %}
+              <div style="border:1px solid #e3e6ef; border-radius:8px; padding:12px; background:#fbfcff;">
+                <div style="display:flex; justify-content:space-between; gap:8px; align-items:flex-start; margin-bottom:8px;">
+                  <h4 style="font-size:0.98rem; color:#333; margin:0; line-height:1.4;">{{ card.title }}</h4>
+                  <span class="badge badge-warn">{{ card.skill }}</span>
+                </div>
+                {% if card.policy_match %}
+                  <div style="font-size:0.78rem; color:#667; margin-bottom:8px;">{{ card.policy_match }}</div>
+                {% endif %}
+                {% if card.evidence_lines %}
+                  <div style="font-size:0.78rem; font-weight:600; color:#666; margin-bottom:4px;">根拠</div>
+                  <ul style="margin-left:18px; color:#555; line-height:1.5; font-size:0.86rem; margin-bottom:8px;">
+                    {% for evidence in card.evidence_lines %}
+                      <li>{{ evidence }}</li>
+                    {% endfor %}
+                  </ul>
+                {% endif %}
+                <div style="font-size:0.78rem; font-weight:600; color:#666; margin-bottom:3px;">親の1問</div>
+                <div style="font-size:0.92rem; line-height:1.55; color:#333; margin-bottom:8px;">{{ card.parent_question }}</div>
+                <div style="font-size:0.78rem; font-weight:600; color:#666; margin-bottom:3px;">今日の伴走</div>
+                <div style="font-size:0.9rem; line-height:1.55; color:#444; margin-bottom:8px;">{{ card.parent_action }}</div>
+                {% if card.next_observation %}
+                  <div style="font-size:0.82rem; color:#777; line-height:1.5; margin-bottom:8px;">次に見ること: {{ card.next_observation }}</div>
+                {% endif %}
+                <div style="font-size:0.8rem; color:#999; line-height:1.5; margin-bottom:10px;">避けたい声かけ: {{ card.avoid }}</div>
+                <form method="post" action="/compass-bot/op/learning_card_feedback" style="display:flex; gap:8px; flex-wrap:wrap;">
+                  <input type="hidden" name="target" value="{{ u.name }}">
+                  <input type="hidden" name="card_id" value="{{ card.card_id }}">
+                  <input type="hidden" name="card_type" value="{{ card.type }}">
+                  <input type="hidden" name="parent_question" value="{{ card.parent_question }}">
+                  <input type="hidden" name="child_action" value="{{ card.child_action }}">
+                  <button type="submit" name="feedback" value="use_this_week" class="btn btn-primary" style="padding:6px 10px; font-size:0.82rem;">今週使う</button>
+                  <button type="submit" name="feedback" value="suppress_week" class="btn btn-secondary" style="padding:6px 10px; font-size:0.82rem;">今週は出さない</button>
+                  <button type="submit" name="feedback" value="helpful" class="btn btn-secondary" style="padding:6px 10px; font-size:0.82rem;">役に立った</button>
+                </form>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div style="color:#aaa; font-size:0.9rem; margin-bottom:14px;">表示できる会話カードがまだありません</div>
+        {% endif %}
+
+        <details style="margin-bottom:14px;">
+          <summary style="cursor:pointer; color:#666; font-size:0.88rem;">補助情報を表示</summary>
+          <div style="padding-top:8px;">
             {% if u.learning_summary.signals %}
-              <ul style="margin-left:18px; color:#555; line-height:1.6; font-size:0.9rem;">
+              <ul style="margin-left:18px; color:#666; line-height:1.6; font-size:0.86rem;">
                 {% for signal in u.learning_summary.signals %}
                   <li>{{ signal }}</li>
                 {% endfor %}
               </ul>
-            {% else %}
-              <div style="color:#aaa; font-size:0.9rem;">まだ表示できるシグナルがありません</div>
             {% endif %}
-          </div>
-          <div>
-            <div style="font-size:0.85rem; font-weight:600; color:#555; margin-bottom:6px;">フォローのヒント</div>
-            {% if u.learning_summary.parent_hints %}
-              <ul style="margin-left:18px; color:#555; line-height:1.6; font-size:0.9rem;">
-                {% for hint in u.learning_summary.parent_hints %}
-                  <li>{{ hint }}</li>
+            {% if insights.source_notes %}
+              <ul style="margin-left:18px; color:#888; line-height:1.6; font-size:0.82rem; margin-top:6px;">
+                {% for note in insights.source_notes %}
+                  <li>{{ note }}</li>
                 {% endfor %}
               </ul>
-            {% else %}
-              <div style="color:#aaa; font-size:0.9rem;">ヒントはまだありません</div>
             {% endif %}
           </div>
+        </details>
+
+        <div style="border-top:1px solid #eee; padding-top:12px; margin-bottom:14px;">
+          <div style="font-size:0.88rem; font-weight:600; color:#555; margin-bottom:8px;">収入と行動プラン</div>
+          <form method="post" action="/compass-bot/op/growth_plan">
+            <input type="hidden" name="target" value="{{ u.name }}">
+            {% if plan %}<input type="hidden" name="plan_id" value="{{ plan.plan_id }}">{% endif %}
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-bottom:10px;">
+              <div>
+                <label style="font-size:0.82rem; display:block; margin-bottom:4px; color:#666;">種類</label>
+                <select name="request_type" style="width:100%; padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.9rem;">
+                  <option value="allowance_increase" {% if plan and plan.request_type == "allowance_increase" %}selected{% endif %}>お小遣い増額</option>
+                  <option value="extra_income" {% if plan and plan.request_type == "extra_income" %}selected{% endif %}>臨時収入</option>
+                  <option value="saving_goal_support" {% if plan and plan.request_type == "saving_goal_support" %}selected{% endif %}>目標貯金サポート</option>
+                </select>
+              </div>
+              <div>
+                <label style="font-size:0.82rem; display:block; margin-bottom:4px; color:#666;">見直し日</label>
+                <input type="date" name="review_at" value="{{ plan.review_at if plan else '' }}"
+                       style="width:100%; padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.9rem;">
+              </div>
+              <div>
+                <label style="font-size:0.82rem; display:block; margin-bottom:4px; color:#666;">報酬額（円）</label>
+                <input type="number" name="reward_amount" min="0" value="{{ plan.reward_amount if plan and plan.reward_amount is not none else '' }}"
+                       style="width:100%; padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.9rem;">
+              </div>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:10px;">
+              <div>
+                <label style="font-size:0.82rem; display:block; margin-bottom:4px; color:#666;">子どもの理由</label>
+                <textarea name="child_reason" rows="2" style="width:100%; padding:8px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.9rem; resize:vertical;">{{ plan.child_reason if plan else '' }}</textarea>
+              </div>
+              <div>
+                <label style="font-size:0.82rem; display:block; margin-bottom:4px; color:#666;">親の条件</label>
+                <textarea name="parent_condition" rows="2" style="width:100%; padding:8px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.9rem; resize:vertical;">{{ plan.parent_condition if plan else '' }}</textarea>
+              </div>
+              <div>
+                <label style="font-size:0.82rem; display:block; margin-bottom:4px; color:#666;">合意した行動</label>
+                <textarea name="agreed_action" rows="2" style="width:100%; padding:8px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.9rem; resize:vertical;">{{ plan.agreed_action if plan else '' }}</textarea>
+              </div>
+            </div>
+            <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:8px; flex-wrap:wrap;">
+              <button type="submit" name="status" value="draft" class="btn btn-secondary" style="padding:7px 14px; font-size:0.86rem;">下書き</button>
+              <button type="submit" name="status" value="active" class="btn btn-primary" style="padding:7px 14px; font-size:0.86rem;">保存</button>
+              {% if plan %}
+                <button type="submit" name="action" value="done" class="btn btn-secondary" style="padding:7px 14px; font-size:0.86rem;">完了</button>
+                <button type="submit" name="action" value="cancel" class="btn btn-secondary" style="padding:7px 14px; font-size:0.86rem;">中止</button>
+              {% endif %}
+            </div>
+          </form>
         </div>
 
         <form method="post" action="/compass-bot/op/followup_policy">
@@ -323,42 +416,22 @@
   {% endif %}
 </div>
 
-{% if my_learning_summary %}
+{% if my_child_challenge %}
 <div class="card">
-  <h2>🧭 学習支援サマリー</h2>
-  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); gap:8px; margin-bottom:12px;">
-    {% for metric in my_learning_summary.metrics %}
-      <div style="background:#f7f8fb; border:1px solid #eceef5; border-radius:6px; padding:8px 10px;">
-        <div style="font-size:0.75rem; color:#777; margin-bottom:2px;">{{ metric.label }}</div>
-        <div style="font-weight:600; color:#333;">{{ metric.value }}</div>
-      </div>
-    {% endfor %}
-  </div>
-  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:14px;">
-    <div>
-      <div style="font-size:0.85rem; font-weight:600; color:#555; margin-bottom:6px;">今の記録から見えること</div>
-      {% if my_learning_summary.signals %}
-        <ul style="margin-left:18px; color:#555; line-height:1.6; font-size:0.9rem;">
-          {% for signal in my_learning_summary.signals %}
-            <li>{{ signal }}</li>
-          {% endfor %}
-        </ul>
-      {% else %}
-        <div style="color:#aaa; font-size:0.9rem;">まだ表示できるサマリーがありません</div>
-      {% endif %}
+  <h2>🧭 次の小さなチャレンジ</h2>
+  <div style="background:#fbfcff; border:1px solid #e3e6ef; border-radius:8px; padding:14px;">
+    <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start; flex-wrap:wrap; margin-bottom:8px;">
+      <div style="font-weight:600; color:#333; line-height:1.4;">{{ my_child_challenge.title }}</div>
+      <span class="badge badge-ok">{{ my_child_challenge.expected_time }}</span>
     </div>
-    <div>
-      <div style="font-size:0.85rem; font-weight:600; color:#555; margin-bottom:6px;">次にやってみること</div>
-      {% if my_learning_summary.child_hints %}
-        <ul style="margin-left:18px; color:#555; line-height:1.6; font-size:0.9rem;">
-          {% for hint in my_learning_summary.child_hints %}
-            <li>{{ hint }}</li>
-          {% endfor %}
-        </ul>
-      {% else %}
-        <div style="color:#aaa; font-size:0.9rem;">買い物を記録するとヒントが表示されます</div>
-      {% endif %}
-    </div>
+    <div style="font-size:1rem; line-height:1.7; color:#333; margin-bottom:12px;">{{ my_child_challenge.action }}</div>
+    <form method="post" action="/compass-bot/op/child_challenge_feedback" style="display:flex; gap:8px; flex-wrap:wrap;">
+      <input type="hidden" name="challenge_id" value="{{ my_child_challenge.challenge_id }}">
+      <input type="hidden" name="child_action" value="{{ my_child_challenge.action }}">
+      <button type="submit" name="feedback" value="done" class="btn btn-primary" style="padding:7px 14px; font-size:0.9rem;">やった</button>
+      <button type="submit" name="feedback" value="later" class="btn btn-secondary" style="padding:7px 14px; font-size:0.9rem;">あとで</button>
+      <button type="submit" name="feedback" value="different" class="btn btn-secondary" style="padding:7px 14px; font-size:0.9rem;">ちがう</button>
+    </form>
   </div>
 </div>
 {% endif %}

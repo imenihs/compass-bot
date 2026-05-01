@@ -5,6 +5,7 @@ from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
+from urllib.parse import quote
 
 import discord
 
@@ -44,6 +45,39 @@ def _build_pocket_journal_reminder_message(user_conf: dict) -> str:
     )
 
 
+def _build_proactive_child_nudge_message(user_conf: dict, nudge: dict) -> str:
+    """子どもへ送る能動的な伴走メッセージを作る。責めずに1行動だけ促す。"""
+    name = str(user_conf.get("name", "")).strip()
+    reason = str(nudge.get("reason") or "").strip()
+    action = str(nudge.get("action") or "").strip()
+    age = _age_int(user_conf.get("age"))
+    prefix = f"{name}さん、" if name else ""
+
+    if reason == "challenge_stale":
+        if age is not None and age <= 9:
+            return f"{prefix}このまえのチャレンジ、どうだった？\n「やった」「あとで」「ちがう」だけでも教えてね。"
+        return f"{prefix}この前の小さなチャレンジ、どうだった？\n「やった」「あとで」「ちがう」だけでも返してね。"
+
+    if reason == "growth_plan_review":
+        plan_action = action or "決めた行動"
+        return f"{prefix}{plan_action} の確認日が近いよ。\nできたことを1つだけ教えてね。"
+
+    if age is not None and age <= 9:
+        return f"{prefix}さいきんのお金の記録、少しあいてるみたい。\n買ったものがあったら「支出記録」って送ってね。"
+    if age is not None and age <= 12:
+        return f"{prefix}最近の記録が少し空いてるみたい。\n買ったものがあったら、名前だけでも「支出記録」で残してみよう。"
+    return f"{prefix}最近の支出記録が少し空いています。\n使ったものがあれば「支出記録」で残しておこう。"
+
+
+def _age_int(raw_age) -> int | None:
+    """年齢設定を int に正規化する"""
+    if isinstance(raw_age, int):
+        return raw_age
+    if isinstance(raw_age, str) and raw_age.strip().isdigit():
+        return int(raw_age.strip())
+    return None
+
+
 class ReminderService:
     def __init__(
         self,
@@ -55,6 +89,7 @@ class ReminderService:
         allow_channel_ids: set[int] | None = None,
         monthly_summary_conf: dict | None = None,
         pocket_journal_reminder_conf: dict | None = None,
+        proactive_child_nudge_conf: dict | None = None,
     ):
         self.client = client
         self.allowance_reminder_conf = allowance_reminder_conf
@@ -66,9 +101,12 @@ class ReminderService:
         self.monthly_summary_conf = monthly_summary_conf or {}
         # 週次支出記録リマインドの設定（未指定は無効扱いとする）
         self.pocket_journal_reminder_conf = pocket_journal_reminder_conf or {}
+        self.proactive_child_nudge_conf = proactive_child_nudge_conf or {}
 
         root = Path(__file__).resolve().parents[1]
         self.reminder_state_path = root / "data" / "reminder_state.json"
+        self.learning_support_state_dir = root / "data" / "learning_support_state"
+        self.growth_plans_dir = root / "data" / "growth_plans"
         self.loop_task: asyncio.Task | None = None
 
     def _load_reminder_state(self) -> dict:
@@ -395,6 +433,212 @@ class ReminderService:
                 continue
         return False
 
+    def _latest_journal_entry_at(self, user_name: str, log_dir: Path) -> datetime | None:
+        """最後の支出記録日時を返す。記録がなければ None を返す。"""
+        path = log_dir / f"{user_name}_pocket_journal.jsonl"
+        rows = self._load_jsonl(path)
+        latest: datetime | None = None
+        for row in rows:
+            dt = self._parse_datetime(row.get("ts"))
+            if dt is not None and (latest is None or dt > latest):
+                latest = dt
+        return latest
+
+    @staticmethod
+    def _parse_datetime(value) -> datetime | None:
+        """ISO文字列をJST基準のaware datetimeにそろえる"""
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except Exception:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=JST)
+        return dt.astimezone(JST)
+
+    def _user_key(self, user_conf: dict) -> str:
+        """状態ファイル用のユーザーキーを返す"""
+        name = str(user_conf.get("name") or "").strip()
+        discord_id = str(user_conf.get("discord_user_id") or "").strip()
+        return quote(name or discord_id or "unknown", safe="")
+
+    def _load_json_file(self, path: Path) -> dict:
+        """JSONファイルをdictとして読み込む"""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _load_learning_support_state(self, user_conf: dict) -> dict:
+        """子ども別の学習支援状態を読み込む"""
+        return self._load_json_file(self.learning_support_state_dir / f"{self._user_key(user_conf)}.json")
+
+    def _load_growth_plans(self, user_conf: dict) -> dict:
+        """子ども別の成長行動プランを読み込む"""
+        return self._load_json_file(self.growth_plans_dir / f"{self._user_key(user_conf)}.json")
+
+    def _active_growth_plan_due(self, user_conf: dict, now: datetime, days_before: int) -> dict | None:
+        """確認日が近い有効な成長行動プランを返す"""
+        data = self._load_growth_plans(user_conf)
+        plans = data.get("plans")
+        if not isinstance(plans, list):
+            return None
+        today = now.date()
+        limit = today + timedelta(days=days_before)
+        for plan in plans:
+            if not isinstance(plan, dict) or plan.get("status") != "active":
+                continue
+            review_at = str(plan.get("review_at") or "").strip()
+            try:
+                review_date = date.fromisoformat(review_at)
+            except ValueError:
+                continue
+            if today <= review_date <= limit:
+                return plan
+        return None
+
+    def _has_recent_child_response(self, state: dict, now: datetime, days: int) -> bool:
+        """子どもが最近チャレンジへ反応したかを判定する"""
+        response = state.get("child_response")
+        if not isinstance(response, dict):
+            return False
+        responded_at = self._parse_datetime(response.get("responded_at"))
+        if responded_at is None:
+            return False
+        return responded_at >= now - timedelta(days=days)
+
+    def _select_proactive_nudge(self, user_conf: dict, log_dir: Path, now: datetime) -> dict | None:
+        """記録空白・未反応・確認日から、送るべき伴走メッセージを1つ選ぶ"""
+        policy = user_conf.get("ai_follow_policy")
+        if isinstance(policy, dict) and policy.get("enabled") is False:
+            return None
+
+        cfg = self.proactive_child_nudge_conf
+        state = self._load_learning_support_state(user_conf)
+        challenge_days = int(cfg.get("challenge_stale_days", 5))
+        last_nudge_at = self._parse_datetime(state.get("last_nudge_at"))
+        if last_nudge_at and last_nudge_at <= now - timedelta(days=challenge_days):
+            if state.get("last_child_action") and not self._has_recent_child_response(state, now, challenge_days):
+                return {
+                    "reason": "challenge_stale",
+                    "action": str(state.get("last_child_action") or ""),
+                }
+
+        plan = self._active_growth_plan_due(
+            user_conf,
+            now,
+            int(cfg.get("growth_plan_review_days_before", 2)),
+        )
+        if plan:
+            return {
+                "reason": "growth_plan_review",
+                "action": str(plan.get("agreed_action") or "決めた行動"),
+                "plan_id": str(plan.get("plan_id") or ""),
+            }
+
+        no_record_days = int(cfg.get("no_record_days", 10))
+        latest = self._latest_journal_entry_at(str(user_conf.get("name", "")), log_dir)
+        if latest is None or latest <= now - timedelta(days=no_record_days):
+            return {
+                "reason": "no_record",
+                "last_record_at": latest.isoformat() if latest else "",
+            }
+
+        return None
+
+    def _is_recent_proactive_sent(self, state: dict, user_name: str, now: datetime) -> bool:
+        """同じ子へ短期間に能動メッセージを送りすぎないようにする"""
+        sent_by_user = state.get("proactive_child_nudge_last_sent_by_user")
+        if not isinstance(sent_by_user, dict):
+            return False
+        item = sent_by_user.get(user_name)
+        if not isinstance(item, dict):
+            return False
+        sent_at = self._parse_datetime(item.get("ts"))
+        if sent_at is None:
+            return False
+        min_days = int(self.proactive_child_nudge_conf.get("min_days_between_nudges", 3))
+        return sent_at > now - timedelta(days=min_days)
+
+    def _mark_proactive_sent(self, state: dict, user_name: str, nudge: dict, now: datetime) -> None:
+        """能動メッセージ送信履歴を保存する"""
+        sent_by_user = state.get("proactive_child_nudge_last_sent_by_user")
+        if not isinstance(sent_by_user, dict):
+            sent_by_user = {}
+        sent_by_user[user_name] = {
+            "ts": now.isoformat(),
+            "reason": str(nudge.get("reason") or ""),
+        }
+        state["proactive_child_nudge_last_sent_by_user"] = sent_by_user
+
+    async def _child_channels(self) -> dict[str, discord.abc.Messageable]:
+        """allow_channel_ids から子どもごとの送信先チャンネルを1つ選ぶ"""
+        users = self.load_all_users()
+        user_by_discord_id = {
+            int(u["discord_user_id"]): u
+            for u in users
+            if u.get("discord_user_id")
+        }
+        channels_by_name = {}
+        for channel_id in self.allow_channel_ids:
+            channel = self.client.get_channel(channel_id)
+            if channel is None:
+                channel = await self.client.fetch_channel(channel_id)
+            member_ids = {m.id for m in getattr(channel, "members", [])}
+            for member_id in member_ids:
+                user_conf = user_by_discord_id.get(member_id)
+                if not user_conf:
+                    continue
+                name = str(user_conf.get("name", "")).strip()
+                if name and name not in channels_by_name:
+                    channels_by_name[name] = channel
+        return channels_by_name
+
+    async def send_proactive_child_nudges(self, log_dir: Path, now: datetime | None = None) -> int:
+        """対象の子どもへ能動的な伴走メッセージを送る。テストからも直接呼ぶ。"""
+        now_dt = now or datetime.now(JST)
+        state = self._load_reminder_state()
+        channels_by_name = await self._child_channels()
+        sent_count = 0
+        max_per_run = int(self.proactive_child_nudge_conf.get("max_per_run", 20))
+
+        for user_conf in sorted(self.load_all_users(), key=lambda x: str(x.get("name", ""))):
+            if sent_count >= max_per_run:
+                break
+            user_name = str(user_conf.get("name", "")).strip()
+            channel = channels_by_name.get(user_name)
+            if not user_name or channel is None:
+                continue
+            if self._is_recent_proactive_sent(state, user_name, now_dt):
+                continue
+            nudge = self._select_proactive_nudge(user_conf, log_dir, now_dt)
+            if not nudge:
+                continue
+            await channel.send(_build_proactive_child_nudge_message(user_conf, nudge))
+            self._mark_proactive_sent(state, user_name, nudge, now_dt)
+            sent_count += 1
+
+        self._save_reminder_state(state)
+        return sent_count
+
+    async def maybe_send_proactive_child_nudges(self) -> None:
+        """設定時刻に子どもへの能動伴走メッセージを送信する"""
+        cfg = self.proactive_child_nudge_conf
+        if not cfg.get("enabled"):
+            return
+
+        now = datetime.now(JST)
+        hh, mm = [int(x) for x in cfg["notify_time"].split(":")]
+        if now.hour != hh or now.minute != mm:
+            return
+
+        from app.config import get_log_dir, load_system
+        log_dir = get_log_dir(load_system())
+        await self.send_proactive_child_nudges(log_dir=log_dir, now=now)
+
     async def maybe_send_pocket_journal_reminder(self) -> None:
         """週次支出記録リマインドを送信する。
         設定された曜日・時刻に、過去7日間の記録がないユーザーにのみ送信する。"""
@@ -462,6 +706,7 @@ class ReminderService:
                 await self.maybe_request_wallet_audit()
                 await self.maybe_send_monthly_summary()
                 await self.maybe_send_pocket_journal_reminder()
+                await self.maybe_send_proactive_child_nudges()
             except Exception as e:
                 print("Reminder loop error:", e)
             await asyncio.sleep(20)

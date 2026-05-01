@@ -2,6 +2,8 @@ import asyncio
 import os
 import json
 import re
+from pathlib import Path
+from urllib.parse import quote
 
 import discord
 import uvicorn
@@ -47,6 +49,7 @@ from app.config import (
     get_monthly_summary_setting,
     get_parent_ids,
     get_pocket_journal_reminder_setting,
+    get_proactive_child_nudge_setting,
     get_wallet_audit_setting,
     load_all_users,
     load_system,
@@ -64,9 +67,12 @@ from app.message_parser import (
 from app.prompts import build_chat_prompt, build_prompt
 from app.reflection_context import build_reflection_context
 try:
-    from app.reflection_context import build_learning_insights
+    from app.learning_insights import build_learning_insights
 except ImportError:
-    build_learning_insights = None
+    try:
+        from app.reflection_context import build_learning_insights
+    except ImportError:
+        build_learning_insights = None
 from app.reminder_service import ReminderService
 from app.storage import append_jsonl, now_jst_iso, JST
 from app.wallet_service import WalletService
@@ -86,6 +92,7 @@ FORCE_ASSESS_TEST_KEYWORD = get_force_assess_test_keyword()
 LOW_BALANCE_ALERT = get_low_balance_alert_setting()
 MONTHLY_SUMMARY = get_monthly_summary_setting()
 POCKET_JOURNAL_REMINDER = get_pocket_journal_reminder_setting()
+PROACTIVE_CHILD_NUDGE = get_proactive_child_nudge_setting()
 
 # 初期設定・財布チェックで受け付ける現実的な財布上限。Discord ID等の誤入力を拒否する。
 MAX_WALLET_INPUT_AMOUNT = 1_000_000
@@ -112,6 +119,7 @@ reminder_service = ReminderService(
     allow_channel_ids=ALLOW_CHANNEL_IDS,
     monthly_summary_conf=MONTHLY_SUMMARY,
     pocket_journal_reminder_conf=POCKET_JOURNAL_REMINDER,
+    proactive_child_nudge_conf=PROACTIVE_CHILD_NUDGE,
 )
 
 
@@ -376,6 +384,43 @@ def _log_system_diagnostic(event: str, details: dict | None = None) -> None:
         })
     except Exception as e:
         print(f"[runtime_diagnostics] system log error: {type(e).__name__}: {e}")
+
+
+def _build_learning_context_for_prompt(user_conf: dict, system_conf: dict, audit_state: dict) -> dict:
+    """学習支援エンジンの出力を査定プロンプト用に取得する。"""
+    if callable(build_learning_insights):
+        try:
+            analysis_state = dict(audit_state or {})
+            analysis_state["learning_support_state"] = _load_learning_support_state_for_prompt(user_conf)
+            context = build_learning_insights(
+                user_conf=user_conf,
+                system_conf=system_conf,
+                audit_state=analysis_state,
+            )
+        except TypeError:
+            context = build_learning_insights(user_conf, system_conf, audit_state)
+        return context if isinstance(context, dict) else {}
+
+    context = build_reflection_context(
+        user_conf=user_conf,
+        system_conf=system_conf,
+        audit_state=audit_state,
+    )
+    return context if isinstance(context, dict) else {}
+
+
+def _load_learning_support_state_for_prompt(user_conf: dict) -> dict:
+    """Webで保存された会話カード状態をDiscord査定プロンプトにも反映する"""
+    name = str((user_conf or {}).get("name") or "").strip()
+    user_id = str((user_conf or {}).get("discord_user_id") or "").strip()
+    key = quote(name or user_id or "unknown", safe="")
+    path = Path(__file__).resolve().parents[1] / "data" / "learning_support_state" / f"{key}.json"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _is_initial_setup_pending(user_name: str) -> bool:
@@ -1610,7 +1655,7 @@ async def _dispatch_by_intent(
 
     # none: 雑談プロンプトで楽しく会話する（査定フローには落とさない）
     if intent == "none":
-        bot_personality = str(user_conf.get("bot_personality", "sibling"))
+        bot_personality = str(user_conf.get("bot_personality") or system_conf.get("bot_personality", "sibling"))
         chat_prompt = build_chat_prompt(
             user_conf=user_conf,
             input_text=input_block,
@@ -1787,6 +1832,10 @@ async def on_message(message: discord.Message):
 
     # 親による設定変更コマンド（「設定変更 たろう 固定 800円」）
     if await handlers_parent.maybe_handle_user_setting_change(message, content):
+        return
+
+    # 親によるAIフォロー方針変更（「フォロー方針 たろう 記録習慣を重視」）
+    if await handlers_parent.maybe_handle_followup_policy(message, content):
         return
 
     # 親による全ユーザー一括支給コマンド（「一括支給」）
@@ -2051,9 +2100,9 @@ async def on_message(message: discord.Message):
     current_month_text = f"{now_dt.month}月"
     next_month_num = 1 if now_dt.month == 12 else now_dt.month + 1
     next_month_text = f"{next_month_num}月"
-    reflection_context = {}
+    learning_context = {}
     try:
-        reflection_context = build_reflection_context(
+        learning_context = _build_learning_context_for_prompt(
             user_conf=user_conf,
             system_conf=system_conf,
             audit_state=wallet_service.load_audit_state(),
@@ -2061,7 +2110,7 @@ async def on_message(message: discord.Message):
     except Exception as e:
         _log_runtime_event(
             system_conf, message, user_conf, input_block,
-            "reflection_context_error",
+            "learning_context_error",
             {
                 "error_type": type(e).__name__,
                 "error": _short_log_text(e, limit=300),
@@ -2091,10 +2140,11 @@ async def on_message(message: discord.Message):
         months_since_last_fixed_increase=increase_stats["months_since_last_fixed_increase"],
         fixed_increase_count_this_year=increase_stats["fixed_increase_count_this_year"],
         # bot_personality は user_conf から読む（N-4）
-        bot_personality=str(user_conf.get("bot_personality", "sibling")),
+        bot_personality=str(user_conf.get("bot_personality") or system_conf.get("bot_personality", "sibling")),
         # 財布チェックペナルティノート: あれば査定に影響させて使用後にクリアする
         wallet_check_penalty=wallet_check_penalty,
-        reflection_context=reflection_context,
+        reflection_context=learning_context,
+        learning_insights=learning_context,
     )
     try:
         assessment_timeout_reply = (

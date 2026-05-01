@@ -341,6 +341,39 @@ def get_pocket_journal_reminder_setting() -> dict:
     }
 
 
+def get_proactive_child_nudge_setting() -> dict:
+    """
+    子どもへの能動的な伴走メッセージ設定を返す。
+    setting.json の "proactive_child_nudge" セクションを読み込む。
+    """
+    setting = load_setting()
+    raw = setting.get("proactive_child_nudge", {}) if isinstance(setting, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    enabled = bool(raw.get("enabled", False))
+    notify_time = str(raw.get("notify_time", "18:30")).strip()
+    if not re.match(r"^\d{2}:\d{2}$", notify_time):
+        notify_time = "18:30"
+
+    def bounded_int(key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(raw.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    return {
+        "enabled": enabled,
+        "notify_time": notify_time,
+        "no_record_days": bounded_int("no_record_days", 10, 3, 60),
+        "challenge_stale_days": bounded_int("challenge_stale_days", 5, 1, 30),
+        "growth_plan_review_days_before": bounded_int("growth_plan_review_days_before", 2, 0, 14),
+        "min_days_between_nudges": bounded_int("min_days_between_nudges", 3, 1, 14),
+        "max_per_run": bounded_int("max_per_run", 20, 1, 50),
+    }
+
+
 def find_user_json_path_by_name(name: str) -> Path | None:
     """ユーザー名に対応する users/*.json のファイルパスを返す。見つからなければ None を返す"""
     target = (name or "").strip()
