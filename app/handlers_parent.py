@@ -25,8 +25,9 @@ from app.config import (
     get_log_dir,
     update_user_field,
 )
+from app.error_messages import operation_failure_message
 from app.message_parser import extract_input_from_mention
-from app.storage import JST
+from app.storage import JST, append_jsonl, now_jst_iso
 
 # モジュールレベルの依存オブジェクト — init() で bot.py から注入する
 _wallet_service = None
@@ -114,6 +115,25 @@ def init(wallet_service, client, reminder_service, allowance_reminder_conf: dict
 def _is_parent(user_id: int) -> bool:
     """Discord ユーザーIDが親（管理者）かどうかを判定する"""
     return user_id in get_parent_ids()
+
+
+def _log_parent_handler_error(message: discord.Message, event: str, error: Exception, details: dict | None = None) -> None:
+    """親ハンドラの失敗を診断ログへ残す。ログ失敗は標準出力に逃がす。"""
+    try:
+        system_conf = load_system()
+        log_dir = get_log_dir(system_conf)
+        append_jsonl(log_dir / "runtime_diagnostics.jsonl", {
+            "ts": now_jst_iso(),
+            "event": event,
+            "discord_user_id": int(message.author.id),
+            "channel_id": int(getattr(message.channel, "id", 0) or 0),
+            "input": str(getattr(message, "content", "") or "")[:1200],
+            "error_type": type(error).__name__,
+            "error_message": str(error)[:600],
+            "details": details or {},
+        })
+    except Exception as log_error:
+        print(f"[parent_handler_diagnostics] log error: {type(log_error).__name__}: {log_error}")
 
 
 def _command_body(content: str) -> str:
@@ -379,7 +399,8 @@ async def maybe_handle_wallet_audit_send(message: discord.Message, content: str)
         await _reminder_service.send_wallet_audit()
         await message.channel.send("残高チェック案内を送信したよ。")
     except Exception as e:
-        await message.channel.send(f"送信に失敗したよ。原因: {type(e).__name__}: {e}")
+        _log_parent_handler_error(message, "wallet_audit_send_error", e)
+        await message.channel.send(operation_failure_message("残高チェック案内の送信"))
     return True
 
 
@@ -411,7 +432,8 @@ async def maybe_handle_reminder_test(message: discord.Message, content: str) -> 
         await _reminder_service.send_allowance_reminder(payday=payday, channel_id=int(channel_id), is_test=True)
         await message.channel.send("リマインダーをテスト送信したよ。")
     except Exception as e:
-        await message.channel.send(f"テスト送信に失敗したよ。原因: {type(e).__name__}: {e}")
+        _log_parent_handler_error(message, "reminder_test_send_error", e)
+        await message.channel.send(operation_failure_message("リマインダーテスト送信"))
     return True
 
 
@@ -536,7 +558,7 @@ async def maybe_handle_user_setting_change(message: discord.Message, content: st
 
     # users/*.json ファイルの対象フィールドを書き換える
     if not update_user_field(target_name, field, amount):
-        await message.channel.send(f"{target_name}の設定ファイルの更新に失敗したよ。")
+        await message.channel.send(operation_failure_message(f"{target_name}の設定ファイル更新"))
         return True
 
     await message.channel.send(
@@ -597,7 +619,7 @@ async def maybe_handle_followup_policy(message: discord.Message, content: str) -
     new_policy = _normalize_follow_policy(new_policy)
 
     if not update_user_field(target_name, "ai_follow_policy", new_policy):
-        await message.channel.send(f"{target_name}のAIフォロー方針の保存に失敗したよ。")
+        await message.channel.send(operation_failure_message(f"{target_name}のAIフォロー方針保存"))
         return True
 
     await message.channel.send("AIフォロー方針を保存したよ。\n" + _follow_policy_summary(target_name, new_policy))

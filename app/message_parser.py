@@ -2,6 +2,10 @@ import re
 import discord
 
 
+_DISCORD_MENTION_RE = re.compile(r"<@!?\d+>|<@&\d+>|@(?:everyone|here)\b", re.IGNORECASE)
+_PLAIN_AT_MENTION_RE = re.compile(r"(^|[\s　])@[^\s　@]+")
+
+
 def parse_proxy_request(text: str) -> tuple[str | None, str]:
     """
     `nameの代理 送信内容` を解析して (name, 本文) を返す。
@@ -42,6 +46,14 @@ def extract_input_from_mention(text: str, bot_user: discord.ClientUser | None) -
             return content[len(p) :].lstrip(" \t\r\n:：,，")
 
     return None
+
+
+def contains_any_mention(text: str) -> bool:
+    """Discordメンションまたは通常の @名前 表記が含まれるか判定する。"""
+    content = (text or "").strip()
+    if not content:
+        return False
+    return bool(_DISCORD_MENTION_RE.search(content) or _PLAIN_AT_MENTION_RE.search(content))
 
 
 def parse_usage_report(text: str) -> dict | None:

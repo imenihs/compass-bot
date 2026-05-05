@@ -1,15 +1,21 @@
 import asyncio
 import calendar
 import json
+import time
+import traceback
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 from urllib.parse import quote
 
 import discord
 
-from app.storage import JST
+from app.storage import JST, append_jsonl, now_jst_iso
+
+
+DEFAULT_LOOP_INTERVAL_SEC = 600
+REMINDER_STEP_TIMEOUT_SEC = 120
 
 
 def _build_pocket_journal_reminder_message(user_conf: dict) -> str:
@@ -126,10 +132,100 @@ class ReminderService:
         with open(self.reminder_state_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
 
+    def _write_runtime_diagnostic(self, record: dict) -> None:
+        """通知ループの異常を運用ログへ残す。ログ失敗は標準出力に逃がす。"""
+        try:
+            from app.config import get_log_dir, load_system
+
+            log_dir = get_log_dir(load_system())
+            append_jsonl(log_dir / "runtime_diagnostics.jsonl", record)
+        except Exception as log_error:
+            print(f"[reminder_diagnostics] log error: {type(log_error).__name__}: {log_error}")
+
+    def _log_reminder_step_error(self, step_name: str, error: Exception, elapsed_ms: int) -> None:
+        """通知ごとの失敗を後で追える形で記録する。"""
+        self._write_runtime_diagnostic({
+            "ts": now_jst_iso(),
+            "event": "reminder_step_error",
+            "step": step_name,
+            "elapsed_ms": elapsed_ms,
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "traceback": "".join(
+                traceback.format_exception(type(error), error, error.__traceback__, limit=8)
+            )[:4000],
+        })
+
+    def _log_reminder_delivery_error(self, step_name: str, error: Exception, details: dict | None = None) -> None:
+        """通知送信単位の失敗を記録し、他の宛先処理は継続する。"""
+        self._write_runtime_diagnostic({
+            "ts": now_jst_iso(),
+            "event": "reminder_delivery_error",
+            "step": step_name,
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "details": details or {},
+        })
+
+    async def _run_notification_step(
+        self,
+        step_name: str,
+        handler: Callable[[], Awaitable[None]],
+        timeout_sec: float = REMINDER_STEP_TIMEOUT_SEC,
+    ) -> bool:
+        """1通知の失敗やハングで、後続通知を止めないための実行ラッパー。"""
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(handler(), timeout=timeout_sec)
+            return True
+        except Exception as e:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            self._log_reminder_step_error(step_name, e, elapsed_ms)
+            print(f"Reminder step error [{step_name}]: {type(e).__name__}: {e}")
+            return False
+
     @staticmethod
     def _safe_month_day(year: int, month: int, day: int) -> date:
         max_day = calendar.monthrange(year, month)[1]
         return date(year, month, min(day, max_day))
+
+    @staticmethod
+    def _scheduled_datetime(base: datetime, time_text: str) -> datetime | None:
+        """指定日の HH:MM を datetime にする。形式が不正なら None を返す。"""
+        try:
+            hh_text, mm_text = str(time_text).split(":", 1)
+            hh = int(hh_text)
+            mm = int(mm_text)
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+        return base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+    def _scheduled_time_reached(self, now: datetime, time_text: str) -> bool:
+        """現在時刻が当日の予定時刻以降かを判定する。"""
+        scheduled_at = self._scheduled_datetime(now, time_text)
+        return scheduled_at is not None and now >= scheduled_at
+
+    def _should_run_daily_schedule(self, state: dict, state_key: str, now: datetime, time_text: str) -> bool:
+        """予定時刻を過ぎていて、前回実行が今回予定時刻より前なら True。"""
+        scheduled_at = self._scheduled_datetime(now, time_text)
+        if scheduled_at is None or now < scheduled_at:
+            return False
+        last_run_at = self._parse_datetime(state.get(state_key))
+        return last_run_at is None or last_run_at < scheduled_at
+
+    def _mark_schedule_run(self, state: dict, state_key: str, now: datetime) -> None:
+        """定期処理の最終実行時刻を保存する。"""
+        state[state_key] = now.isoformat()
+
+    @staticmethod
+    def _safe_int(value, default: int = 0) -> int:
+        """集計用に整数化する。壊れた値は default に倒す。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def next_payday(self, today: date, payday_day: int) -> date:
         this_month_payday = self._safe_month_day(today.year, today.month, payday_day)
@@ -158,25 +254,29 @@ class ReminderService:
             channel = await self.client.fetch_channel(int(channel_id))
         await channel.send("\n".join(lines))
 
-    async def _grant_fixed_allowance_all(self) -> str:
+    async def _grant_fixed_allowance_all(self, payday: date | None = None) -> str:
         """全ユーザーの固定お小遣いを残高に自動加算して結果サマリーを返す。
         支給日当日の自動加算（B-1）で呼び出す。"""
-        from app.config import get_log_dir, load_all_users, load_system
+        from app.config import load_system
         system_conf = load_system()
-        users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
+        users = sorted(self.load_all_users(), key=lambda x: str(x.get("name", "")))
         lines = []
         for u in users:
             name = str(u.get("name", ""))
-            amount = int(u.get("fixed_allowance", 0))
+            amount = self._safe_int(u.get("fixed_allowance"), 0)
             # 固定額が未設定のユーザーはスキップする
             if amount <= 0:
                 continue
+            operation_key = ""
+            if payday is not None:
+                operation_key = f"allowance_monthly_auto_grant:{name}:{payday.isoformat()}"
             new_balance, _ = self.wallet_service.update_balance(
                 user_conf=u,
                 system_conf=system_conf,
                 delta=amount,
                 action="allowance_monthly_auto_grant",
                 note="auto_grant_on_payday",
+                operation_key=operation_key,
             )
             lines.append(f"・{name}: +{amount}円 → {new_balance}円")
         return "\n".join(lines) if lines else "対象ユーザーなし"
@@ -191,8 +291,7 @@ class ReminderService:
             return
 
         now = datetime.now(JST)
-        hh, mm = [int(x) for x in cfg["notify_time"].split(":")]
-        if now.hour != hh or now.minute != mm:
+        if not self._scheduled_time_reached(now, cfg["notify_time"]):
             return
 
         payday = self.next_payday(now.date(), int(cfg["payday_day"]))
@@ -210,7 +309,7 @@ class ReminderService:
             await self.send_allowance_reminder(payday=payday, channel_id=int(channel_id), is_test=False)
             # before_days=0（支給日当日）かつ auto_grant_on_payday=true の場合に自動加算する
             if before_days == 0 and cfg.get("auto_grant_on_payday"):
-                grant_summary = await self._grant_fixed_allowance_all()
+                grant_summary = await self._grant_fixed_allowance_all(payday=payday)
                 channel = self.client.get_channel(int(channel_id))
                 if channel is None:
                     channel = await self.client.fetch_channel(int(channel_id))
@@ -231,6 +330,9 @@ class ReminderService:
         users = sorted(self.load_all_users(), key=lambda x: str(x.get("name", "")))
         for u in users:
             state["pending_by_user"][str(u.get("name"))] = month_key
+        cfg = self.wallet_audit_conf
+        state["last_request_key"] = f"{month_key}_{cfg['check_time']}"
+        self.wallet_service.save_audit_state(state)
 
         def make_audit_message() -> str:
             return "\n".join([
@@ -269,13 +371,23 @@ class ReminderService:
                 for u in channel_users:
                     name = str(u.get("name"))
                     msg = make_audit_message() if self.wallet_service.has_wallet(name) else make_setup_message()
-                    await channel.send(msg)
+                    try:
+                        await channel.send(msg)
+                    except Exception as e:
+                        self._log_reminder_delivery_error(
+                            "wallet_audit",
+                            e,
+                            {"channel_id": channel_id, "user_name": name},
+                        )
             else:
-                await channel.send(make_audit_message())
-
-        cfg = self.wallet_audit_conf
-        state["last_request_key"] = f"{month_key}_{cfg['check_time']}"
-        self.wallet_service.save_audit_state(state)
+                try:
+                    await channel.send(make_audit_message())
+                except Exception as e:
+                    self._log_reminder_delivery_error(
+                        "wallet_audit",
+                        e,
+                        {"channel_id": channel_id, "user_name": ""},
+                    )
 
     async def maybe_request_wallet_audit(self) -> None:
         cfg = self.wallet_audit_conf
@@ -283,8 +395,7 @@ class ReminderService:
             return
 
         now = datetime.now(JST)
-        hh, mm = [int(x) for x in cfg["check_time"].split(":")]
-        if now.day != int(cfg["check_day"]) or now.hour != hh or now.minute != mm:
+        if now.day != int(cfg["check_day"]) or not self._scheduled_time_reached(now, cfg["check_time"]):
             return
 
         month_key = now.strftime("%Y-%m")
@@ -332,9 +443,13 @@ class ReminderService:
                 if self._is_in_month(r.get("ts"), year, month)
             ]
             spend_count = len(month_journals)
+            satisfaction_values = [
+                self._safe_int(r.get("satisfaction"), 0)
+                for r in month_journals
+            ]
             avg_satisfaction = (
-                sum(int(r.get("satisfaction", 0)) for r in month_journals) / spend_count
-                if spend_count > 0 else 0
+                sum(satisfaction_values) / len(satisfaction_values)
+                if satisfaction_values else 0
             )
             item_counter: Counter = Counter(
                 str(r.get("item", "")).strip()
@@ -347,7 +462,7 @@ class ReminderService:
             ledger_path = log_dir / f"{name}_wallet_ledger.jsonl"
             ledger_rows = self._load_jsonl(ledger_path)
             grant_total = sum(
-                int(r.get("delta", 0))
+                self._safe_int(r.get("delta"), 0)
                 for r in ledger_rows
                 if r.get("action") == "allowance_grant" and self._is_in_month(r.get("ts"), year, month)
             )
@@ -386,8 +501,7 @@ class ReminderService:
         if now.day != 1:
             return
 
-        hh, mm = [int(x) for x in cfg["send_time"].split(":")]
-        if now.hour != hh or now.minute != mm:
+        if not self._scheduled_time_reached(now, cfg["send_time"]):
             return
 
         # 前月を計算する
@@ -617,27 +731,40 @@ class ReminderService:
             nudge = self._select_proactive_nudge(user_conf, log_dir, now_dt)
             if not nudge:
                 continue
-            await channel.send(_build_proactive_child_nudge_message(user_conf, nudge))
+            try:
+                await channel.send(_build_proactive_child_nudge_message(user_conf, nudge))
+            except Exception as e:
+                self._log_reminder_delivery_error(
+                    "proactive_child_nudge",
+                    e,
+                    {"user_name": user_name},
+                )
+                continue
             self._mark_proactive_sent(state, user_name, nudge, now_dt)
+            self._save_reminder_state(state)
             sent_count += 1
 
         self._save_reminder_state(state)
         return sent_count
 
-    async def maybe_send_proactive_child_nudges(self) -> None:
-        """設定時刻に子どもへの能動伴走メッセージを送信する"""
+    async def maybe_send_proactive_child_nudges(self, now: datetime | None = None) -> None:
+        """予定時刻到達後、未処理なら子どもへの能動伴走メッセージを送信する"""
         cfg = self.proactive_child_nudge_conf
         if not cfg.get("enabled"):
             return
 
-        now = datetime.now(JST)
-        hh, mm = [int(x) for x in cfg["notify_time"].split(":")]
-        if now.hour != hh or now.minute != mm:
+        now_dt = now or datetime.now(JST)
+        state = self._load_reminder_state()
+        run_state_key = "proactive_child_nudge_last_run_at"
+        if not self._should_run_daily_schedule(state, run_state_key, now_dt, cfg["notify_time"]):
             return
 
         from app.config import get_log_dir, load_system
         log_dir = get_log_dir(load_system())
-        await self.send_proactive_child_nudges(log_dir=log_dir, now=now)
+        await self.send_proactive_child_nudges(log_dir=log_dir, now=now_dt)
+        state = self._load_reminder_state()
+        self._mark_schedule_run(state, run_state_key, now_dt)
+        self._save_reminder_state(state)
 
     async def maybe_send_pocket_journal_reminder(self) -> None:
         """週次支出記録リマインドを送信する。
@@ -650,8 +777,7 @@ class ReminderService:
         # 設定曜日（Python weekday: 0=月〜6=日）と現在の曜日が一致する場合のみ処理する
         if now.weekday() != int(cfg["day_of_week"]):
             return
-        hh, mm = [int(x) for x in cfg["notify_time"].split(":")]
-        if now.hour != hh or now.minute != mm:
+        if not self._scheduled_time_reached(now, cfg["notify_time"]):
             return
 
         # ISO週番号をキーにして同一週の二重送信を防ぐ
@@ -690,26 +816,37 @@ class ReminderService:
                     continue
                 # 今週すでに記録がある場合はリマインドを省略する
                 if not self._has_recent_journal_entry(user_name, log_dir, days=7):
-                    await channel.send(
-                        _build_pocket_journal_reminder_message(u)
-                    )
+                    try:
+                        await channel.send(
+                            _build_pocket_journal_reminder_message(u)
+                        )
+                    except Exception as e:
+                        self._log_reminder_delivery_error(
+                            "pocket_journal_reminder",
+                            e,
+                            {"channel_id": channel_id, "user_name": user_name},
+                        )
+                        continue
                 # 記録あり・なし問わず今週分は処理済みとしてマークする
                 sent_keys.append(send_key)
+                state["sent_pocket_journal_reminder_keys"] = sent_keys
+                self._save_reminder_state(state)
 
         state["sent_pocket_journal_reminder_keys"] = sent_keys
         self._save_reminder_state(state)
 
     async def loop(self) -> None:
         while not self.client.is_closed():
-            try:
-                await self.maybe_send_allowance_reminder()
-                await self.maybe_request_wallet_audit()
-                await self.maybe_send_monthly_summary()
-                await self.maybe_send_pocket_journal_reminder()
-                await self.maybe_send_proactive_child_nudges()
-            except Exception as e:
-                print("Reminder loop error:", e)
-            await asyncio.sleep(20)
+            steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
+                ("allowance_reminder", self.maybe_send_allowance_reminder),
+                ("wallet_audit", self.maybe_request_wallet_audit),
+                ("monthly_summary", self.maybe_send_monthly_summary),
+                ("pocket_journal_reminder", self.maybe_send_pocket_journal_reminder),
+                ("proactive_child_nudge", self.maybe_send_proactive_child_nudges),
+            ]
+            for step_name, handler in steps:
+                await self._run_notification_step(step_name, handler)
+            await asyncio.sleep(DEFAULT_LOOP_INTERVAL_SEC)
 
     def start_loop_if_needed(self) -> None:
         if self.loop_task is None or self.loop_task.done():

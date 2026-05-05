@@ -56,8 +56,15 @@ from app.config import (
     update_user_field,
 )
 from app import intent_normalizer
+from app.error_messages import (
+    ai_failure_message,
+    is_likely_transient_error,
+    operation_failure_message,
+    processing_failure_message,
+)
 from app.gemini_service import GeminiService, count_recent_allowance_requests
 from app.message_parser import (
+    contains_any_mention,
     extract_input_from_mention,
     parse_balance_report,
     parse_usage_report,
@@ -98,6 +105,7 @@ PROACTIVE_CHILD_NUDGE = get_proactive_child_nudge_setting()
 MAX_WALLET_INPUT_AMOUNT = 1_000_000
 # 貯金目標の補完入力で受け付ける上限。通常の子供向け目標として十分な範囲にする。
 MAX_GOAL_INPUT_AMOUNT = 10_000_000
+_thinking_sent_message_keys: set[tuple[str, int]] = set()
 
 
 gemini_service = GeminiService(
@@ -292,6 +300,29 @@ def _short_log_text(value, limit: int = 1200) -> str:
     return text[:limit] + "...(truncated)"
 
 
+def _message_state_key(message: discord.Message) -> tuple[str, int]:
+    """discord.Message は任意属性を持てないため、外部キーで一時状態を管理する。"""
+    message_id = getattr(message, "id", None)
+    if message_id is not None:
+        try:
+            return ("discord_message_id", int(message_id))
+        except Exception:
+            pass
+    return ("object_id", id(message))
+
+
+def _mark_thinking_sent(message: discord.Message, sent: bool) -> None:
+    key = _message_state_key(message)
+    if sent:
+        _thinking_sent_message_keys.add(key)
+    else:
+        _thinking_sent_message_keys.discard(key)
+
+
+def _was_thinking_sent(message: discord.Message) -> bool:
+    return _message_state_key(message) in _thinking_sent_message_keys
+
+
 def _compact_intent_result(intent_result: dict | None) -> dict:
     """intent_result を診断ログに保存しやすい形へ整える"""
     if not isinstance(intent_result, dict):
@@ -384,6 +415,62 @@ def _log_system_diagnostic(event: str, details: dict | None = None) -> None:
         })
     except Exception as e:
         print(f"[runtime_diagnostics] system log error: {type(e).__name__}: {e}")
+
+
+async def _send_processing_error_fallback(message: discord.Message, error: Exception) -> None:
+    """メッセージ処理が落ちた場合、診断ログを残してユーザーへ最終応答を返す。"""
+    content = str(getattr(message, "content", "") or "")
+    try:
+        system_conf = load_system()
+    except Exception:
+        system_conf = {}
+    try:
+        user_conf = find_user_by_discord_id(message.author.id)
+    except Exception:
+        user_conf = None
+    _log_runtime_event(
+        system_conf=system_conf,
+        message=message,
+        user_conf=user_conf,
+        input_block=content,
+        event="message_processing_unhandled_error",
+        details={
+            "error_type": type(error).__name__,
+            "error": _short_log_text(error, limit=600),
+            "user_action": "contact_admin",
+        },
+    )
+    try:
+        await message.channel.send(processing_failure_message())
+    except Exception as send_error:
+        print("fallback send error:", send_error)
+
+
+def _should_send_unhandled_error_fallback(message: discord.Message) -> bool:
+    """未捕捉例外時にユーザーへ返答すべきメッセージか判定する。"""
+    if _was_thinking_sent(message):
+        return True
+    if bool(getattr(getattr(message, "author", None), "bot", False)):
+        return False
+    content = str(getattr(message, "content", "") or "").strip()
+    if not content:
+        return False
+    try:
+        if extract_input_from_mention(content, client.user) is not None:
+            return True
+    except Exception:
+        pass
+    if contains_any_mention(content):
+        return False
+    if CHAT_SETTING.get("natural_chat_enabled") and not CHAT_SETTING.get("require_mention"):
+        return True
+    direct_command_prefixes = [
+        "使い方の説明", "つかいかたのせつめい", "支給", "残高調整", "設定変更", "一括支給",
+        "アナウンス", "web承認", "全体確認", "全員の分析", "残高チェック送信", "月頭案内送信",
+        "reminder test", "reminder-test", "リマインダーテスト", "フォロー方針", "フォロー強さ",
+        "フォロー頻度",
+    ]
+    return any(content.lower().startswith(prefix.lower()) for prefix in direct_command_prefixes)
 
 
 def _build_learning_context_for_prompt(user_conf: dict, system_conf: dict, audit_state: dict) -> dict:
@@ -1650,7 +1737,7 @@ async def _dispatch_by_intent(
         if ok:
             await message.channel.send(f"話し方を「{label}」に変えたよ。")
         else:
-            await message.channel.send("設定の変更に失敗したよ。ごめんね。")
+            await message.channel.send(operation_failure_message("設定変更"))
         return True
 
     # none: 雑談プロンプトで楽しく会話する（査定フローには落とさない）
@@ -1665,7 +1752,10 @@ async def _dispatch_by_intent(
             reply = await gemini_service.call_with_progress(
                 message.channel,
                 chat_prompt,
-                timeout_reply="ごめん、今AIの返事が遅いみたい。少し短くしてもう一度送ってね。",
+                timeout_reply=(
+                    "ごめん、今AI側が混み合っているか応答が遅いみたいで、返事できなかったよ。"
+                    "少し時間をおいてもう一度送ってね。何度も続くときは管理者に連絡してね。"
+                ),
             )
         except Exception as e:
             print("Gemini chat error:", e)
@@ -1676,9 +1766,10 @@ async def _dispatch_by_intent(
                     "intent_result": _compact_intent_result(intent_result),
                     "error_type": type(e).__name__,
                     "error": _short_log_text(e, limit=600),
+                    "user_action": "retry_later" if is_likely_transient_error(e) else "contact_admin",
                 },
             )
-            await message.channel.send("ごめん、今AIの返事が不安定みたい。少し短くしてもう一度送ってね。")
+            await message.channel.send(ai_failure_message(e, "返事"))
             return True
         if reply:
             await message.channel.send(reply)
@@ -1755,6 +1846,20 @@ async def send_assessment_change_notice(
 
 @client.event
 async def on_ready():
+    try:
+        await _on_ready_impl()
+    except Exception as e:
+        print("on_ready error:", e)
+        _log_system_diagnostic(
+            "on_ready_unhandled_error",
+            {
+                "error_type": type(e).__name__,
+                "error": _short_log_text(e, limit=600),
+            },
+        )
+
+
+async def _on_ready_impl():
     print(f"Compass logged in as {client.user}")
     conflicts = get_discord_id_conflicts()
     for conflict in conflicts:
@@ -1791,10 +1896,26 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
+    try:
+        await _on_message_impl(message)
+    except Exception as e:
+        print("on_message error:", e)
+        if _should_send_unhandled_error_fallback(message):
+            await _send_processing_error_fallback(message, e)
+    finally:
+        _mark_thinking_sent(message, False)
+
+
+async def _on_message_impl(message: discord.Message):
+    _mark_thinking_sent(message, False)
     if message.author.bot:
         return
 
     content = (message.content or "").strip()
+    bot_mention_input = extract_input_from_mention(content, client.user)
+    if bot_mention_input is None and contains_any_mention(content):
+        return
+
     # 「使い方の説明と初期設定」は全チャンネルへの一斉通知のため最優先で処理する
     if await handlers_parent.maybe_handle_parent_broadcast_guide(message, content):
         return
@@ -1850,7 +1971,7 @@ async def on_message(message: discord.Message):
     if await handlers_parent.maybe_handle_web_approve(message, content):
         return
 
-    mention_input = extract_input_from_mention(content, client.user)
+    mention_input = bot_mention_input
     if mention_input is None:
         if CHAT_SETTING.get("natural_chat_enabled") and not CHAT_SETTING.get("require_mention"):
             mention_input = content
@@ -2023,6 +2144,7 @@ async def on_message(message: discord.Message):
     age = user_conf.get("age")
     age_int_pre = int(age) if isinstance(age, int) else (int(str(age)) if isinstance(age, str) and str(age).strip().isdigit() else None)
     await message.channel.send(_thinking_message(age_int_pre))
+    _mark_thinking_sent(message, True)
 
     # Gemini 軽量モデルで intent + entities + confidence を取得する
     intent_result = await intent_normalizer.normalize_intent(input_block, gemini_service)
@@ -2149,7 +2271,8 @@ async def on_message(message: discord.Message):
     try:
         assessment_timeout_reply = (
             f"「{_short_log_text(input_block, limit=40)}」の相談は受け取ったよ。"
-            "ごめん、今AIの応答が遅くて査定できなかったよ。少し短くしてもう一度送ってね。"
+            "ごめん、今AI側が混み合っているか応答が遅いみたいで、査定できなかったよ。"
+            "少し時間をおいてもう一度送ってね。何度も続くときは管理者に連絡してね。"
         )
         reply = await gemini_service.call_with_progress(
             message.channel,
@@ -2164,11 +2287,12 @@ async def on_message(message: discord.Message):
             {
                 "error_type": type(e).__name__,
                 "error": _short_log_text(e, limit=600),
+                "user_action": "retry_later" if is_likely_transient_error(e) else "contact_admin",
             },
         )
         await message.channel.send(
             f"「{_short_log_text(input_block, limit=40)}」の相談は受け取ったよ。"
-            "ごめん、今AIの応答が不安定で査定できなかったよ。少し短くしてもう一度送ってね。"
+            + ai_failure_message(e, "査定")
         )
         return
 
@@ -2263,7 +2387,15 @@ async def on_message(message: discord.Message):
                 await message.channel.send(f"査定変更通知をスキップしたよ（{reason}）。")
         except Exception as e:
             print("assessment change notify error:", e)
-            await message.channel.send(f"査定変更通知の送信に失敗したよ。原因: {type(e).__name__}: {e}")
+            _log_runtime_event(
+                system_conf, message, user_conf, input_block,
+                "assessment_change_notify_error",
+                {
+                    "error_type": type(e).__name__,
+                    "error": _short_log_text(e, limit=600),
+                },
+            )
+            await message.channel.send(operation_failure_message("査定変更通知の送信"))
         if assessed.get("total") is not None:
             # tuple で (更新後残高, 達成した目標リスト) が返る
             new_balance, achieved_goals = wallet_service.update_balance(

@@ -1,4 +1,5 @@
 import json
+import threading
 import uuid
 from pathlib import Path
 
@@ -14,6 +15,7 @@ class WalletService:
         root = Path(__file__).resolve().parents[1]
         self.wallet_state_path = root / "data" / "wallet_state.json"
         self.wallet_audit_state_path = root / "data" / "wallet_audit_state.json"
+        self._lock = threading.RLock()
 
     @staticmethod
     def new_entry_id(prefix: str = "expense") -> str:
@@ -57,14 +59,38 @@ class WalletService:
                     if self._migrate_savings_goals_if_needed(data):
                         self._save_wallet_state(data)
                     return data
-        except Exception:
-            pass
-        return {"users": {}}
+        except Exception as e:
+            self._log_wallet_error("wallet_state_load_error", e, {"path": str(self.wallet_state_path)})
+            raise RuntimeError("wallet_state.json の読み込みに失敗しました") from e
+        self._log_wallet_error(
+            "wallet_state_invalid_error",
+            ValueError("wallet_state.json schema is invalid"),
+            {"path": str(self.wallet_state_path)},
+        )
+        raise RuntimeError("wallet_state.json の形式が不正です")
 
     def _save_wallet_state(self, state: dict) -> None:
         self.wallet_state_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.wallet_state_path, "w", encoding="utf-8") as f:
+        tmp_path = self.wallet_state_path.with_suffix(self.wallet_state_path.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        tmp_path.replace(self.wallet_state_path)
+
+    def _log_wallet_error(self, event: str, error: Exception, details: dict | None = None) -> None:
+        """ウォレット状態の異常を診断ログへ残す。ログ失敗は標準出力に逃がす。"""
+        try:
+            root = Path(__file__).resolve().parents[1]
+            log_path = root / "data" / "logs" / "runtime_diagnostics.jsonl"
+            append_jsonl(log_path, {
+                "ts": now_jst_iso(),
+                "event": event,
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+                "details": details or {},
+            })
+        except Exception as log_error:
+            print(f"[wallet_diagnostics] log error: {type(log_error).__name__}: {log_error}")
 
     # ------------------------------------------------------------------
     # 残高操作
@@ -81,11 +107,12 @@ class WalletService:
         return int(u.get("expected_balance", 0))
 
     def set_balance(self, user_name: str, amount: int) -> None:
-        state = self._load_wallet_state()
-        users = state.setdefault("users", {})
-        u = users.setdefault(user_name, {})
-        u["expected_balance"] = int(amount)
-        self._save_wallet_state(state)
+        with self._lock:
+            state = self._load_wallet_state()
+            users = state.setdefault("users", {})
+            u = users.setdefault(user_name, {})
+            u["expected_balance"] = int(amount)
+            self._save_wallet_state(state)
 
     def update_balance(
         self,
@@ -95,38 +122,61 @@ class WalletService:
         action: str,
         note: str = "",
         extra: dict | None = None,
+        operation_key: str | None = None,
     ) -> tuple[int, list[dict]]:
-        user_name = str(user_conf.get("name", "unknown"))
-        # 更新前の残高を記録しておく（目標達成の前後比較に使う）
-        before = self.get_balance(user_name)
-        after = before + int(delta)
-        self.set_balance(user_name, after)
+        with self._lock:
+            user_name = str(user_conf.get("name", "unknown"))
+            state = self._load_wallet_state()
+            users = state.setdefault("users", {})
+            user_state = users.setdefault(user_name, {})
+            before = int(user_state.get("expected_balance", 0))
+            applied_keys = state.setdefault("applied_operation_keys", {})
+            safe_operation_key = str(operation_key or "").strip()
+            if safe_operation_key and safe_operation_key in applied_keys:
+                return before, []
+            after = before + int(delta)
 
-        log_dir = get_log_dir(system_conf)
-        ledger_path = log_dir / f"{user_name}_wallet_ledger.jsonl"
-        record = {
-            "ts": now_jst_iso(),
-            "name": user_name,
-            "action": action,
-            "delta": int(delta),
-            "balance_before": before,
-            "balance_after": after,
-            "note": note,
-        }
-        if extra:
-            record["extra"] = extra
-        append_jsonl(ledger_path, record)
+            log_dir = get_log_dir(system_conf)
+            ledger_path = log_dir / f"{user_name}_wallet_ledger.jsonl"
+            ts = now_jst_iso()
+            record = {
+                "ts": ts,
+                "name": user_name,
+                "action": action,
+                "delta": int(delta),
+                "balance_before": before,
+                "balance_after": after,
+                "note": note,
+            }
+            if safe_operation_key:
+                record["operation_key"] = safe_operation_key
+            if extra:
+                record["extra"] = extra
+            append_jsonl(ledger_path, record)
 
-        # 全貯金目標に対して達成チェックをする（残高増加時のみ判定する）
-        achieved: list[dict] = []
-        if delta > 0:
-            for goal in self.get_savings_goals(user_name):
-                target = int(goal.get("target_amount", 0))
-                # 更新前は未達成かつ更新後に到達した瞬間のみ達成とみなす
-                if before < target <= after:
-                    achieved.append(goal)
+            user_state["expected_balance"] = after
+            if safe_operation_key:
+                applied_keys[safe_operation_key] = {
+                    "ts": ts,
+                    "name": user_name,
+                    "action": action,
+                    "delta": int(delta),
+                    "balance_after": after,
+                }
+            self._save_wallet_state(state)
 
-        return after, achieved
+            achieved: list[dict] = []
+            if delta > 0:
+                goals = user_state.get("savings_goals", [])
+                for goal in goals if isinstance(goals, list) else []:
+                    try:
+                        target = int(goal.get("target_amount", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if before < target <= after:
+                        achieved.append(goal)
+
+            return after, achieved
 
     # ------------------------------------------------------------------
     # 監査・ペナルティ
@@ -147,8 +197,11 @@ class WalletService:
 
     def save_audit_state(self, state: dict) -> None:
         self.wallet_audit_state_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.wallet_audit_state_path, "w", encoding="utf-8") as f:
+        tmp_path = self.wallet_audit_state_path.with_suffix(self.wallet_audit_state_path.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        tmp_path.replace(self.wallet_audit_state_path)
 
     def apply_penalty(self, user_conf: dict, system_conf: dict, diff: int, wallet_audit_conf: dict) -> int:
         penalty = int(abs(diff) * float(wallet_audit_conf.get("penalty_rate", 1.0)))
