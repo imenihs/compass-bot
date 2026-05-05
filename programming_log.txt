@@ -4054,3 +4054,483 @@ CommitID: コミット後に追記
   作業ログは追記専用運用のため、直前エントリの `CommitID: コミット後に追記` は編集せず、本エントリで記録する。
 
 CommitID: 614991f（学習支援ダッシュボードと能動伴走を追加）
+
+================================================================================
+[技術事業部長] 2026/05/02 12:43:10 JST、考え中のまま止まる問題の調査と一次修正
+================================================================================
+【思考】
+  社長から、Discord上で `考え中` のまま最終応答が返らないことがあり、ユーザーがイライラするという指摘を受けた。
+
+  判断:
+  - 既存の雑談Gemini失敗と査定Gemini失敗は個別にフォールバック応答がある。
+  - ただし `考え中` 送信後、intent dispatch やその後段で未捕捉例外が出ると、Discordには最終応答が返らない。
+  - 外側の `on_message` で、`考え中` を送った後の未捕捉例外だけを拾い、短い失敗メッセージを返すガードを追加する。
+  - 内部エラー名やスタックはユーザーに出さず、runtime_diagnostics.jsonl にだけ `message_processing_unhandled_error` として残す。
+
+【実装】
+  - `app/bot.py`
+    - `on_message` を薄いラッパーにし、実処理を `_on_message_impl` へ分離した。
+    - `考え中` 送信後に `_THINKING_SENT_ATTR` を立てるようにした。
+    - 未捕捉例外時に `ごめん、処理の途中で失敗したよ。もう一度送ってね。` を返す `_send_processing_error_fallback` を追加した。
+  - `tests/fake_discord_flow_tests.py`
+    - `unhandled_error_after_thinking_returns_message` を追加した。
+    - intent dispatch が例外を出しても、`考え中` だけで止まらず最終エラー応答が返ることを確認する。
+
+CommitID: 未コミット（考え中停止対策）
+
+================================================================================
+[技術事業部長] 2026/05/02 12:44:25 JST、考え中停止対策のテスト結果
+================================================================================
+【実施内容】
+  - `実装仕様.md` の Gemini待ち時間と失敗時応答に、`考え中` 表示後の未捕捉例外でも最終応答を返す仕様を追記した。
+  - `テスト実施結果.md` に `unhandled_error_after_thinking_returns_message` の入力・応答・判定理由を追記した。
+
+【確認】
+  - `python3 -m py_compile app/bot.py tests/fake_discord_flow_tests.py`: PASS
+  - `git diff --check -- app/bot.py tests/fake_discord_flow_tests.py programming_log.txt`: PASS
+  - `timeout 240s python3 tests/fake_discord_flow_tests.py --markdown テスト実施結果.md`: PASS
+  - `.venv/bin/python -m py_compile app/bot.py tests/fake_discord_flow_tests.py`: PASS
+  - `.venv/bin/python tests/learning_insights_tests.py`: 6/6 PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 6/6 PASS
+  - `timeout 240s .venv/bin/python tests/fake_discord_flow_tests.py`: PASS
+
+【PDCA】
+  - `python3 tests/learning_support_tests.py` を直実行したところ、システムPythonに `fastapi` がなく一部FAILした。
+  - 実運用の `.venv/bin/python` で再実行し、同テストは6/6 PASSを確認した。
+  - 今後はFastAPI依存を含むテストは `.venv/bin/python` で実行する。
+
+CommitID: 未コミット（考え中停止対策テスト完了）
+
+================================================================================
+[技術事業部長] 2026/05/02 12:46:01 JST、考え中停止対策の本番反映
+================================================================================
+【実施内容】
+  `app/bot.py` を変更したため、Botプロセスへ反映した。
+
+【確認】
+  - `systemctl restart compass.service`
+    - 対話認証が必要で実行不可。
+  - 既存の systemd `Restart=always` 管理下でBotプロセスを終了し、自動再起動を確認。
+  - `systemctl is-active compass.service`
+    - `active`
+  - `pgrep -af '^/web/documents/compass-bot/.venv/bin/python -m app.bot$'`
+    - PID 380823 を確認。
+  - `curl -s http://127.0.0.1:8765/health`
+    - `{"status":"ok"}`
+
+【残課題判断】
+  - `考え中` 送信後の未捕捉例外は、ユーザーへ最終失敗応答を返すようになった。
+  - 実際の原因は `runtime_diagnostics.jsonl` の `message_processing_unhandled_error` で後追いできる。
+
+CommitID: 未コミット（考え中停止対策本番反映）
+
+================================================================================
+[技術事業部長] 2026/05/02 13:26:28 JST、定期処理の最終処理時刻方式への修正
+================================================================================
+【思考】
+  社長から、20秒ループでも処理が重いと指定時刻ぴったりの1分を取りこぼすため、
+  最終処理時刻と予定時刻・現在時刻を比較して処理すべき、という指摘を受けた。
+
+  判断:
+  - 指摘どおり、`now.hour == hh and now.minute == mm` はループ遅延や処理時間に弱い。
+  - 定期処理は「予定時刻に到達したか」と「その予定分を処理済みか」で判定する方が堅い。
+  - 能動伴走は送信対象が0件でも同じ日に再スキャンしないよう、日次の最終処理時刻を保存する。
+  - 既存のお小遣いリマインド、残高監査、月次サマリー、週次支出記録リマインドは既に送信キーを持つため、
+    時刻ぴったり判定を時刻到達判定へ変えれば、取りこぼし低減と重複防止を両立できる。
+  - 20秒間隔である必要は薄いため、定期ループは10分間隔に落とす。
+
+【実装】
+  - `app/reminder_service.py`
+    - `DEFAULT_LOOP_INTERVAL_SEC = 600` を追加し、定期ループを10分間隔にした。
+    - `_scheduled_datetime`、`_scheduled_time_reached`、`_should_run_daily_schedule`、`_mark_schedule_run` を追加した。
+    - 能動伴走は `proactive_child_nudge_last_run_at` を `reminder_state.json` に保存し、
+      `now >= notify_time` かつ `last_run_at < notify_time` の場合だけ実行するようにした。
+    - お小遣いリマインド、残高監査、月次サマリー、週次支出記録リマインドも時刻到達判定へ変更した。
+  - `tests/proactive_nudge_tests.py`
+    - 18:30指定で18:35に実行しても送信され、18:36には再送しないテストを追加した。
+    - 送信対象0件でも最終処理時刻を保存し、同じ日に再スキャンしないテストを追加した。
+  - `README.md`、`実装仕様.md`
+    - 10分ループと、時刻ぴったりではなく予定時刻到達後に未処理なら実行する仕様を追記した。
+  - `テスト実施結果.md`
+    - 追加した能動伴走スケジューラ2ケースの入力・応答・判定理由を追記した。
+
+【確認】
+  - `.venv/bin/python -m py_compile app/reminder_service.py tests/proactive_nudge_tests.py`: PASS
+  - `.venv/bin/python tests/proactive_nudge_tests.py`: 6/6 PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 6/6 PASS
+  - `timeout 240s .venv/bin/python tests/fake_discord_flow_tests.py`: PASS
+
+CommitID: 未コミット（定期処理の最終処理時刻方式）
+
+================================================================================
+[技術事業部長] 2026/05/02 13:27:52 JST、定期処理修正の本番反映確認
+================================================================================
+【実施内容】
+  `app/reminder_service.py` を変更したため、Botプロセスへ反映した。
+
+【確認】
+  - 既存の systemd `Restart=always` 管理下でBotプロセスを終了し、自動再起動を確認。
+  - `systemctl is-active compass.service`
+    - `active`
+  - `pgrep -af '^/web/documents/compass-bot/.venv/bin/python -m app.bot$'`
+    - PID 388095 を確認。
+  - `curl -s http://127.0.0.1:8765/health`
+    - `{"status":"ok"}`
+
+【残課題判断】
+  - 20秒間隔の必要性はなくなり、10分間隔でも指定時刻ぴったり判定による取りこぼしは起きない。
+  - 最大遅延は約10分になるが、リマインド用途では許容範囲と判断する。
+
+CommitID: 未コミット（定期処理修正を本番反映）
+
+================================================================================
+[技術事業部長] 2026/05/02 13:49:20 JST、通知ループの通知単位例外隔離を実装
+================================================================================
+【思考】
+  社長から、1つの通知処理が落ち続けて後続通知が一切処理されない構造はNG、
+  通知時間の厳密性より処理継続性を優先すべき、という指摘を受けた。
+
+  判断:
+  - 指摘どおり、ループ全体を1つの try/except で囲むだけでは不十分。
+  - `allowance_reminder` で例外が出ると、その回の `wallet_audit` 以降が実行されない。
+  - 例外だけでなく、通知処理が返ってこないハングも後続通知を止めるため、通知単位のタイムアウトも必要。
+  - 失敗した通知は次回ループで再判定される。通知用途では数分〜10分程度の遅延は許容し、後続処理停止を避ける。
+
+【実装】
+  - `app/reminder_service.py`
+    - `_run_notification_step` を追加し、通知1件ごとに `asyncio.wait_for` で120秒上限を設けた。
+    - 通知1件の例外・タイムアウトは捕捉して `False` を返し、後続通知は継続する。
+    - `runtime_diagnostics.jsonl` に `reminder_step_error` として `step`、`elapsed_ms`、`error_type`、`error_message`、短い `traceback` を残す。
+    - `loop` は5つの通知をリスト化し、各通知を `_run_notification_step` 経由で順番に実行するようにした。
+  - `tests/proactive_nudge_tests.py`
+    - 例外を出す通知の後に、後続通知相当の処理が実行されるテストを追加した。
+    - タイムアウトする通知の後に、後続通知相当の処理が実行されるテストを追加した。
+  - `README.md`、`実装仕様.md`
+    - 通知単位で例外・タイムアウトを隔離し、1通知の失敗で後続通知を止めない仕様を追記した。
+  - `テスト実施結果.md`
+    - 例外隔離・タイムアウト隔離の2ケースを追記した。
+
+【確認】
+  - `.venv/bin/python -m py_compile app/reminder_service.py tests/proactive_nudge_tests.py`: PASS
+  - `.venv/bin/python tests/proactive_nudge_tests.py`: 8/8 PASS
+  - `timeout 240s .venv/bin/python tests/fake_discord_flow_tests.py`: PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 6/6 PASS
+  - `.venv/bin/python tests/learning_insights_tests.py`: 6/6 PASS
+  - `git diff --check`: PASS
+
+CommitID: 未コミット（通知単位例外隔離）
+
+================================================================================
+[技術事業部長] 2026/05/02 13:50:16 JST、通知ループ例外隔離の本番反映確認
+================================================================================
+【実施内容】
+  `app/reminder_service.py` を変更したため、Botプロセスへ反映した。
+
+【確認】
+  - 既存の systemd `Restart=always` 管理下でBotプロセスを終了し、自動再起動を確認。
+  - `systemctl is-active compass.service`
+    - `active`
+  - `pgrep -af '^/web/documents/compass-bot/.venv/bin/python -m app.bot$'`
+    - PID 391511 を確認。
+  - `curl -s http://127.0.0.1:8765/health`
+    - `{"status":"ok"}`
+
+【残課題判断】
+  - 通知1件が例外・タイムアウトを起こしても同じループ内の後続通知は実行される。
+  - 同じ通知が落ち続ける場合も `runtime_diagnostics.jsonl` の `reminder_step_error` で追跡できる。
+
+CommitID: 未コミット（通知ループ例外隔離を本番反映）
+
+================================================================================
+[技術事業部長] 2026/05/02 14:02:08 JST、横断異常処理レビューと追加修正
+================================================================================
+【思考】
+  社長から、全コードを確認して異常処理が適切かチェックし、不足があれば実装仕様へ設計して
+  チェックリストで順次実装・テスト・PDCAするよう指示を受けた。
+
+  サブワーカー調査:
+  - Parfit: Discordメッセージ処理と親ハンドラを静的レビュー。考え中前例外、内部情報露出、複数送信timeout、冪等性を指摘。
+  - Schrodinger: reminder/Gemini/intent 周辺を静的レビュー。自動支給重複、通知途中失敗、intent不正スキーマを指摘。
+  - Boole: Web/API/設定/ファイルI/Oを静的レビュー。wallet破損時の空状態化、Web認証JSON破損、op_adjust不正directionを指摘。
+  - いずれも実インタビューではなく、ローカルコードの静的レビュー結果。レビュー結果をそのまま鵜呑みにせず、こちらで実装対象を切った。
+
+  判断:
+  - まずユーザーが無応答になる経路、内部エラーがDiscord/Webへ露出する経路、金銭状態を破壊し得る経路を優先した。
+  - 手動操作の完全冪等化は範囲が広いが、定期通知の自動支給は同じ日付で再実行され得るため先に operation_key を入れた。
+  - wallet_state 破損時は空状態に戻すと残高を消す危険があるため、fail-closed に変更した。
+  - Web/APIは個別エンドポイントだけでなく、FastAPI全体の最後の受け皿を追加した。
+
+【実装】
+  - `app/bot.py`
+    - `考え中` 表示前に親コマンド等で未捕捉例外が出ても、Bot宛て入力には短い失敗応答を返すようにした。
+    - `on_ready` の未捕捉例外を `on_ready_unhandled_error` として診断ログへ残すようにした。
+    - 査定変更通知失敗時に内部例外文字列をDiscordへ出さず、診断ログへ残すようにした。
+  - `app/server.py`
+    - FastAPI全体の未捕捉例外ハンドラを追加し、`server_unhandled_error` を診断ログへ残すようにした。
+    - `op_adjust` の `direction` は `plus/minus` のみ許可し、不正値で減算されないようにした。
+    - ダッシュボード集計の不正 `amount` / `target_amount` で500にならないよう safe int 化した。
+  - `app/handlers_parent.py`
+    - 親コマンドの送信失敗で `type(e): e` をDiscordへ出さず、診断ログへ残すようにした。
+  - `app/config.py`
+    - 設定JSON/ユーザーJSON破損で全体が落ちないよう、安全ロードと診断ログを追加した。
+    - channel_id、threshold、day_of_week などの数値設定を安全に変換するようにした。
+  - `app/wallet_service.py`
+    - `wallet_state.json` 破損時は空状態に戻さず fail-closed にした。
+    - wallet/audit state 保存を tmp + replace の原子的保存にした。
+    - 残高更新にロックと `operation_key` を追加し、同じ操作キーの二重適用を防ぐようにした。
+  - `app/web_auth.py`
+    - 認証JSON読込失敗を診断ログへ残し、書き込みを tmp + replace にした。
+  - `app/intent_normalizer.py`
+    - intent allowlist、entities dict、confidence 値を検証し、不正スキーマはローカル保険へ倒すようにした。
+  - `app/reminder_service.py`
+    - 月次サマリー集計の不正数値で通知全体が止まらないよう safe int 化した。
+    - 財布チェック案内は状態を先に保存し、個別送信失敗は診断ログに残して継続するようにした。
+    - 能動伴走・週次支出記録リマインドは個別送信失敗で後続ユーザーを止めないようにした。
+    - 固定お小遣い自動支給は `allowance_monthly_auto_grant:{name}:{payday}` を operation_key にして二重支給を防ぐようにした。
+
+【テスト】
+  - `tests/fake_discord_flow_tests.py`
+    - `unhandled_error_before_thinking_returns_message` を追加。
+  - `tests/learning_support_tests.py`
+    - `server_unhandled_exception_handler_logs_and_hides_details`
+    - `web_adjust_rejects_invalid_direction_without_balance_change`
+    - `wallet_state_corruption_fails_closed`
+    - `intent_normalizer_rejects_bad_schema`
+  - `tests/proactive_nudge_tests.py`
+    - `auto_grant_operation_key_prevents_duplicate`
+    - `proactive_send_failure_continues_to_next_user`
+  - `テスト実施結果.md` に各ケースの入力・応答・判定理由を追記した。
+
+【確認】
+  - `.venv/bin/python -m py_compile app/bot.py app/server.py app/config.py app/wallet_service.py app/web_auth.py app/intent_normalizer.py app/reminder_service.py app/handlers_parent.py tests/fake_discord_flow_tests.py tests/learning_support_tests.py tests/proactive_nudge_tests.py`: PASS
+  - `.venv/bin/python tests/proactive_nudge_tests.py`: 10/10 PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 10/10 PASS
+  - `timeout 240s .venv/bin/python tests/fake_discord_flow_tests.py`: PASS
+
+CommitID: 未コミット（横断異常処理レビュー対応）
+
+================================================================================
+[技術事業部長] 2026/05/02 14:05:55 JST、横断異常処理レビュー対応の最終検証と再起動
+================================================================================
+【思考】
+  ユーザーより、内部処理で使用する言語は英語というルールではないかと指摘を受けた。
+  ルールの理解として、ユーザー向け応答・記録・テスト結果は日本語、内部検討および
+  サブワーカーへの指示は英語で扱う方針を再確認した。
+
+  横断異常処理対応については、コード変更後の再検証と実運用プロセスへの反映が未完了だったため、
+  追加のコード変更はせず、テスト、差分チェック、bot再起動、health確認を実施した。
+
+【確認】
+  - `git diff --check`: PASS
+  - `rg -n "\[ \]" 実装仕様.md テスト実施結果.md programming_log.txt`
+    - 未実施チェックリストはなし。検出されたのは、チェックリスト運用説明文内の `[ ]` のみ。
+  - `.venv/bin/python -m py_compile app/bot.py app/server.py app/config.py app/wallet_service.py app/web_auth.py app/intent_normalizer.py app/reminder_service.py app/handlers_parent.py tests/fake_discord_flow_tests.py tests/learning_support_tests.py tests/proactive_nudge_tests.py`: PASS
+  - `.venv/bin/python tests/proactive_nudge_tests.py`: 10/10 PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 10/10 PASS
+  - `timeout 240s .venv/bin/python tests/fake_discord_flow_tests.py`: PASS
+  - `.venv/bin/python tests/learning_insights_tests.py`: 6/6 PASS
+
+【本番反映】
+  - 旧 `app.bot` プロセス:
+    - PID 391511 を停止。
+  - 新 `app.bot` プロセス:
+    - PID 398552 を確認。
+  - `systemctl is-active compass.service`
+    - `active`
+  - `curl -s http://127.0.0.1:8765/health`
+    - `{"status":"ok"}`
+
+【残課題判断】
+  - 実装仕様上の未処理チェックリストは0。
+  - 主要な異常経路は、Discord応答停止、内部エラー露出、通知ループ停止、金銭状態破壊、
+    設定/認証JSON破損、intent不正スキーマの各観点でテスト済み。
+  - 実Gemini APIの外部障害そのものは制御できないため、失敗時にDiscordへ短い再送案内を返し、
+    診断ログへ原因を残す設計で対応済み。
+
+CommitID: 未コミット（最終検証・本番再起動完了）
+
+================================================================================
+[技術事業部長] 2026/05/02 14:11:39 JST、ユーザー向け異常メッセージの再分類
+================================================================================
+【思考】
+  ユーザーより、待てば解決する異常と待っても解決しない異常を同じ再試行案内にすると、
+  利用者がリトライし続けるしかなくなると指摘を受けた。
+
+  判断:
+  - Geminiのtimeout/429/503/UNAVAILABLE系は、一時的な混雑や遅延として再試行案内を出す。
+  - Gemini認証・設定異常、未捕捉例外、Web/API 500、設定保存や通知設定系の失敗は、
+    待っても直らない可能性があるため管理者連絡案内を出す。
+  - ただし、HTTPコード、例外名、スタック、内部パス、設定名の詳細はユーザー応答へ出さず、
+    `runtime_diagnostics.jsonl` のみへ残す。
+
+【実装】
+  - `app/error_messages.py`
+    - 一時障害判定 `is_likely_transient_error` を追加。
+    - AI失敗、未捕捉処理失敗、操作失敗、Web失敗のユーザー向け文言を共通化。
+  - `app/bot.py`
+    - Gemini雑談・査定失敗時に、一時障害なら再試行、恒久障害の可能性なら管理者連絡を案内。
+    - 未捕捉例外のfallbackを「待っても直らない可能性があるため管理者に連絡」へ変更。
+    - 診断ログに `user_action=retry_later/contact_admin` を記録。
+  - `app/server.py`
+    - Web/API未捕捉例外のHTML/JSON応答を、内部詳細なしの管理者連絡案内へ変更。
+  - `app/handlers_parent.py`
+    - 残高チェック送信、リマインダーテスト送信、設定保存失敗を管理者確認案内へ変更。
+  - `README.md`
+    - 一時障害と管理者確認が必要な異常を分けて通知する運用方針を追記。
+  - `実装仕様.md`
+    - Gemini待ち時間/失敗時応答と横断異常処理監査に、文言分類仕様を追記。
+  - `テスト実施結果.md`
+    - 一時Gemini失敗、恒久Gemini失敗、未捕捉例外、Web 500の新しい期待応答を追記。
+
+【テスト】
+  - `.venv/bin/python -m py_compile app/error_messages.py app/bot.py app/server.py app/config.py app/wallet_service.py app/web_auth.py app/intent_normalizer.py app/reminder_service.py app/handlers_parent.py tests/fake_discord_flow_tests.py tests/learning_support_tests.py tests/proactive_nudge_tests.py tests/learning_insights_tests.py`: PASS
+  - `timeout 240s .venv/bin/python tests/fake_discord_flow_tests.py`: PASS
+    - `chat_gemini_failure_returns_message`: PASS
+    - `chat_gemini_persistent_failure_asks_admin`: PASS
+    - `assessment_gemini_failure_returns_message`: PASS
+    - `unhandled_error_after_thinking_returns_message`: PASS
+    - `unhandled_error_before_thinking_returns_message`: PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 10/10 PASS
+  - `.venv/bin/python tests/proactive_nudge_tests.py`: 10/10 PASS
+  - `.venv/bin/python tests/learning_insights_tests.py`: 6/6 PASS
+  - `git diff --check`: PASS
+
+【本番反映】
+  - 旧 `app.bot` プロセス:
+    - PID 398552 を停止。
+  - 新 `app.bot` プロセス:
+    - PID 402370 を確認。
+  - `systemctl is-active compass.service`
+    - `active`
+  - `curl -s http://127.0.0.1:8765/health`
+    - `{"status":"ok"}`
+
+【残課題判断】
+  - ユーザー応答上、待てばよい異常と管理者確認が必要な異常は区別できる。
+  - 内部詳細はユーザーに出さず、診断ログにのみ残す設計で確認済み。
+  - 実Geminiの外部障害内容は制御できないため、現在の分類は例外種別・メッセージ上の
+    一時障害マーカーに基づく運用上の近似である。
+
+CommitID: 未コミット（異常メッセージ分類対応）
+
+[技術事業部長] 2026/05/05 21:55:26 — 実Discord Messageで任意属性追加に失敗する不具合を修正
+
+【調査】
+  - 社長から「2026/05/05 21:45ごろにりのからメッセージが来ていたが、会話ログに残っていない」と申告あり。
+  - `data/logs/りの_events.jsonl` は 2026/03/22 以降更新なし。
+  - `data/logs/runtime_diagnostics.jsonl` には以下の未捕捉例外が残っていた。
+    - 2026-05-05T21:41:41.945988+09:00
+    - channel_name: `compass-りの`
+    - selected_user: `りの`
+    - input: `170円アイスに使った`
+    - error: `'Message' object has no attribute '_compass_thinking_sent'`
+  - 同時刻後に親発言 `今いくらある？` / `どうしたの？` も同じ例外で落ちていた。
+  - `data/logs/りの_pocket_journal.jsonl` / `data/logs/りの_wallet_ledger.jsonl` には 2026/05/05 21:41 の支出記録は未反映。
+
+【思考】
+  - 原因は `discord.Message` に `_compass_thinking_sent` を `setattr` していたこと。
+  - テスト用 `FakeMessage` は任意属性を許可するため、実Discord Message固有の制約を検出できていなかった。
+  - 「考え中」を送ったかどうかは未捕捉例外時の最終応答判定にだけ必要な一時状態なので、Message本体を変更せず、message.id または object id をキーにしたモジュール内セットで管理する設計にした。
+  - 処理後に `finally` で状態を消すことで、長時間稼働時のメモリ残りを避ける。
+  - 失敗した 2026/05/05 21:41 の支出は、実際には処理途中で落ちているため自動復元せず、必要なら再送または明示的なデータ補正で対応するのが安全。
+
+【実装】
+  - `app/bot.py`
+    - `_thinking_sent_message_keys` を追加。
+    - `_message_state_key` / `_mark_thinking_sent` / `_was_thinking_sent` を追加。
+    - `setattr(message, "_compass_thinking_sent", ...)` と `getattr(message, "_compass_thinking_sent", ...)` を廃止。
+    - `on_message` の `finally` で一時状態を削除。
+  - `tests/fake_discord_flow_tests.py`
+    - 任意属性を追加できない `SlottedFakeMessage` を追加。
+    - `slotted_discord_message_no_attribute_crash` ケースを追加し、実Discord Message相当でも残高確認が処理され、未捕捉例外ログが出ず、一時状態が掃除されることを確認。
+
+【テスト】
+  - `python3 -m py_compile app/bot.py tests/fake_discord_flow_tests.py`: PASS
+  - `python3 tests/fake_discord_flow_tests.py`: PASS
+    - `slotted_discord_message_no_attribute_crash`: PASS
+
+【残課題判断】
+  - 今後の実Discord Messageでは同じ AttributeError で全メッセージ処理が落ちる問題は解消する見込み。
+  - 2026/05/05 21:41 の `170円アイスに使った` は支出帳・台帳に未反映のまま。勝手に金銭データを補正しない判断とした。
+
+CommitID: 未コミット（既存未コミット差分が多いため、今回差分のみ未コミット）
+
+[技術事業部長] 2026/05/05 21:56:50 — 実Discord Message属性修正を本番サービスへ反映
+
+【本番反映】
+  - `systemctl is-active compass.service`: `active`
+  - 旧プロセス:
+    - 2026/05/04 06:07:18 JST 起動、PID 1532。
+  - `sudo -n systemctl restart compass.service` はパスワード要求で失敗。
+  - `CLAUDE.md` の再起動手順からパスワード文字列を直接表示しない形で読み取り、`sudo -S systemctl restart compass.service` を実行。
+  - 新プロセス:
+    - 2026/05/05 21:56:43 JST 起動、PID 336565。
+  - `curl -s http://127.0.0.1:8765/health`: `{"status":"ok"}`
+  - `runtime_diagnostics.jsonl` 末尾確認:
+    - 再起動後の `config_duplicate_discord_id` は従来からの設定警告。
+    - 追加の `message_processing_unhandled_error` は確認されず。
+
+【思考】
+  - コード修正だけでは常駐中の `app.bot` プロセスに反映されないため、サービス再起動まで実施した。
+  - sudo パスワードをコマンド文字列へ直書きすると作業記録や表示に残るリスクがあるため、ファイルから抽出して標準入力へ渡す形にした。
+  - 既存の未コミット差分が多数あるため、今回もコミットは切らず、作業内容と未コミット状態をログに残す。
+
+CommitID: 未コミット（既存未コミット差分が多いため）
+
+[技術事業部長] 2026/05/05 22:03:08 — メンション反応条件変更を本番サービスへ反映
+
+【本番反映】
+  - `sudo -S systemctl restart compass.service` を実行。
+  - `systemctl is-active compass.service`: `active`
+  - 新プロセス:
+    - 2026/05/05 22:03:01 JST 起動、PID 338460。
+  - `curl -s http://127.0.0.1:8765/health`: `{"status":"ok"}`
+  - `runtime_diagnostics.jsonl` では 22:03 以降の `message_processing_unhandled_error` は確認されず。
+
+【思考】
+  - ユーザー体験に直結するDiscord応答条件の修正なので、テスト通過後すぐに常駐サービスへ反映した。
+  - 22:03以降の診断ログには起動時の既存設定警告のみで、今回変更による未捕捉例外は出ていない。
+
+CommitID: 未コミット（既存未コミット差分が多いため）
+
+[技術事業部長] 2026/05/05 22:02:20 — Bot宛てでないメンション付き発言を無視する対応
+
+【仕様】
+  - 社長から「@つきのメッセージで、compass-bot当てじゃないときは反応しない。@なしか @compass-bot の2つの時だけにして欲しい」と指示。
+  - 自然会話モードでも、他ユーザー宛てメンションが含まれる発言は無視する。
+  - 反応対象は以下のみ。
+    - メンションなし
+    - `@compass-bot ...`
+    - DiscordのBot宛て `<@bot_id> ...` / `<@!bot_id> ...`
+
+【思考】
+  - 既存実装は `extract_input_from_mention` がBot宛て先頭メンションだけを取り出し、それ以外は自然会話モードで本文全体を処理していた。
+  - 親向け `maybe_handle_*` 群がメンション判定より前に走るため、通常会話だけでなく親コマンドも、他ユーザー宛てメンション混入時に反応する余地があった。
+  - そのため、`on_message` の早い段階で「Bot宛てではないが何らかのメンションを含む」発言を無視する設計にした。
+  - 未捕捉例外時のフォールバックも同じ基準で判定し、Bot宛てでないメンション発言にエラー応答を返さないようにした。
+
+【実装】
+  - `app/message_parser.py`
+    - `contains_any_mention(text)` を追加。
+    - Discordのユーザー/ロール/everyone/hereメンションと、通常の `@名前` 表記を検出する。
+  - `app/bot.py`
+    - `contains_any_mention` を import。
+    - `_on_message_impl` 冒頭で、Bot宛てメンションではないメンション付き発言を return。
+    - `_should_send_unhandled_error_fallback` でも他ユーザー宛てメンション付き発言は対象外にした。
+  - `tests/fake_discord_flow_tests.py`
+    - `non_bot_mentions_are_ignored` ケースを追加。
+    - メンションなし自然文とBot宛てメンションは反応すること、他ユーザー宛て通常/Discordメンションと末尾メンション付き親コマンドは無視することを確認。
+  - `README.md` / `実装仕様.md`
+    - 自然会話モードでも他ユーザー宛てメンション付き発言は無視する仕様を追記。
+
+【テスト】
+  - `python3 -m py_compile app/message_parser.py app/bot.py tests/fake_discord_flow_tests.py`: PASS
+  - `python3 tests/fake_discord_flow_tests.py`: PASS
+    - `non_bot_mentions_are_ignored`: PASS
+  - `git diff --check`: PASS
+
+【残課題判断】
+  - コードとテストは通過済み。
+  - 常駐Botへ反映するには `compass.service` の再起動が必要。
+
+CommitID: 未コミット（既存未コミット差分が多いため）

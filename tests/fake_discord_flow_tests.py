@@ -116,6 +116,18 @@ class FakeMessage:
     channel: FakeChannel
 
 
+class SlottedFakeMessage:
+    """discord.Message と同じく任意属性を追加できないメッセージ代替。"""
+
+    __slots__ = ("content", "author", "channel", "id")
+
+    def __init__(self, content: str, author: FakeAuthor, channel: FakeChannel, message_id: int) -> None:
+        self.content = content
+        self.author = author
+        self.channel = channel
+        self.id = message_id
+
+
 @dataclass
 class FakeBotUser:
     id: int = BOT_ID
@@ -146,6 +158,11 @@ class StubGeminiService:
 class FailingGeminiService(StubGeminiService):
     async def call_with_progress(self, channel: FakeChannel, prompt: str, **kwargs: Any) -> str:
         raise TimeoutError("simulated gemini timeout")
+
+
+class PersistentFailingGeminiService(StubGeminiService):
+    async def call_with_progress(self, channel: FakeChannel, prompt: str, **kwargs: Any) -> str:
+        raise RuntimeError("401 UNAUTHENTICATED simulated gemini auth failure")
 
 
 class CapturingGeminiService(StubGeminiService):
@@ -676,6 +693,64 @@ async def case_runtime_diagnostics_written(h: Harness) -> tuple[list[str], bool,
     return outputs, passed, reason, not passed
 
 
+async def case_slotted_discord_message_no_attribute_crash(h: Harness) -> tuple[list[str], bool, str, bool]:
+    channel = FakeChannel(182, "りの-おこづかい", [FakeAuthor(RINO_ID, "りの")])
+    message = SlottedFakeMessage("@compass-bot 残高おしえて", FakeAuthor(RINO_ID, "りの"), channel, 9_000_000_000_000_001)
+    await h.bot.on_message(message)
+
+    path = h.tmp / "logs" / "runtime_diagnostics.jsonl"
+    rows: list[dict[str, Any]] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+    unhandled = [row for row in rows if row.get("event") == "message_processing_unhandled_error"]
+    passed = (
+        has_all(channel.outputs, "りのさんの現在の所持金は 2100円")
+        and not unhandled
+        and not h.bot._thinking_sent_message_keys
+    )
+    reason = "任意属性を追加できないdiscord.Message相当でも、外部状態管理でクラッシュせず処理後に状態が掃除されているため" if passed else "discord.Message相当で未捕捉例外が出る、または一時状態が残る"
+    return list(channel.outputs), passed, reason, not passed
+
+
+async def case_non_bot_mentions_are_ignored(h: Harness) -> tuple[list[str], bool, str, bool]:
+    child_channel = FakeChannel(183, "りか-おこづかい", [FakeAuthor(RIKA_ID, "りか")])
+    natural = await h.send(RIKA_ID, "りか", child_channel, "ねむたい")
+    bot_mention = await h.send(RIKA_ID, "りか", child_channel, "@compass-bot 残高おしえて")
+    raw_bot_mention = await h.send(RIKA_ID, "りか", child_channel, f"<@{BOT_ID}> 残高おしえて")
+    plain_other = await h.send(RIKA_ID, "りか", child_channel, "@りの 残高おしえて")
+    raw_other = await h.send(RIKA_ID, "りか", child_channel, "<@333000000000000003> 残高おしえて")
+    raw_other_middle = await h.send(RIKA_ID, "りか", child_channel, "残高おしえて <@333000000000000003>")
+
+    parent_channel = FakeChannel(184, "parents", [FakeAuthor(PARENT_ID, "親")])
+    before = h.bot.wallet_service.get_balance("りか")
+    parent_other = await h.send(PARENT_ID, "親", parent_channel, "支給 りか 700円 @りの")
+    after = h.bot.wallet_service.get_balance("りか")
+
+    outputs = (
+        ["[natural] " + x for x in natural]
+        + ["[bot] " + x for x in bot_mention]
+        + ["[raw_bot] " + x for x in raw_bot_mention]
+        + ["[plain_other] " + x for x in plain_other]
+        + ["[raw_other] " + x for x in raw_other]
+        + ["[raw_other_middle] " + x for x in raw_other_middle]
+        + ["[parent_other] " + x for x in parent_other]
+    )
+    passed = (
+        has_all(natural, "stubbed Gemini response")
+        and has_all(bot_mention, "りかさんの現在の所持金は 3450円")
+        and has_all(raw_bot_mention, "りかさんの現在の所持金は 3450円")
+        and plain_other == []
+        and raw_other == []
+        and raw_other_middle == []
+        and parent_other == []
+        and before == after
+    )
+    reason = "メンションなし自然文と@compass-bot宛てだけに反応し、他ユーザー宛てメンション付き発言や末尾メンション付き親コマンドは無視しているため" if passed else "bot宛てでないメンションに反応している、または許可すべき入力に反応していない"
+    return outputs, passed, reason, not passed
+
+
 async def case_parent_manual_grant_command(h: Harness) -> tuple[list[str], bool, str, bool]:
     channel = FakeChannel(163, "parents")
     before = h.bot.wallet_service.get_balance("りか")
@@ -1094,8 +1169,18 @@ async def case_chat_gemini_failure_returns_message(h: Harness) -> tuple[list[str
     channel = FakeChannel(17, "りか-おこづかい", [FakeAuthor(RIKA_ID, "りか")])
     outputs = await h.send(RIKA_ID, "りか", channel, "@compass-bot ねむたい")
     joined = "\n".join(outputs)
-    passed = "もう一度送ってね" in joined and "原因:" not in joined
-    reason = "雑談Gemini失敗時も考え中のまま止まらず、再送を促す短い応答を返しているため" if passed else "雑談Gemini失敗時に最終応答がない、または内部原因を露出している"
+    passed = "少し時間をおいてもう一度送ってね" in joined and "管理者に連絡" in joined and "原因:" not in joined
+    reason = "雑談Gemini一時失敗時は考え中のまま止まらず、再試行可能かつ継続時は管理者連絡と分かる応答を返しているため" if passed else "雑談Gemini一時失敗時に最終応答がない、または再試行/管理者連絡の判断材料が不足している"
+    return outputs, passed, reason, not passed
+
+
+async def case_chat_gemini_persistent_failure_asks_admin(h: Harness) -> tuple[list[str], bool, str, bool]:
+    h.bot.gemini_service = PersistentFailingGeminiService()
+    channel = FakeChannel(171, "りか-おこづかい", [FakeAuthor(RIKA_ID, "りか")])
+    outputs = await h.send(RIKA_ID, "りか", channel, "@compass-bot ねむたい")
+    joined = "\n".join(outputs)
+    passed = "待っても直らない可能性" in joined and "管理者に連絡" in joined and "401" not in joined and "UNAUTHENTICATED" not in joined
+    reason = "AI認証など待っても直りにくい失敗では、内部詳細を出さず管理者確認が必要と伝えているため" if passed else "AI恒久失敗時に管理者連絡案内がない、または内部原因を露出している"
     return outputs, passed, reason, not passed
 
 
@@ -1109,8 +1194,48 @@ async def case_assessment_gemini_failure_returns_message(h: Harness) -> tuple[li
     channel = FakeChannel(18, "りの-おこづかい", [FakeAuthor(RINO_ID, "りの")])
     outputs = await h.send(RINO_ID, "りの", channel, "@compass-bot 攻略本を買いたいからお小遣い増やして")
     joined = "\n".join(outputs)
-    passed = "査定できなかった" in joined and "もう一度送ってね" in joined and "原因:" not in joined
-    reason = "査定Gemini失敗時も考え中のまま止まらず、内部エラーではなく再送案内を返しているため" if passed else "査定Gemini失敗時に最終応答がない、または内部原因を露出している"
+    passed = "査定できなかった" in joined and "少し時間をおいてもう一度送ってね" in joined and "管理者に連絡" in joined and "原因:" not in joined
+    reason = "査定Gemini一時失敗時も考え中のまま止まらず、再試行可能かつ継続時は管理者連絡と分かる応答を返しているため" if passed else "査定Gemini一時失敗時に最終応答がない、または再試行/管理者連絡の判断材料が不足している"
+    return outputs, passed, reason, not passed
+
+
+async def case_unhandled_error_after_thinking_returns_message(h: Harness) -> tuple[list[str], bool, str, bool]:
+    original_dispatch = h.bot._dispatch_by_intent
+
+    async def balance_intent(text: str, gemini_service: Any) -> dict:
+        return {"intent": "balance_check", "confidence": "high", "entities": {}}
+
+    async def exploding_dispatch(*args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("simulated dispatcher crash")
+
+    h.bot.intent_normalizer.normalize_intent = balance_intent
+    h.bot._dispatch_by_intent = exploding_dispatch
+    channel = FakeChannel(19, "りか-おこづかい", [FakeAuthor(RIKA_ID, "りか")])
+    try:
+        outputs = await h.send(RIKA_ID, "りか", channel, "@compass-bot 残高おしえて")
+    finally:
+        h.bot._dispatch_by_intent = original_dispatch
+    joined = "\n".join(outputs)
+    passed = "考え中" in joined and "待っても直らない" in joined and "管理者に連絡" in joined and "simulated dispatcher crash" not in joined
+    reason = "考え中表示後に未捕捉例外が起きても、内部原因を出さず管理者連絡が必要な最終応答を返しているため" if passed else "考え中表示後の未捕捉例外で最終応答が返っていない、または管理者連絡案内/秘匿が不足している"
+    return outputs, passed, reason, not passed
+
+
+async def case_unhandled_error_before_thinking_returns_message(h: Harness) -> tuple[list[str], bool, str, bool]:
+    original_handler = h.bot.handlers_parent.maybe_handle_parent_dashboard
+
+    async def exploding_parent_handler(*args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("simulated pre-thinking crash")
+
+    h.bot.handlers_parent.maybe_handle_parent_dashboard = exploding_parent_handler
+    channel = FakeChannel(20, "parents")
+    try:
+        outputs = await h.send(PARENT_ID, "parent", channel, "@compass-bot 全体確認")
+    finally:
+        h.bot.handlers_parent.maybe_handle_parent_dashboard = original_handler
+    joined = "\n".join(outputs)
+    passed = "考え中" not in joined and "待っても直らない" in joined and "管理者に連絡" in joined and "simulated pre-thinking crash" not in joined
+    reason = "考え中表示前の親コマンド処理で未捕捉例外が起きても、内部原因を出さず管理者連絡が必要な最終応答を返しているため" if passed else "考え中表示前の未捕捉例外で最終応答が返っていない、または管理者連絡案内/秘匿が不足している"
     return outputs, passed, reason, not passed
 
 
@@ -1137,6 +1262,8 @@ async def main(markdown_path: Path | None = None) -> int:
         ("assessment_history_no_rows", "@compass-bot 査定履歴見せて", case_assessment_history_no_rows),
         ("assessment_history_existing_rows", "@compass-bot 査定履歴見せて", case_assessment_history_existing_rows),
         ("runtime_diagnostics_written", "@compass-bot 残高おしえて", case_runtime_diagnostics_written),
+        ("slotted_discord_message_no_attribute_crash", "@compass-bot 残高おしえて", case_slotted_discord_message_no_attribute_crash),
+        ("non_bot_mentions_are_ignored", "ねむたい / @compass-bot 残高おしえて / @りの 残高おしえて", case_non_bot_mentions_are_ignored),
         ("parent_manual_grant_command", "@compass-bot 支給 りか 700円", case_parent_manual_grant_command),
         ("child_manual_grant_rejected", "@compass-bot 支給 りか 700円", case_child_manual_grant_rejected),
         ("parent_balance_adjustment_command", "@compass-bot 残高調整 りか +500円", case_parent_balance_adjustment_command),
@@ -1154,7 +1281,10 @@ async def main(markdown_path: Path | None = None) -> int:
         ("learning_insight_card_in_assessment_prompt", "@compass-bot お小遣い増やしてほしい", case_learning_insight_card_in_assessment_prompt),
         ("parent_followup_policy_command", "@compass-bot フォロー方針 りか 記録習慣を重視", case_parent_followup_policy_command),
         ("chat_gemini_failure_returns_message", "@compass-bot ねむたい", case_chat_gemini_failure_returns_message),
+        ("chat_gemini_persistent_failure_asks_admin", "@compass-bot ねむたい", case_chat_gemini_persistent_failure_asks_admin),
         ("assessment_gemini_failure_returns_message", "@compass-bot 攻略本を買いたいからお小遣い増やして", case_assessment_gemini_failure_returns_message),
+        ("unhandled_error_after_thinking_returns_message", "@compass-bot 残高おしえて", case_unhandled_error_after_thinking_returns_message),
+        ("unhandled_error_before_thinking_returns_message", "@compass-bot 全体確認", case_unhandled_error_before_thinking_returns_message),
     ]
     results = [await run_case(name, input_text, func, markdown_path) for name, input_text, func in cases]
     return 0 if all(results) else 1

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import secrets
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -31,15 +32,42 @@ def _read_json(path: Path) -> dict:
     """JSONファイルを読み込む。存在しない場合は空dictを返す"""
     if not path.exists():
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as e:
+        _log_web_auth_error("web_auth_json_read_error", path, e)
+        return {}
 
 
 def _write_json(path: Path, data: dict) -> None:
     """JSONファイルに書き込む。ディレクトリが存在しない場合は作成する"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    tmp_path.replace(path)
+
+
+def _log_web_auth_error(event: str, path: Path, error: Exception) -> None:
+    """Web認証状態ファイルの異常を診断ログに残す。"""
+    try:
+        log_path = DATA_DIR / "logs" / "runtime_diagnostics.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "event": event,
+                "path": str(path),
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+                "traceback": "".join(
+                    traceback.format_exception(type(error), error, error.__traceback__, limit=4)
+                )[:2000],
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def _hash_password(password: str, salt: str) -> str:

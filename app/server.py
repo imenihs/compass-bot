@@ -6,6 +6,7 @@ Compass Bot Webダッシュボード + ヘルスチェック FastAPI サーバ�
 import datetime
 import json
 import re
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -13,13 +14,14 @@ from urllib.parse import quote
 
 import discord
 from fastapi import Cookie, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from app import web_auth
 from app.config import (
     get_allow_channel_ids,
     get_allowance_reminder_setting,
+    get_log_dir,
     get_low_balance_alert_setting,
     get_web_base_url,
     find_user_by_name,
@@ -27,7 +29,8 @@ from app.config import (
     load_system,
     update_user_field,
 )
-from app.storage import JST, now_jst_iso
+from app.error_messages import web_failure_message
+from app.storage import JST, append_jsonl, now_jst_iso
 
 try:
     from app.reflection_context import build_reflection_context
@@ -104,6 +107,44 @@ def init(discord_client: discord.Client, wallet_service) -> None:
 def health():
     """死活監視エンドポイント"""
     return {"status": "ok"}
+
+
+def _log_server_exception(request: Request, exc: Exception) -> None:
+    """Web/APIの未捕捉例外を診断ログに残す。ログ失敗は標準出力に逃がす。"""
+    try:
+        system_conf = load_system()
+        log_dir = get_log_dir(system_conf)
+        client = getattr(request, "client", None)
+        append_jsonl(log_dir / "runtime_diagnostics.jsonl", {
+            "ts": now_jst_iso(),
+            "event": "server_unhandled_error",
+            "method": str(getattr(request, "method", "")),
+            "path": str(getattr(getattr(request, "url", None), "path", "")),
+            "client": str(getattr(client, "host", "") or ""),
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "traceback": "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__, limit=8)
+            )[:4000],
+        })
+    except Exception as log_error:
+        print(f"[server_diagnostics] log error: {type(log_error).__name__}: {log_error}")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """想定外のWeb/API例外を捕捉し、利用者へ内部情報を出さず500を返す。"""
+    _log_server_exception(request, exc)
+    accept = str(request.headers.get("accept", ""))
+    if "text/html" in accept:
+        return HTMLResponse(
+            web_failure_message(),
+            status_code=500,
+        )
+    return JSONResponse(
+        {"status": "error", "message": web_failure_message()},
+        status_code=500,
+    )
 
 
 # ---------- ユーティリティ ----------
@@ -899,8 +940,9 @@ def _build_user_stats(name: str, system_conf: dict, user_conf: Optional[dict] = 
             if ts.startswith(month_str):
                 month_count += 1
                 amount = r.get("amount")
-                if amount is not None:
-                    month_spending += int(amount)
+                amount_value = _safe_int(amount)
+                if amount_value is not None:
+                    month_spending += amount_value
                 if last_spent_date is None:
                     last_spent_date = ts[:10]
         # 直近5件を recent_items に格納する（新しい順に逆引き）
@@ -931,7 +973,7 @@ def _build_user_stats(name: str, system_conf: dict, user_conf: Optional[dict] = 
     goals = []
     if _wallet_service and has_wallet:
         for g in _wallet_service.get_savings_goals(name):
-            target = int(g.get("target_amount", 0))
+            target = _safe_int(g.get("target_amount")) or 0
             saved = balance if balance is not None else 0
             pct = int(saved / target * 100) if target > 0 else 0
             goals.append({
@@ -1673,6 +1715,9 @@ async def op_adjust(
         return _op_redirect(error="金額が正しくありません。")
     if amt <= 0:
         return _op_redirect(error="金額は1円以上を入力してください。")
+
+    if direction not in {"plus", "minus"}:
+        return _op_redirect(error="増減の指定が正しくありません。")
 
     delta = amt if direction == "plus" else -amt
 

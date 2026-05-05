@@ -410,6 +410,136 @@ def test_child_challenge_feedback_and_template_do_not_expose_parent_policy() -> 
             server.build_learning_insights = old_build_learning_insights
 
 
+def test_server_unhandled_exception_handler_logs_and_hides_details() -> None:
+    import app.server as server
+
+    with tempfile.TemporaryDirectory(prefix="compass-server-error-") as d:
+        root = Path(d)
+        log_dir = root / "logs"
+        old_load_system = server.load_system
+        old_get_log_dir = server.get_log_dir
+        try:
+            server.load_system = lambda: {"log_dir": str(log_dir)}
+            server.get_log_dir = lambda system_conf: Path(system_conf["log_dir"])
+            request = types.SimpleNamespace(
+                method="GET",
+                url=types.SimpleNamespace(path="/compass-bot/dashboard"),
+                client=types.SimpleNamespace(host="127.0.0.1"),
+                headers={"accept": "application/json"},
+            )
+            response = asyncio.run(
+                server.unhandled_exception_handler(
+                    request,
+                    RuntimeError("simulated web secret"),
+                )
+            )
+            body = response.body.decode("utf-8")
+            assert response.status_code == 500
+            assert "管理者に連絡" in body
+            assert "待っても直らない" in body
+            assert "simulated web secret" not in body
+            diagnostics_path = log_dir / "runtime_diagnostics.jsonl"
+            rows = [
+                json.loads(line)
+                for line in diagnostics_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            assert any(
+                row.get("event") == "server_unhandled_error"
+                and row.get("path") == "/compass-bot/dashboard"
+                and row.get("error_type") == "RuntimeError"
+                and row.get("error_message") == "simulated web secret"
+                for row in rows
+            )
+        finally:
+            server.load_system = old_load_system
+            server.get_log_dir = old_get_log_dir
+
+
+def test_web_adjust_rejects_invalid_direction_without_balance_change() -> None:
+    import app.server as server
+    from app.wallet_service import WalletService
+
+    with tempfile.TemporaryDirectory(prefix="compass-adjust-") as d:
+        root = Path(d)
+        wallet = WalletService()
+        wallet.wallet_state_path = root / "wallet_state.json"
+        wallet.wallet_audit_state_path = root / "wallet_audit_state.json"
+        wallet.set_balance("りか", 1000)
+
+        old_get_current_user = server._get_current_user
+        old_is_admin = server._is_admin
+        old_wallet_service = server._wallet_service
+        old_find_user_by_name = server.find_user_by_name
+        old_load_system = server.load_system
+        try:
+            async def fake_current_user(_token: str | None) -> str:
+                return "parent"
+
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server._wallet_service = wallet
+            server.find_user_by_name = lambda name: {"name": name} if name == "りか" else None
+            server.load_system = lambda: {"log_dir": str(root / "logs")}
+
+            response = asyncio.run(
+                server.op_adjust(
+                    session_token="token",
+                    target="りか",
+                    amount="500円",
+                    direction="bad",
+                )
+            )
+            assert response.status_code == 303
+            assert "増減の指定が正しくありません" in unquote(response.headers["location"])
+            assert wallet.get_balance("りか") == 1000
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server._wallet_service = old_wallet_service
+            server.find_user_by_name = old_find_user_by_name
+            server.load_system = old_load_system
+
+
+def test_wallet_state_corruption_fails_closed() -> None:
+    from app.wallet_service import WalletService
+
+    with tempfile.TemporaryDirectory(prefix="compass-wallet-corrupt-") as d:
+        root = Path(d)
+        wallet = WalletService()
+        wallet.wallet_state_path = root / "wallet_state.json"
+        wallet.wallet_audit_state_path = root / "wallet_audit_state.json"
+        wallet.wallet_state_path.write_text("{broken", encoding="utf-8")
+
+        try:
+            wallet.update_balance(
+                user_conf={"name": "りか"},
+                system_conf={"log_dir": str(root / "logs")},
+                delta=500,
+                action="test",
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("corrupt wallet_state.json should fail closed")
+
+        assert wallet.wallet_state_path.read_text(encoding="utf-8") == "{broken"
+        assert not (root / "logs" / "りか_wallet_ledger.jsonl").exists()
+
+
+def test_intent_normalizer_rejects_bad_schema() -> None:
+    from app.intent_normalizer import normalize_intent
+
+    class BadSchemaGemini:
+        async def call_silent(self, _prompt: str) -> str:
+            return '{"intent":"balance_check","entities":["bad"],"confidence":"maybe"}'
+
+    result = asyncio.run(normalize_intent("残高おしえて", BadSchemaGemini()))
+    assert result["intent"] == "balance_check"
+    assert isinstance(result["entities"], dict)
+    assert result["confidence"] == "high"
+
+
 def main() -> int:
     tests = [
         test_reflection_context,
@@ -418,6 +548,10 @@ def main() -> int:
         test_dashboard_template_renders_policy_form,
         test_learning_card_and_growth_plan_endpoints_write_isolated_state,
         test_child_challenge_feedback_and_template_do_not_expose_parent_policy,
+        test_server_unhandled_exception_handler_logs_and_hides_details,
+        test_web_adjust_rejects_invalid_direction_without_balance_change,
+        test_wallet_state_corruption_fails_closed,
+        test_intent_normalizer_rejects_bad_schema,
     ]
     failures = []
     for test in tests:

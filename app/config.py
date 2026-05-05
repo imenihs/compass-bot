@@ -12,12 +12,43 @@ PARENTS_DIR = USERS_DIR / "parents"
 SYSTEM_PATH = SETTINGS_DIR / "system.json"
 SETTING_PATH = SETTINGS_DIR / "setting.json"
 
-def _load_json(path: Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _log_config_error(path: Path, error: Exception, event: str = "config_load_error") -> None:
+    """設定ファイル異常を最低限の診断ログへ残す。config内なので固定ログ先を使う。"""
+    try:
+        log_dir = ROOT / "data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / "runtime_diagnostics.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "event": event,
+                "path": str(path),
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _safe_int(value, default: int | None = None) -> int | None:
+    """設定値を安全に int 化する。失敗時は default を返す。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_json(path: Path, default: dict | None = None) -> dict:
+    """JSON設定を安全に読む。破損時は診断ログを残して default を返す。"""
+    fallback = {} if default is None else default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else fallback
+    except (OSError, json.JSONDecodeError) as e:
+        _log_config_error(path, e)
+        return fallback
 
 def load_system() -> dict:
-    return _load_json(SYSTEM_PATH)
+    return _load_json(SYSTEM_PATH, {"log_dir": "data/logs"})
 
 def load_setting() -> dict:
     if not SETTING_PATH.exists():
@@ -31,7 +62,9 @@ def load_all_users() -> list[dict]:
         # .example.json はサンプルファイルのため実ユーザーとして読み込まない
         if p.name.endswith(".example.json"):
             continue
-        users.append(_load_json(p))
+        data = _load_json(p, {})
+        if data:
+            users.append(data)
     return users
 
 def load_all_parents() -> list[dict]:
@@ -43,20 +76,22 @@ def load_all_parents() -> list[dict]:
         # .example.json はサンプルファイルのため除外する
         if p.name.endswith(".example.json"):
             continue
-        parents.append(_load_json(p))
+        data = _load_json(p, {})
+        if data:
+            parents.append(data)
     return parents
 
 def find_child_user_by_discord_id(discord_user_id: int) -> Optional[dict]:
     """discord_user_id で子供ユーザーだけを検索する"""
     for u in load_all_users():
-        if int(u.get("discord_user_id", -1)) == int(discord_user_id):
+        if _safe_int(u.get("discord_user_id"), -1) == int(discord_user_id):
             return u
     return None
 
 def find_parent_by_discord_id(discord_user_id: int) -> Optional[dict]:
     """discord_user_id で親ユーザーだけを検索する"""
     for u in load_all_parents():
-        if int(u.get("discord_user_id", -1)) == int(discord_user_id):
+        if _safe_int(u.get("discord_user_id"), -1) == int(discord_user_id):
             return u
     return None
 
@@ -81,9 +116,9 @@ def get_parent_ids() -> set[int]:
     """親ユーザーの Discord ID 集合を返す。users/parents/*.json から収集する"""
     ids: set[int] = set()
     for p in load_all_parents():
-        uid = p.get("discord_user_id")
-        if uid:
-            ids.add(int(uid))
+        uid = _safe_int(p.get("discord_user_id"))
+        if uid is not None:
+            ids.add(uid)
     return ids
 
 def get_discord_id_conflicts() -> list[dict]:
@@ -92,14 +127,14 @@ def get_discord_id_conflicts() -> list[dict]:
     children = load_all_users()
     parents = load_all_parents()
     for child in children:
-        child_id = child.get("discord_user_id")
-        if not child_id:
+        child_id = _safe_int(child.get("discord_user_id"))
+        if child_id is None:
             continue
         for parent in parents:
-            parent_id = parent.get("discord_user_id")
-            if parent_id and int(child_id) == int(parent_id):
+            parent_id = _safe_int(parent.get("discord_user_id"))
+            if parent_id is not None and child_id == parent_id:
                 conflicts.append({
-                    "discord_user_id": int(child_id),
+                    "discord_user_id": child_id,
                     "child_name": str(child.get("name", "")),
                     "parent_name": str(parent.get("name", "")),
                 })
@@ -121,7 +156,7 @@ def get_allow_channel_ids() -> set[int] | None:
     if raw_list is None:
         pass
     elif isinstance(raw_list, list):
-        return {int(x) for x in raw_list}
+        return {value for value in (_safe_int(x) for x in raw_list) if value is not None}
     elif isinstance(raw_list, str) and not raw_list.strip():
         return None
 
@@ -129,7 +164,7 @@ def get_allow_channel_ids() -> set[int] | None:
     if not raw:
         return None
 
-    return {int(x.strip()) for x in raw.split(",") if x.strip()}
+    return {value for value in (_safe_int(x.strip()) for x in raw.split(",") if x.strip()) if value is not None}
 
 def get_gemini_model() -> str:
     setting = load_setting()
@@ -152,9 +187,9 @@ def get_allowance_reminder_setting() -> dict:
     if channel_id in ("", None):
         channel_id = None
     elif channel_id is not None:
-        channel_id = int(channel_id)
+        channel_id = _safe_int(channel_id)
 
-    payday_day = int(rem.get("payday_day", 1))
+    payday_day = _safe_int(rem.get("payday_day"), 1) or 1
     payday_day = min(31, max(1, payday_day))
 
     notify_time = str(rem.get("notify_time", "20:00")).strip()
@@ -202,16 +237,19 @@ def get_wallet_audit_setting() -> dict:
     if channel_id in ("", None):
         channel_id = None
     elif channel_id is not None:
-        channel_id = int(channel_id)
+        channel_id = _safe_int(channel_id)
 
-    check_day = int(audit.get("check_day", 1))
+    check_day = _safe_int(audit.get("check_day"), 1) or 1
     check_day = min(31, max(1, check_day))
 
     check_time = str(audit.get("check_time", "20:00")).strip()
     if not re.match(r"^\d{2}:\d{2}$", check_time):
         check_time = "20:00"
 
-    penalty_rate = float(audit.get("penalty_rate", 1.0))
+    try:
+        penalty_rate = float(audit.get("penalty_rate", 1.0))
+    except (TypeError, ValueError):
+        penalty_rate = 1.0
     if penalty_rate < 0:
         penalty_rate = 0.0
 
@@ -272,7 +310,7 @@ def get_monthly_summary_setting() -> dict:
     if channel_id in ("", None):
         channel_id = None
     elif channel_id is not None:
-        channel_id = int(channel_id)
+        channel_id = _safe_int(channel_id)
 
     send_time = str(ms.get("send_time", "09:00")).strip()
     if not re.match(r"^\d{2}:\d{2}$", send_time):
@@ -300,9 +338,9 @@ def get_low_balance_alert_setting() -> dict:
     if channel_id in ("", None):
         channel_id = None
     elif channel_id is not None:
-        channel_id = int(channel_id)
+        channel_id = _safe_int(channel_id)
 
-    threshold = int(alert.get("threshold", 500))
+    threshold = _safe_int(alert.get("threshold"), 500) or 500
     if threshold < 0:
         threshold = 0
 
@@ -327,7 +365,7 @@ def get_pocket_journal_reminder_setting() -> dict:
     enabled = bool(pjr.get("enabled", False))
 
     # 0〜6 の範囲にクランプする
-    day_of_week = int(pjr.get("day_of_week", 0))
+    day_of_week = _safe_int(pjr.get("day_of_week"), 0) or 0
     day_of_week = max(0, min(6, day_of_week))
 
     notify_time = str(pjr.get("notify_time", "19:00")).strip()

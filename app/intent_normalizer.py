@@ -70,6 +70,8 @@ _INTENT_CONFIRM_QUESTIONS = {
     "personality_change": "話し方を変えたいってこと？",
     "allowance_request": "お小遣いの相談をしたいってこと？",
 }
+_ALLOWED_INTENTS = set(_INTENT_CONFIRM_QUESTIONS) | {"none"}
+_ALLOWED_CONFIDENCE = {"high", "low"}
 
 # 「はい」系の返答キーワード
 _YES_KEYWORDS = {
@@ -282,12 +284,20 @@ async def normalize_intent(text: str, gemini_service) -> dict:
         if m:
             result = json.loads(m.group())
             if isinstance(result, dict) and result.get("intent"):
+                intent = str(result["intent"]).strip()
+                if intent not in _ALLOWED_INTENTS:
+                    return fallback if fallback is not None else {"intent": "none", "entities": {}, "confidence": "high"}
                 # entities が None の場合は空 dict に正規化する
                 entities = result.get("entities") or {}
+                if not isinstance(entities, dict):
+                    return fallback if fallback is not None else {"intent": "none", "entities": {}, "confidence": "high"}
+                confidence = str(result.get("confidence", "high")).strip()
+                if confidence not in _ALLOWED_CONFIDENCE:
+                    confidence = "low" if fallback is None else str(fallback.get("confidence", "high"))
                 normalized = {
-                    "intent": str(result["intent"]).strip(),
+                    "intent": intent,
                     "entities": entities,
-                    "confidence": str(result.get("confidence", "high")).strip(),
+                    "confidence": confidence,
                 }
                 strict_fallback_intents = {"assessment_history", "ledger_history", "child_review"}
                 if fallback is not None and fallback["intent"] in strict_fallback_intents and normalized["intent"] != fallback["intent"]:
