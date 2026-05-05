@@ -58,7 +58,7 @@ def load_setting() -> dict:
 def load_all_users() -> list[dict]:
     """子供ユーザー一覧を返す。users/*.json を対象とし parents/ サブディレクトリは除外する"""
     users = []
-    for p in USERS_DIR.glob("*.json"):
+    for p in sorted(USERS_DIR.glob("*.json"), key=lambda path: path.name):
         # .example.json はサンプルファイルのため実ユーザーとして読み込まない
         if p.name.endswith(".example.json"):
             continue
@@ -72,7 +72,7 @@ def load_all_parents() -> list[dict]:
     parents = []
     if not PARENTS_DIR.exists():
         return parents
-    for p in PARENTS_DIR.glob("*.json"):
+    for p in sorted(PARENTS_DIR.glob("*.json"), key=lambda path: path.name):
         # .example.json はサンプルファイルのため除外する
         if p.name.endswith(".example.json"):
             continue

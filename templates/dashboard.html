@@ -3,21 +3,160 @@
 {% block content %}
 <h2 style="margin-bottom:20px; color:#444;">ダッシュボード</h2>
 
-{% if flash_msg %}
-<div class="alert alert-success" style="margin-bottom:16px;">✅ {{ flash_msg }}</div>
-{% endif %}
-{% if flash_error %}
-<div class="alert alert-error" style="margin-bottom:16px;">❌ {{ flash_error }}</div>
+{% if flash_msg or flash_error %}
+<div class="toast-region" aria-live="polite" aria-atomic="true">
+  {% if flash_msg %}
+  <div class="toast toast-success" role="status" data-dashboard-toast>
+    <div class="toast-label">OK</div>
+    <div class="toast-message">{{ flash_msg }}</div>
+    <button type="button" class="toast-close" data-toast-close aria-label="通知を閉じる">閉じる</button>
+  </div>
+  {% endif %}
+  {% if flash_error %}
+  <div class="toast toast-error" role="alert" data-dashboard-toast>
+    <div class="toast-label">ERROR</div>
+    <div class="toast-message">{{ flash_error }}</div>
+    <button type="button" class="toast-close" data-toast-close aria-label="通知を閉じる">閉じる</button>
+  </div>
+  {% endif %}
+</div>
 {% endif %}
 
 {% if is_admin %}
+{% set parent_forms = parent_settings|default([]) %}
+<style>
+  .settings-open-button { padding: 5px 12px; font-size: 0.85rem; white-space: nowrap; }
+  .user-order-handle {
+    display: inline-flex;
+    width: 30px;
+    height: 30px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid #d8dce8;
+    border-radius: 6px;
+    background: #f7f8fb;
+    color: #555;
+    cursor: grab;
+    font-size: 1rem;
+    line-height: 1;
+    user-select: none;
+    touch-action: none;
+  }
+  .user-order-handle:active { cursor: grabbing; }
+  .user-order-handle:focus-visible { outline: 2px solid #4f63d8; outline-offset: 2px; }
+  body.user-order-drag-active,
+  body.user-order-drag-active * { cursor: grabbing !important; }
+  tr.user-order-dragging { opacity: 0.48; }
+  tr.user-order-drag-over td { background: #eef2ff; }
+  .user-order-toolbar { display:flex; justify-content:flex-end; margin-bottom:10px; }
+  .user-order-save { padding:6px 12px; font-size:0.85rem; }
+  .user-order-save:disabled { cursor: default; opacity: 0.55; }
+  .dashboard-table-wrap {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .dashboard-user-table { min-width: 1120px; }
+  .settings-modal[hidden] { display: none; }
+  .settings-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(34, 39, 52, 0.48);
+  }
+  .settings-modal--confirm { z-index: 1100; }
+  .settings-modal__panel {
+    width: min(860px, calc(100vw - 32px));
+    max-height: calc(100vh - 40px);
+    overflow: auto;
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 18px 56px rgba(20, 24, 35, 0.28);
+  }
+  .settings-modal__panel--confirm { width: min(430px, calc(100vw - 32px)); }
+  .settings-modal__header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 18px 20px 14px;
+    background: #fff;
+    border-bottom: 1px solid #eee;
+  }
+  .settings-modal__header h3 { margin: 0; color: #333; font-size: 1rem; }
+  .settings-modal__body { padding: 18px 20px; }
+  .settings-modal__footer {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 14px 20px;
+    background: #fff;
+    border-top: 1px solid #eee;
+  }
+  .settings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .settings-grid--keywords { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .settings-field label {
+    display: block;
+    margin-bottom: 4px;
+    color: #666;
+    font-size: 0.82rem;
+  }
+  .settings-field input,
+  .settings-field select,
+  .settings-field textarea {
+    width: 100%;
+    padding: 7px 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 0.9rem;
+  }
+  .settings-field textarea { resize: vertical; }
+  .settings-note {
+    margin-bottom: 12px;
+    color: #777;
+    font-size: 0.82rem;
+    line-height: 1.55;
+  }
+  .settings-confirm-text { color: #555; line-height: 1.65; font-size: 0.92rem; }
+  body.settings-modal-open { overflow: hidden; }
+  @media (max-width: 640px) {
+    .dashboard-table-wrap {
+      margin: 0 -12px;
+      padding: 0 12px 4px;
+    }
+    .user-order-toolbar { justify-content: stretch; }
+    .user-order-save { width: 100%; }
+    .settings-modal { align-items: stretch; padding: 10px; }
+    .settings-modal__panel { width: 100%; max-height: calc(100vh - 20px); }
+    .settings-modal__footer { flex-wrap: wrap; }
+    .settings-modal__footer .btn { flex: 1 1 130px; }
+  }
+</style>
 <!-- 管理者向け全体概要 -->
 <div class="card">
-  <h2>👨‍👩‍👧‍👦 全ユーザー残高一覧</h2>
-  {% if users %}
-  <table>
+  <h2>👨‍👩‍👧‍👦 全ユーザー一覧</h2>
+  {% if users or parent_forms %}
+  <form id="user-order-form" method="post" action="/compass-bot/op/user_order" data-user-order-form>
+  <input id="user-order-input" type="hidden" name="user_order" value="{{ dashboard_user_order_json|default('[]')|e }}">
+  <div class="user-order-toolbar">
+    <button type="submit" class="btn btn-primary user-order-save" data-user-order-save disabled>並び順を保存</button>
+  </div>
+  <div class="dashboard-table-wrap">
+  <table class="dashboard-user-table">
     <thead>
       <tr>
+        <th>移動</th>
+        <th>種別</th>
         <th>名前</th>
         <th>月額</th>
         <th>残高</th>
@@ -25,61 +164,564 @@
         <th>最終支出日</th>
         <th>残高報告</th>
         <th>目標貯金</th>
+        <th>操作</th>
       </tr>
     </thead>
-    <tbody>
-    {% for u in users %}
-      <tr>
-        <td>{{ u.name }}</td>
+    <tbody data-user-order-list>
+    {% for row in dashboard_user_rows|default([]) %}
+      <tr data-user-order-row data-order-key="{{ row.dashboard_order_key }}">
         <td>
-          {% if u.fixed_allowance is defined and u.fixed_allowance is not none %}
-            {{ "{:,}".format(u.fixed_allowance|int) }}円
-          {% else %}
-            <span style="color:#aaa;">—</span>
-          {% endif %}
+          <span class="user-order-handle" data-drag-handle tabindex="0" title="ドラッグして並び替え" aria-label="ドラッグまたは上下キーで並び替え">↕</span>
         </td>
-        <td style="font-weight:600;">
-          {% if u.balance is not none %}
-            {{ "{:,}".format(u.balance) }}円
-            {% if u.low_balance %}
-              <span class="badge badge-danger">低残高</span>
+        {% if row.dashboard_user_type == "child" %}
+          <td><span class="badge badge-ok">子ども</span></td>
+          <td>{{ row.name }}</td>
+          <td>
+            {% if row.fixed_allowance is defined and row.fixed_allowance is not none %}
+              {{ "{:,}".format(row.fixed_allowance|int) }}円
+            {% else %}
+              <span style="color:#aaa;">—</span>
             {% endif %}
-          {% else %}
-            <span style="color:#aaa;">未設定</span>
-          {% endif %}
-        </td>
-        <td>{{ "{:,}".format(u.month_spending) }}円（{{ u.month_count }}件）</td>
-        <td>{{ u.last_spent_date or "—" }}</td>
-        <td>
-          {% if u.audit_reported %}
-            <span class="badge badge-ok">報告済</span>
-          {% else %}
-            <span class="badge badge-warn">未報告</span>
-          {% endif %}
-        </td>
-        <td>
-          {% if u.goals %}
-            {% for g in u.goals %}
-              <div style="margin-bottom:6px;">
-                <div style="font-size:0.85rem; margin-bottom:2px;">{{ g.title }}（{{ "{:,}".format(g.target) }}円）</div>
-                <div class="progress-bar-bg">
-                  <div class="progress-bar-fill" style="width:{{ [g.pct, 100]|min }}%;"></div>
+          </td>
+          <td style="font-weight:600;">
+            {% if row.balance is not none %}
+              {{ "{:,}".format(row.balance) }}円
+              {% if row.low_balance %}
+                <span class="badge badge-danger">低残高</span>
+              {% endif %}
+            {% else %}
+              <span style="color:#aaa;">未設定</span>
+            {% endif %}
+          </td>
+          <td>{{ "{:,}".format(row.month_spending) }}円（{{ row.month_count }}件）</td>
+          <td>{{ row.last_spent_date or "—" }}</td>
+          <td>
+            {% if row.audit_reported %}
+              <span class="badge badge-ok">報告済</span>
+            {% else %}
+              <span class="badge badge-warn">未報告</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if row.goals %}
+              {% for g in row.goals %}
+                <div style="margin-bottom:6px;">
+                  <div style="font-size:0.85rem; margin-bottom:2px;">{{ g.title }}（{{ "{:,}".format(g.target) }}円）</div>
+                  <div class="progress-bar-bg">
+                    <div class="progress-bar-fill" style="width:{{ [g.pct, 100]|min }}%;"></div>
+                  </div>
+                  <div style="font-size:0.75rem; color:#888; text-align:right;">{{ g.pct }}%</div>
                 </div>
-                <div style="font-size:0.75rem; color:#888; text-align:right;">{{ g.pct }}%</div>
-              </div>
-            {% endfor %}
-          {% else %}
-            <span style="color:#aaa; font-size:0.85rem;">なし</span>
-          {% endif %}
+              {% endfor %}
+            {% else %}
+              <span style="color:#aaa; font-size:0.85rem;">なし</span>
+            {% endif %}
+          </td>
+        {% else %}
+          <td><span class="badge badge-warn">親</span></td>
+          <td>{{ row.name }}</td>
+          <td><span style="color:#aaa;">—</span></td>
+          <td><span style="color:#aaa;">—</span></td>
+          <td><span style="color:#aaa;">—</span></td>
+          <td><span style="color:#aaa;">—</span></td>
+          <td><span style="color:#aaa;">—</span></td>
+          <td><span style="color:#aaa; font-size:0.85rem;">なし</span></td>
+        {% endif %}
+        <td>
+          <button type="button" class="btn btn-secondary settings-open-button"
+                  data-settings-open="{{ row.settings_modal_id }}">設定</button>
         </td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
+  </div>
+  </form>
+  {% for u in users %}
+    {% set s = u.settings_form %}
+    {% set child_index = loop.index %}
+    <div id="{{ u.settings_modal_id|default('child-settings-modal-' ~ child_index) }}" class="settings-modal" role="dialog" aria-modal="true"
+         aria-labelledby="child-settings-title-{{ child_index }}" hidden data-settings-modal>
+      <div class="settings-modal__panel" role="document">
+        <form method="post" action="/compass-bot/op/user_settings" data-settings-form
+              data-original-name="{{ s.name }}" data-original-discord-id="{{ s.discord_user_id }}">
+          <input type="hidden" name="user_type" value="child">
+          <input type="hidden" name="original_name" value="{{ s.name }}">
+          <div class="settings-modal__header">
+            <h3 id="child-settings-title-{{ child_index }}">ユーザー設定: {{ u.name }}</h3>
+          </div>
+          <div class="settings-modal__body">
+            <div class="settings-note">名前またはDiscord IDを変更して保存する場合は、関連データの移行確認を表示します。</div>
+            <div class="settings-grid">
+              <div class="settings-field">
+                <label for="child-name-{{ child_index }}">名前</label>
+                <input id="child-name-{{ child_index }}" type="text" name="name" value="{{ s.name }}" required maxlength="60">
+              </div>
+              <div class="settings-field">
+                <label for="child-discord-id-{{ child_index }}">Discord ID</label>
+                <input id="child-discord-id-{{ child_index }}" type="text" inputmode="numeric" pattern="[0-9]{5,25}"
+                       name="discord_user_id" value="{{ s.discord_user_id }}" required>
+              </div>
+              <div class="settings-field">
+                <label for="child-age-{{ child_index }}">年齢</label>
+                <input id="child-age-{{ child_index }}" type="number" name="age" min="0" max="120" value="{{ s.age }}" required>
+              </div>
+              <div class="settings-field">
+                <label for="child-gender-{{ child_index }}">性別</label>
+                <select id="child-gender-{{ child_index }}" name="gender">
+                  {% for choice in user_gender_choices|default([]) %}
+                    <option value="{{ choice.value }}" {% if s.gender == choice.value %}selected{% endif %}>{{ choice.label }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="settings-field">
+                <label for="child-personality-{{ child_index }}">話し方</label>
+                <select id="child-personality-{{ child_index }}" name="bot_personality">
+                  {% for choice in bot_personality_choices|default([]) %}
+                    <option value="{{ choice.value }}" {% if s.bot_personality == choice.value %}selected{% endif %}>{{ choice.label }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+
+            <div class="settings-grid">
+              <div class="settings-field">
+                <label for="child-fixed-allowance-{{ child_index }}">月額お小遣い</label>
+                <input id="child-fixed-allowance-{{ child_index }}" type="number" name="fixed_allowance" min="0"
+                       value="{{ s.fixed_allowance }}" required>
+              </div>
+              <div class="settings-field">
+                <label for="child-temporary-max-{{ child_index }}">臨時上限</label>
+                <input id="child-temporary-max-{{ child_index }}" type="number" name="temporary_max" min="0"
+                       value="{{ s.temporary_max }}" required>
+              </div>
+              <div class="settings-field">
+                <label for="child-fixed-increase-cap-{{ child_index }}">固定増額上限</label>
+                <input id="child-fixed-increase-cap-{{ child_index }}" type="number" name="fixed_increase_cap" min="0"
+                       value="{{ s.fixed_increase_cap }}" required>
+              </div>
+              <div class="settings-field">
+                <label for="child-penalty-cap-{{ child_index }}">残高確認差額上限</label>
+                <input id="child-penalty-cap-{{ child_index }}" type="number" name="penalty_cap" min="0" value="{{ s.penalty_cap }}">
+              </div>
+            </div>
+
+            <div class="settings-grid settings-grid--keywords">
+              {% for bucket in user_keyword_buckets|default([]) %}
+                <div class="settings-field">
+                  <label for="child-keywords-{{ bucket.key }}-{{ child_index }}">{{ bucket.label }}キーワード</label>
+                  <textarea id="child-keywords-{{ bucket.key }}-{{ child_index }}" name="keywords_{{ bucket.key }}" rows="4">{{ s.keywords[bucket.key] }}</textarea>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="settings-modal__footer">
+            <button type="button" class="btn btn-secondary" data-settings-cancel>キャンセル</button>
+            <button type="submit" class="btn btn-primary">設定を保存</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  {% endfor %}
+  {% for p in parent_forms %}
+    <div id="{{ p.settings_modal_id|default('parent-settings-modal-' ~ loop.index) }}" class="settings-modal" role="dialog" aria-modal="true"
+         aria-labelledby="parent-settings-title-{{ loop.index }}" hidden data-settings-modal>
+      <div class="settings-modal__panel" role="document">
+        <form method="post" action="/compass-bot/op/user_settings" data-settings-form
+              data-original-name="{{ p.name }}" data-original-discord-id="{{ p.discord_user_id }}">
+          <input type="hidden" name="user_type" value="parent">
+          <input type="hidden" name="original_name" value="{{ p.name }}">
+          <div class="settings-modal__header">
+            <h3 id="parent-settings-title-{{ loop.index }}">親ユーザー設定: {{ p.name }}</h3>
+          </div>
+          <div class="settings-modal__body">
+            <div class="settings-note">名前またはDiscord IDを変更して保存する場合は、関連データの移行確認を表示します。</div>
+            <div class="settings-grid">
+              <div class="settings-field">
+                <label for="parent-name-{{ loop.index }}">名前</label>
+                <input id="parent-name-{{ loop.index }}" type="text" name="name" value="{{ p.name }}" required maxlength="60">
+              </div>
+              <div class="settings-field">
+                <label for="parent-discord-id-{{ loop.index }}">Discord ID</label>
+                <input id="parent-discord-id-{{ loop.index }}" type="text" inputmode="numeric" pattern="[0-9]{5,25}"
+                       name="discord_user_id" value="{{ p.discord_user_id }}" required>
+              </div>
+            </div>
+          </div>
+          <div class="settings-modal__footer">
+            <button type="button" class="btn btn-secondary" data-settings-cancel>キャンセル</button>
+            <button type="submit" class="btn btn-primary">設定を保存</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  {% endfor %}
   {% else %}
     <div style="color:#aaa; text-align:center; padding:20px;">ユーザーデータがありません</div>
   {% endif %}
 </div>
+
+{% if users or parent_forms %}
+<div id="settings-discard-confirm" class="settings-modal settings-modal--confirm" role="dialog" aria-modal="true"
+     aria-labelledby="settings-discard-title" hidden data-settings-confirm>
+  <div class="settings-modal__panel settings-modal__panel--confirm" role="document">
+    <div class="settings-modal__header">
+      <h3 id="settings-discard-title">変更を破棄して閉じますか</h3>
+    </div>
+    <div class="settings-modal__body">
+      <div class="settings-confirm-text">未保存の変更があります。破棄して閉じる場合だけ確定してください。</div>
+    </div>
+    <div class="settings-modal__footer">
+      <button type="button" class="btn btn-secondary" data-settings-confirm-cancel>戻る</button>
+      <button type="button" class="btn btn-primary" data-settings-discard-confirm>破棄して閉じる</button>
+    </div>
+  </div>
+</div>
+
+<div id="settings-critical-confirm" class="settings-modal settings-modal--confirm" role="dialog" aria-modal="true"
+     aria-labelledby="settings-critical-title" hidden data-settings-confirm>
+  <div class="settings-modal__panel settings-modal__panel--confirm" role="document">
+    <div class="settings-modal__header">
+      <h3 id="settings-critical-title">重要項目を保存しますか</h3>
+    </div>
+    <div class="settings-modal__body">
+      <div class="settings-confirm-text">名前またはDiscord IDを変更します。関連する設定名や履歴キーの移行を行います。</div>
+    </div>
+    <div class="settings-modal__footer">
+      <button type="button" class="btn btn-secondary" data-settings-confirm-cancel>戻る</button>
+      <button type="button" class="btn btn-primary" data-settings-critical-confirm>保存する</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const body = document.body;
+    let activeModal = null;
+    let pendingCloseModal = null;
+    let pendingSubmitForm = null;
+    let lastFocused = null;
+    let userOrderChanged = false;
+    let allowPageUnload = false;
+    let activeUserOrderDrag = null;
+
+    function serializeForm(form) {
+      return JSON.stringify(Array.from(new FormData(form).entries()));
+    }
+
+    function visibleConfirmModal() {
+      return Array.from(document.querySelectorAll('[data-settings-confirm]')).find(function (modal) {
+        return !modal.hidden;
+      });
+    }
+
+    function firstFocusable(root) {
+      return root.querySelector('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    }
+
+    function setBodyOpen() {
+      const hasVisibleModal = Array.from(document.querySelectorAll('[data-settings-modal], [data-settings-confirm]')).some(function (modal) {
+        return !modal.hidden;
+      });
+      body.classList.toggle('settings-modal-open', hasVisibleModal);
+    }
+
+    function openConfirm(modal) {
+      if (!modal) return;
+      modal.hidden = false;
+      setBodyOpen();
+      const cancelButton = modal.querySelector('[data-settings-confirm-cancel]');
+      const focusTarget = cancelButton || firstFocusable(modal);
+      if (focusTarget) focusTarget.focus();
+    }
+
+    function closeConfirm(modal) {
+      if (!modal) return;
+      const isCriticalConfirm = modal.id === 'settings-critical-confirm';
+      const isDiscardConfirm = modal.id === 'settings-discard-confirm';
+      modal.hidden = true;
+      if (isCriticalConfirm) pendingSubmitForm = null;
+      if (isDiscardConfirm) pendingCloseModal = null;
+      setBodyOpen();
+      const focusTarget = activeModal ? firstFocusable(activeModal) : null;
+      if (focusTarget) focusTarget.focus();
+    }
+
+    function isDirty(form) {
+      return form && form.dataset.initialState !== serializeForm(form);
+    }
+
+    function hasUnsavedChanges() {
+      if (userOrderChanged) return true;
+      return Array.from(document.querySelectorAll('[data-settings-form]')).some(function (form) {
+        return isDirty(form);
+      });
+    }
+
+    function currentUserOrderValue() {
+      const rows = Array.from(document.querySelectorAll('[data-user-order-row]'));
+      return JSON.stringify(rows.map(function (row) { return row.dataset.orderKey || ''; }));
+    }
+
+    function syncUserOrder(markDirty) {
+      const orderInput = document.getElementById('user-order-input');
+      if (!orderInput) return;
+      orderInput.value = currentUserOrderValue();
+      if (markDirty) {
+        userOrderChanged = true;
+        const saveButton = document.querySelector('[data-user-order-save]');
+        if (saveButton) saveButton.disabled = false;
+      }
+    }
+
+    function rowAfterPointer(list, y) {
+      const rows = Array.from(list.querySelectorAll('[data-user-order-row]:not(.user-order-dragging)'));
+      return rows.reduce(function (closest, row) {
+        const box = row.getBoundingClientRect();
+        const offset = y - box.top - box.height / 2;
+        if (offset < 0 && offset > closest.offset) {
+          return {offset: offset, element: row};
+        }
+        return closest;
+      }, {offset: Number.NEGATIVE_INFINITY, element: null}).element;
+    }
+
+    function clearUserOrderDragOver(list) {
+      const root = list || document;
+      root.querySelectorAll('.user-order-drag-over').forEach(function (item) {
+        item.classList.remove('user-order-drag-over');
+      });
+    }
+
+    function moveUserOrderRowAtPointer(row, list, y) {
+      const afterRow = rowAfterPointer(list, y);
+      clearUserOrderDragOver(list);
+      if (afterRow) {
+        afterRow.classList.add('user-order-drag-over');
+        list.insertBefore(row, afterRow);
+      } else {
+        list.appendChild(row);
+      }
+    }
+
+    function addUserOrderDragListeners() {
+      document.addEventListener('pointermove', onUserOrderPointerMove, {passive: false});
+      document.addEventListener('pointerup', onUserOrderPointerEnd);
+      document.addEventListener('pointercancel', onUserOrderPointerEnd);
+      window.addEventListener('blur', finishUserOrderDrag);
+    }
+
+    function removeUserOrderDragListeners() {
+      document.removeEventListener('pointermove', onUserOrderPointerMove);
+      document.removeEventListener('pointerup', onUserOrderPointerEnd);
+      document.removeEventListener('pointercancel', onUserOrderPointerEnd);
+      window.removeEventListener('blur', finishUserOrderDrag);
+    }
+
+    function finishUserOrderDrag(event) {
+      if (!activeUserOrderDrag) return;
+      const drag = activeUserOrderDrag;
+      if (!event || event.pointerId === undefined || event.pointerId === drag.pointerId) {
+        activeUserOrderDrag = null;
+        drag.row.classList.remove('user-order-dragging');
+        body.classList.remove('user-order-drag-active');
+        clearUserOrderDragOver(drag.list);
+        removeUserOrderDragListeners();
+        try {
+          if (drag.handle.releasePointerCapture) drag.handle.releasePointerCapture(drag.pointerId);
+        } catch (_error) {
+          // Pointer capture may already be released by the browser.
+        }
+        syncUserOrder(currentUserOrderValue() !== drag.initialOrder);
+      }
+    }
+
+    function onUserOrderPointerMove(event) {
+      if (!activeUserOrderDrag || event.pointerId !== activeUserOrderDrag.pointerId) return;
+      if (event.pointerType === 'mouse' && event.buttons === 0) {
+        finishUserOrderDrag(event);
+        return;
+      }
+      event.preventDefault();
+      moveUserOrderRowAtPointer(activeUserOrderDrag.row, activeUserOrderDrag.list, event.clientY);
+    }
+
+    function onUserOrderPointerEnd(event) {
+      if (!activeUserOrderDrag || event.pointerId !== activeUserOrderDrag.pointerId) return;
+      event.preventDefault();
+      finishUserOrderDrag(event);
+    }
+
+    function moveUserOrderRowByKeyboard(row, direction) {
+      const list = row ? row.parentElement : null;
+      if (!list) return;
+      if (direction < 0) {
+        const previous = row.previousElementSibling;
+        if (!previous) return;
+        list.insertBefore(row, previous);
+      } else {
+        const next = row.nextElementSibling;
+        if (!next) return;
+        list.insertBefore(next, row);
+      }
+      syncUserOrder(true);
+      const handle = row.querySelector('[data-drag-handle]');
+      if (handle) handle.focus();
+    }
+
+    function resetForm(form) {
+      if (!form) return;
+      form.reset();
+      form.dataset.criticalConfirmed = '';
+    }
+
+    function closeModal(modal, restoreFocus) {
+      if (!modal) return;
+      modal.hidden = true;
+      if (activeModal === modal) activeModal = null;
+      setBodyOpen();
+      if (restoreFocus && lastFocused && typeof lastFocused.focus === 'function') {
+        lastFocused.focus();
+      }
+    }
+
+    function requestCloseModal(modal) {
+      const form = modal ? modal.querySelector('[data-settings-form]') : null;
+      if (form && isDirty(form)) {
+        pendingCloseModal = modal;
+        openConfirm(document.getElementById('settings-discard-confirm'));
+        return;
+      }
+      closeModal(modal, true);
+    }
+
+    document.querySelectorAll('[data-settings-form]').forEach(function (form) {
+      form.dataset.initialState = serializeForm(form);
+      form.addEventListener('submit', function (event) {
+        const nameField = form.elements.name;
+        const discordField = form.elements.discord_user_id;
+        const nameChanged = nameField && nameField.value.trim() !== (form.dataset.originalName || '');
+        const discordChanged = discordField && discordField.value.trim() !== (form.dataset.originalDiscordId || '');
+        if ((nameChanged || discordChanged) && form.dataset.criticalConfirmed !== 'true') {
+          event.preventDefault();
+          pendingSubmitForm = form;
+          openConfirm(document.getElementById('settings-critical-confirm'));
+          return;
+        }
+        allowPageUnload = true;
+      });
+    });
+
+    document.querySelectorAll('[data-drag-handle]').forEach(function (handle) {
+      handle.addEventListener('pointerdown', function (event) {
+        if (event.button !== 0) return;
+        finishUserOrderDrag();
+        const row = handle.closest('[data-user-order-row]');
+        const list = row ? row.parentElement : null;
+        if (!row || !list) return;
+        activeUserOrderDrag = {
+          handle: handle,
+          row: row,
+          list: list,
+          pointerId: event.pointerId,
+          initialOrder: currentUserOrderValue(),
+        };
+        row.classList.add('user-order-dragging');
+        body.classList.add('user-order-drag-active');
+        if (handle.setPointerCapture) handle.setPointerCapture(event.pointerId);
+        addUserOrderDragListeners();
+        event.preventDefault();
+      });
+
+      handle.addEventListener('keydown', function (event) {
+        if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+        const row = handle.closest('[data-user-order-row]');
+        event.preventDefault();
+        moveUserOrderRowByKeyboard(row, event.key === 'ArrowUp' ? -1 : 1);
+      });
+    });
+
+    const userOrderForm = document.querySelector('[data-user-order-form]');
+    if (userOrderForm) {
+      userOrderForm.addEventListener('submit', function () {
+        syncUserOrder(false);
+        allowPageUnload = true;
+      });
+      syncUserOrder(false);
+    }
+
+    document.querySelectorAll('[data-settings-open]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        const modal = document.getElementById(button.dataset.settingsOpen);
+        if (!modal) return;
+        lastFocused = button;
+        activeModal = modal;
+        modal.hidden = false;
+        setBodyOpen();
+        const focusTarget = firstFocusable(modal);
+        if (focusTarget) focusTarget.focus();
+      });
+    });
+
+    document.querySelectorAll('[data-settings-cancel]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        requestCloseModal(button.closest('[data-settings-modal]'));
+      });
+    });
+
+    document.querySelectorAll('[data-settings-confirm-cancel]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        closeConfirm(button.closest('[data-settings-confirm]'));
+      });
+    });
+
+    const discardConfirmButton = document.querySelector('[data-settings-discard-confirm]');
+    if (discardConfirmButton) discardConfirmButton.addEventListener('click', function () {
+      const modal = pendingCloseModal;
+      const form = modal ? modal.querySelector('[data-settings-form]') : null;
+      resetForm(form);
+      closeConfirm(document.getElementById('settings-discard-confirm'));
+      pendingCloseModal = null;
+      closeModal(modal, true);
+    });
+
+    const criticalConfirmButton = document.querySelector('[data-settings-critical-confirm]');
+    if (criticalConfirmButton) criticalConfirmButton.addEventListener('click', function () {
+      const form = pendingSubmitForm;
+      if (!form) return;
+      form.dataset.criticalConfirmed = 'true';
+      document.getElementById('settings-critical-confirm').hidden = true;
+      setBodyOpen();
+      pendingSubmitForm = null;
+      if (form.requestSubmit) {
+        form.requestSubmit();
+      } else {
+        form.submit();
+      }
+    });
+
+    window.addEventListener('beforeunload', function (event) {
+      if (allowPageUnload || !hasUnsavedChanges()) return;
+      event.preventDefault();
+      event.returnValue = '';
+    });
+
+    document.addEventListener('keydown', function (event) {
+      if (event.key !== 'Escape') return;
+      const confirmModal = visibleConfirmModal();
+      if (confirmModal) {
+        event.preventDefault();
+        closeConfirm(confirmModal);
+        return;
+      }
+      if (activeModal && !activeModal.hidden) {
+        event.preventDefault();
+        requestCloseModal(activeModal);
+      }
+    });
+  })();
+</script>
+{% endif %}
 
 <!-- 今週の会話カード / AIフォロー方針 -->
 <div class="card">
@@ -293,46 +935,6 @@
     </form>
   </div>
 
-  <!-- 月額変更 -->
-  <div style="margin-bottom:24px; padding-top:16px; border-top:1px solid #eee;">
-    <h3 style="font-size:1rem; margin-bottom:6px; color:#555;">📌 月額変更（固定お小遣い）</h3>
-    <p style="font-size:0.82rem; color:#888; margin:0 0 10px;">毎月の固定お小遣い額を変更します。残高は自動では増減しません。</p>
-    <form method="post" action="/compass-bot/op/fixed_allowance" style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
-      <div>
-        <label style="font-size:0.85rem; display:block; margin-bottom:4px;">対象ユーザー</label>
-        <select id="fixed-allowance-target" name="target" required style="padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem;">
-          {% for u in users %}
-            <option value="{{ u.name }}" data-fixed="{{ u.fixed_allowance if u.fixed_allowance is defined and u.fixed_allowance is not none else '' }}">
-              {{ u.name }}（現在 {% if u.fixed_allowance is defined and u.fixed_allowance is not none %}{{ "{:,}".format(u.fixed_allowance|int) }}円{% else %}—{% endif %}）
-            </option>
-          {% endfor %}
-        </select>
-      </div>
-      <div>
-        <label style="font-size:0.85rem; display:block; margin-bottom:4px;">新しい月額（円）</label>
-        <input id="fixed-allowance-amount" type="number" name="amount" min="0"
-               value="{{ users[0].fixed_allowance if users and users[0].fixed_allowance is defined and users[0].fixed_allowance is not none else '' }}"
-               placeholder="例: 800" required
-               style="padding:7px 10px; border:1px solid #ccc; border-radius:6px; font-size:0.95rem; width:140px;">
-      </div>
-      <button type="submit" class="btn btn-primary">月額を変更</button>
-    </form>
-  </div>
-
-  <script>
-    (function () {
-      const target = document.getElementById('fixed-allowance-target');
-      const amount = document.getElementById('fixed-allowance-amount');
-      if (!target || !amount) return;
-      const syncAmount = function () {
-        const selected = target.options[target.selectedIndex];
-        amount.value = selected ? selected.dataset.fixed || '' : '';
-      };
-      target.addEventListener('change', syncAmount);
-      syncAmount();
-    })();
-  </script>
-
   <!-- 一括支給 -->
   <div style="margin-bottom:24px; padding-top:16px; border-top:1px solid #eee;">
     <h3 style="font-size:1rem; margin-bottom:6px; color:#555;">💰 一括支給（全員の固定額）</h3>
@@ -478,5 +1080,45 @@
   {% endif %}
 </div>
 {% endif %}
+
+<script>
+  (function () {
+    function clearToastQuery() {
+      if (!window.history || !window.history.replaceState) return;
+      const url = new URL(window.location.href);
+      const hadToastQuery = url.searchParams.has('msg') || url.searchParams.has('error');
+      if (!hadToastQuery) return;
+      url.searchParams.delete('msg');
+      url.searchParams.delete('error');
+      const query = url.searchParams.toString();
+      window.history.replaceState({}, document.title, url.pathname + (query ? '?' + query : '') + url.hash);
+    }
+
+    function dismissToast(toast) {
+      if (!toast || toast.dataset.toastClosing === 'true') return;
+      toast.dataset.toastClosing = 'true';
+      toast.classList.add('toast--leaving');
+      window.setTimeout(function () {
+        toast.remove();
+      }, 200);
+    }
+
+    document.querySelectorAll('[data-dashboard-toast]').forEach(function (toast) {
+      const closeButton = toast.querySelector('[data-toast-close]');
+      if (closeButton) {
+        closeButton.addEventListener('click', function () {
+          dismissToast(toast);
+        });
+      }
+      window.setTimeout(function () {
+        dismissToast(toast);
+      }, 5000);
+    });
+
+    if (document.querySelector('[data-dashboard-toast]')) {
+      clearToastQuery();
+    }
+  })();
+</script>
 
 {% endblock %}
