@@ -176,6 +176,9 @@ def test_dashboard_template_renders_policy_form() -> None:
         users=[
             {
                 "name": "りか",
+                "dashboard_user_type": "child",
+                "dashboard_order_key": "child:りか",
+                "settings_modal_id": "child-settings-modal-1",
                 "fixed_allowance": 500,
                 "balance": 1200,
                 "low_balance": False,
@@ -211,6 +214,22 @@ def test_dashboard_template_renders_policy_form() -> None:
                     ],
                 },
                 "active_growth_plan": None,
+                "settings_form": {
+                    "name": "りか",
+                    "discord_user_id": "101",
+                    "age": 10,
+                    "gender": "female",
+                    "bot_personality": "sibling",
+                    "fixed_allowance": 500,
+                    "temporary_max": 1000,
+                    "fixed_increase_cap": 100,
+                    "penalty_cap": 50,
+                    "keywords": {
+                        "investment": "検定",
+                        "fun": "漫画",
+                        "danger": "課金",
+                    },
+                },
                 "ai_follow_policy": {
                     "enabled": True,
                     "focus_area": "income_balance",
@@ -220,19 +239,273 @@ def test_dashboard_template_renders_policy_form() -> None:
                 },
             }
         ],
+        parent_settings=[
+            {
+                "name": "親",
+                "discord_user_id": "202",
+                "dashboard_user_type": "parent",
+                "dashboard_order_key": "parent:親",
+                "settings_modal_id": "parent-settings-modal-1",
+            }
+        ],
+        dashboard_user_rows=[
+            {
+                "name": "りか",
+                "dashboard_user_type": "child",
+                "dashboard_order_key": "child:りか",
+                "settings_modal_id": "child-settings-modal-1",
+                "fixed_allowance": 500,
+                "balance": 1200,
+                "low_balance": False,
+                "month_spending": 300,
+                "month_count": 2,
+                "last_spent_date": "2026-05-01",
+                "audit_reported": True,
+                "goals": [],
+            },
+            {
+                "name": "親",
+                "dashboard_user_type": "parent",
+                "dashboard_order_key": "parent:親",
+                "settings_modal_id": "parent-settings-modal-1",
+            },
+        ],
+        dashboard_user_order_json='["child:りか","parent:親"]',
         pending_apps=[],
+        user_gender_choices=server.USER_GENDER_CHOICES,
+        bot_personality_choices=server.BOT_PERSONALITY_CHOICES,
+        user_keyword_buckets=server.USER_KEYWORD_BUCKETS,
         follow_focus_choices=server.FOLLOW_FOCUS_CHOICES,
         follow_strength_choices=server.FOLLOW_STRENGTH_CHOICES,
         follow_frequency_choices=server.FOLLOW_FREQUENCY_CHOICES,
-        flash_msg="",
+        flash_msg="保存しました",
         flash_error="",
     )
     assert "/compass-bot/op/followup_policy" in html
     assert "/compass-bot/op/learning_card_feedback" in html
     assert "/compass-bot/op/growth_plan" in html
+    assert "/compass-bot/op/user_settings" in html
+    assert "/compass-bot/op/user_order" in html
+    assert "/compass-bot/op/fixed_allowance" not in html
+    assert "月額変更（固定お小遣い）" not in html
+    assert "全ユーザー一覧" in html
+    assert "全ユーザー残高一覧" not in html
+    assert "ユーザー設定" in html
+    assert 'data-settings-open="child-settings-modal-1"' in html
+    assert 'data-settings-open="parent-settings-modal-1"' in html
+    assert 'data-order-key="child:りか"' in html
+    assert 'data-order-key="parent:親"' in html
+    assert 'data-drag-handle' in html
+    assert "ドラッグして並び替え" in html
+    assert "並び順を保存" in html
+    assert "保存しました" in html
+    assert "toast-region" in html
+    assert "data-dashboard-toast" in html
+    assert "data-toast-close" in html
+    assert "5000" in html
+    assert "clearToastQuery" in html
+    assert "searchParams.delete('msg')" in html
+    assert "searchParams.delete('error')" in html
+    assert "window.history.replaceState" in html
+    assert '<div class="alert alert-success"' not in html
+    assert "user-order-drag-active" in html
+    assert "document.addEventListener('pointerup'" in html
+    assert "window.addEventListener('blur', finishUserOrderDrag" in html
+    assert "dashboard-table-wrap" in html
+    assert "dashboard-user-table" in html
+    assert "width: min(1440px" in html
+    assert "@media (max-width: 1024px)" in html
+    assert "@media (max-width: 640px)" in html
+    assert "data-order-move" not in html
+    assert "上へ" not in html
+    assert "下へ" not in html
+    assert "beforeunload" in html
+    assert 'id="child-settings-modal-1"' in html
+    assert 'role="dialog"' in html
+    assert 'aria-modal="true"' in html
+    assert 'data-settings-form' in html
+    assert 'name="user_type" value="child"' in html
+    assert 'name="original_name" value="りか"' in html
+    assert 'data-original-discord-id="101"' in html
+    assert 'id="parent-settings-modal-1"' in html
+    assert 'name="user_type" value="parent"' in html
+    assert 'id="settings-discard-confirm"' in html
+    assert 'id="settings-critical-confirm"' in html
+    assert 'data-settings-cancel' in html
+    assert "toggleUserSettingsRow" not in html
+    assert "検定" in html
     assert "今週の会話カード" in html
     assert 'option value="income_balance" selected' in html
     assert "買う前に待つ" in html
+
+
+def test_user_settings_endpoint_updates_child_settings() -> None:
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_load_all_parents = server.load_all_parents
+    old_find_user_json_path_by_name = server.find_user_json_path_by_name
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "parent"
+
+    with tempfile.TemporaryDirectory(prefix="compass-user-settings-") as d:
+        root = Path(d)
+        user_path = root / "rika.json"
+        user_path.write_text(
+            json.dumps(
+                {
+                    "name": "りか",
+                    "discord_user_id": 101,
+                    "age": 7,
+                    "gender": "female",
+                    "fixed_allowance": 300,
+                    "temporary_max": 1000,
+                    "fixed_increase_cap": 100,
+                    "penalty_cap": 10,
+                    "keywords": {"investment": ["ダンス"], "fun": ["ゲーム"], "danger": ["課金"]},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server.load_all_users = lambda: [{"name": "りか", "discord_user_id": 101}]
+            server.load_all_parents = lambda: []
+            server.find_user_json_path_by_name = lambda name: user_path if name == "りか" else None
+
+            response = asyncio.run(
+                server.op_user_settings(
+                    session_token="token",
+                    user_type="child",
+                    original_name="りか",
+                    name="りか",
+                    discord_user_id="123456789012345678",
+                    age="9",
+                    gender="female",
+                    bot_personality="friend",
+                    fixed_allowance="800",
+                    temporary_max="2500",
+                    fixed_increase_cap="150",
+                    penalty_cap="",
+                    keywords_investment="検定\n英語",
+                    keywords_fun="漫画、ゲーム",
+                    keywords_danger="課金\n高額ガチャ",
+                )
+            )
+            assert response.status_code == 303
+            saved = json.loads(user_path.read_text(encoding="utf-8"))
+            assert saved["discord_user_id"] == 123456789012345678
+            assert saved["age"] == 9
+            assert saved["bot_personality"] == "friend"
+            assert saved["fixed_allowance"] == 800
+            assert saved["temporary_max"] == 2500
+            assert saved["fixed_increase_cap"] == 150
+            assert saved["penalty_cap"] is None
+            assert saved["keywords"]["investment"] == ["検定", "英語"]
+            assert saved["keywords"]["fun"] == ["漫画", "ゲーム"]
+            assert saved["keywords"]["danger"] == ["課金", "高額ガチャ"]
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.load_all_parents = old_load_all_parents
+            server.find_user_json_path_by_name = old_find_user_json_path_by_name
+
+
+def test_user_order_endpoint_saves_normalized_dashboard_order() -> None:
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_load_all_parents = server.load_all_parents
+    old_setting_path = server.SETTING_PATH
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "parent"
+
+    with tempfile.TemporaryDirectory(prefix="compass-user-order-") as d:
+        root = Path(d)
+        setting_path = root / "setting.json"
+        setting_path.write_text(json.dumps({"web_base_url": "https://example.test"}, indent=2), encoding="utf-8")
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server.load_all_users = lambda: [
+                {"name": "りか", "discord_user_id": 101},
+                {"name": "りの", "discord_user_id": 102},
+            ]
+            server.load_all_parents = lambda: [{"name": "親", "discord_user_id": 202}]
+            server.SETTING_PATH = setting_path
+
+            response = asyncio.run(
+                server.op_user_order(
+                    session_token="token",
+                    user_order=json.dumps(["parent:親", "child:りの", "child:不在", "child:りか"], ensure_ascii=False),
+                )
+            )
+            assert response.status_code == 303
+            saved = json.loads(setting_path.read_text(encoding="utf-8"))
+            assert saved["web_dashboard"]["user_order"] == ["parent:親", "child:りの", "child:りか"]
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.load_all_parents = old_load_all_parents
+            server.SETTING_PATH = old_setting_path
+
+
+def test_user_settings_endpoint_updates_parent_settings() -> None:
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_load_all_parents = server.load_all_parents
+    old_parents_dir = server.PARENTS_DIR
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "parent"
+
+    with tempfile.TemporaryDirectory(prefix="compass-parent-settings-") as d:
+        root = Path(d)
+        parent_path = root / "parent.json"
+        parent_path.write_text(
+            json.dumps({"name": "親", "discord_user_id": 202}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server.load_all_users = lambda: []
+            server.load_all_parents = lambda: [{"name": "親", "discord_user_id": 202}]
+            server.PARENTS_DIR = root
+
+            response = asyncio.run(
+                server.op_user_settings(
+                    session_token="token",
+                    user_type="parent",
+                    original_name="親",
+                    name="親",
+                    discord_user_id="2025555555",
+                )
+            )
+            assert response.status_code == 303
+            saved = json.loads(parent_path.read_text(encoding="utf-8"))
+            assert saved["name"] == "親"
+            assert saved["discord_user_id"] == 2025555555
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.load_all_parents = old_load_all_parents
+            server.PARENTS_DIR = old_parents_dir
 
 
 def test_learning_card_and_growth_plan_endpoints_write_isolated_state() -> None:
@@ -546,6 +819,9 @@ def main() -> int:
         test_prompt_receives_policy_and_learning_context,
         test_followup_policy_endpoint_writes_valid_policy_and_rejects_harmful_note,
         test_dashboard_template_renders_policy_form,
+        test_user_settings_endpoint_updates_child_settings,
+        test_user_order_endpoint_saves_normalized_dashboard_order,
+        test_user_settings_endpoint_updates_parent_settings,
         test_learning_card_and_growth_plan_endpoints_write_isolated_state,
         test_child_challenge_feedback_and_template_do_not_expose_parent_policy,
         test_server_unhandled_exception_handler_logs_and_hides_details,

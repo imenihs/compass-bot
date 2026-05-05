@@ -19,12 +19,16 @@ from fastapi.templating import Jinja2Templates
 
 from app import web_auth
 from app.config import (
+    PARENTS_DIR,
+    SETTING_PATH,
     get_allow_channel_ids,
     get_allowance_reminder_setting,
     get_log_dir,
     get_low_balance_alert_setting,
     get_web_base_url,
+    find_user_json_path_by_name,
     find_user_by_name,
+    load_all_parents,
     load_all_users,
     load_system,
     update_user_field,
@@ -89,6 +93,28 @@ CHILD_CHALLENGE_FEEDBACK_CHOICES = {
     "later": "あとで",
     "different": "ちがう",
 }
+
+USER_GENDER_CHOICES = [
+    {"value": "male", "label": "男性"},
+    {"value": "female", "label": "女性"},
+    {"value": "unspecified", "label": "未指定"},
+]
+USER_GENDER_VALUES = {choice["value"] for choice in USER_GENDER_CHOICES}
+
+BOT_PERSONALITY_CHOICES = [
+    {"value": "", "label": "システム既定"},
+    {"value": "parent", "label": "親"},
+    {"value": "sibling", "label": "兄姉"},
+    {"value": "friend", "label": "友達"},
+    {"value": "teacher", "label": "先生"},
+]
+BOT_PERSONALITY_VALUES = {choice["value"] for choice in BOT_PERSONALITY_CHOICES}
+
+USER_KEYWORD_BUCKETS = [
+    {"key": "investment", "label": "学び・目的"},
+    {"key": "fun", "label": "楽しみ"},
+    {"key": "danger", "label": "注意"},
+]
 
 GROWTH_PLAN_STATUS_CHOICES = {"draft", "active", "done", "cancelled"}
 GROWTH_PLAN_REQUEST_TYPES = {"allowance_increase", "extra_income", "saving_goal_support"}
@@ -687,6 +713,368 @@ def _write_json_file(path: Path, data: Any) -> None:
     tmp_path.replace(path)
 
 
+def _editable_user_settings(user_conf: dict) -> dict:
+    """子ども設定JSONを、管理画面フォームで扱いやすい形へそろえる。"""
+    raw_keywords = user_conf.get("keywords")
+    keywords = raw_keywords if isinstance(raw_keywords, dict) else {}
+    keyword_text = {}
+    for bucket in USER_KEYWORD_BUCKETS:
+        values = keywords.get(bucket["key"], [])
+        if not isinstance(values, list):
+            values = []
+        keyword_text[bucket["key"]] = "\n".join(str(item).strip() for item in values if str(item).strip())
+
+    return {
+        "name": str(user_conf.get("name", "")).strip(),
+        "discord_user_id": str(user_conf.get("discord_user_id", "")).strip(),
+        "age": user_conf.get("age", ""),
+        "gender": str(user_conf.get("gender") or "unspecified").strip(),
+        "bot_personality": str(user_conf.get("bot_personality") or "").strip(),
+        "fixed_allowance": user_conf.get("fixed_allowance", 0),
+        "temporary_max": user_conf.get("temporary_max", 0),
+        "fixed_increase_cap": user_conf.get("fixed_increase_cap", 0),
+        "penalty_cap": "" if user_conf.get("penalty_cap") is None else user_conf.get("penalty_cap", ""),
+        "keywords": keyword_text,
+    }
+
+
+def _editable_parent_settings(parent_conf: dict) -> dict:
+    """親設定JSONを、管理画面フォームで扱いやすい形へそろえる。"""
+    return {
+        "name": str(parent_conf.get("name", "")).strip(),
+        "discord_user_id": str(parent_conf.get("discord_user_id", "")).strip(),
+    }
+
+
+def _dashboard_order_key(user_type: str, name: str) -> str:
+    """ダッシュボード上の親子混在順序で使う安定キーを返す。"""
+    return f"{user_type}:{str(name or '').strip()}"
+
+
+def _dashboard_type_rank(user_type: str) -> int:
+    return 0 if user_type == "child" else 1
+
+
+def _dashboard_user_order_setting() -> list[str]:
+    """保存済みのダッシュボードユーザー表示順を返す。"""
+    setting = _read_json_file(SETTING_PATH, {})
+    if not isinstance(setting, dict):
+        return []
+    web_dashboard = setting.get("web_dashboard")
+    if not isinstance(web_dashboard, dict):
+        return []
+    raw_order = web_dashboard.get("user_order")
+    if not isinstance(raw_order, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_order:
+        key = str(item or "").strip()
+        if not re.fullmatch(r"(child|parent):.+", key) or key in seen:
+            continue
+        seen.add(key)
+        result.append(key)
+    return result
+
+
+def _sort_dashboard_rows(rows: list[dict]) -> list[dict]:
+    """保存順を優先し、未保存ユーザーは種別・名前順で安定表示する。"""
+    saved_order = _dashboard_user_order_setting()
+    order_index = {key: idx for idx, key in enumerate(saved_order)}
+    fallback_offset = len(order_index)
+    return sorted(
+        rows,
+        key=lambda row: (
+            order_index.get(str(row.get("dashboard_order_key", "")), fallback_offset),
+            _dashboard_type_rank(str(row.get("dashboard_user_type", ""))),
+            str(row.get("name", "")),
+        ),
+    )
+
+
+def _normalize_dashboard_user_order(raw_order: list[str]) -> list[str]:
+    """現在存在するユーザーだけで、保存用の順序配列を正規化する。"""
+    available_rows: list[dict] = []
+    for user in load_all_users():
+        name = str(user.get("name", "")).strip()
+        if name:
+            available_rows.append({
+                "name": name,
+                "dashboard_user_type": "child",
+                "dashboard_order_key": _dashboard_order_key("child", name),
+            })
+    for parent in load_all_parents():
+        name = str(parent.get("name", "")).strip()
+        if name:
+            available_rows.append({
+                "name": name,
+                "dashboard_user_type": "parent",
+                "dashboard_order_key": _dashboard_order_key("parent", name),
+            })
+
+    by_key = {row["dashboard_order_key"]: row for row in available_rows}
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_order:
+        key = str(item or "").strip()
+        if key in by_key and key not in seen:
+            seen.add(key)
+            normalized.append(key)
+
+    missing_rows = [row for row in available_rows if row["dashboard_order_key"] not in seen]
+    for row in _sort_dashboard_rows(missing_rows):
+        normalized.append(row["dashboard_order_key"])
+    return normalized
+
+
+def _save_dashboard_user_order(order_keys: list[str]) -> list[str]:
+    """ダッシュボードのユーザー表示順を setting.json に保存する。"""
+    normalized = _normalize_dashboard_user_order(order_keys)
+    setting = _read_json_file(SETTING_PATH, {})
+    if not isinstance(setting, dict):
+        setting = {}
+    web_dashboard = setting.get("web_dashboard")
+    if not isinstance(web_dashboard, dict):
+        web_dashboard = {}
+    web_dashboard["user_order"] = normalized
+    setting["web_dashboard"] = web_dashboard
+    _write_json_file(SETTING_PATH, setting)
+    return normalized
+
+
+def _migrate_dashboard_user_order(user_type: str, old_name: str, new_name: str) -> bool:
+    """ユーザー名変更時に保存済み表示順のキーも追従させる。"""
+    old_key = _dashboard_order_key(user_type, old_name)
+    new_key = _dashboard_order_key(user_type, new_name)
+    if old_key == new_key:
+        return False
+    saved_order = _dashboard_user_order_setting()
+    if old_key not in saved_order:
+        return False
+    replaced = [new_key if key == old_key else key for key in saved_order]
+    _save_dashboard_user_order(replaced)
+    return True
+
+
+def _parse_settings_int(label: str, value: str, minimum: int = 0, maximum: int = 100_000_000) -> tuple[int | None, str | None]:
+    """ユーザー設定フォームの整数を検証して返す。"""
+    text = str(value or "").replace(",", "").replace("円", "").strip()
+    if not text:
+        return None, f"{label}を入力してください。"
+    try:
+        parsed = int(text)
+    except ValueError:
+        return None, f"{label}は整数で入力してください。"
+    if parsed < minimum:
+        return None, f"{label}は{minimum}以上で入力してください。"
+    if parsed > maximum:
+        return None, f"{label}が大きすぎます。"
+    return parsed, None
+
+
+def _parse_optional_settings_int(label: str, value: str, minimum: int = 0, maximum: int = 100_000_000) -> tuple[int | None, str | None]:
+    """空欄を許す整数設定を検証して返す。"""
+    text = str(value or "").replace(",", "").replace("円", "").strip()
+    if not text:
+        return None, None
+    return _parse_settings_int(label, text, minimum=minimum, maximum=maximum)
+
+
+def _parse_discord_user_id(value: str) -> tuple[int | None, str | None]:
+    """Discord IDを文字列入力から安全に int へ変換する。"""
+    text = str(value or "").strip()
+    if not text:
+        return None, "Discord IDを入力してください。"
+    if not re.fullmatch(r"\d{5,25}", text):
+        return None, "Discord IDは5〜25桁の数字で入力してください。"
+    return int(text), None
+
+
+def _parse_keyword_list(value: str) -> list[str]:
+    """カンマ区切り・改行区切りのキーワードを重複なし配列へ変換する。"""
+    parts = re.split(r"[\n,、]+", str(value or ""))
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        item = part.strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item[:40])
+        if len(result) >= 30:
+            break
+    return result
+
+
+def _find_parent_json_path_by_name(name: str) -> Path | None:
+    """親ユーザー名に対応する parents/*.json のファイルパスを返す。"""
+    target = str(name or "").strip()
+    if not target:
+        return None
+    for path in PARENTS_DIR.glob("*.json"):
+        if path.name.endswith(".example.json"):
+            continue
+        data = _read_json_file(path, {})
+        if isinstance(data, dict) and str(data.get("name", "")).strip() == target:
+            return path
+    return None
+
+
+def _settings_path_for_scope(user_type: str, original_name: str) -> Path | None:
+    """編集対象の種類と元ユーザー名から設定ファイルを探す。"""
+    if user_type == "parent":
+        return _find_parent_json_path_by_name(original_name)
+    return find_user_json_path_by_name(original_name)
+
+
+def _name_exists_elsewhere(new_name: str, original_name: str, user_type: str) -> bool:
+    """名前変更で既存ユーザー名と衝突しないか確認する。"""
+    for scope, users in (("child", load_all_users()), ("parent", load_all_parents())):
+        for user in users:
+            candidate = str(user.get("name", "")).strip()
+            if candidate != new_name:
+                continue
+            if scope == user_type and candidate == original_name:
+                continue
+            return True
+    return False
+
+
+def _same_scope_discord_id_exists(user_type: str, discord_user_id: int, original_name: str) -> bool:
+    """同じ種類のユーザー内でDiscord IDが重複しないか確認する。"""
+    users = load_all_parents() if user_type == "parent" else load_all_users()
+    for user in users:
+        candidate_name = str(user.get("name", "")).strip()
+        if candidate_name == original_name:
+            continue
+        try:
+            candidate_id = int(user.get("discord_user_id"))
+        except (TypeError, ValueError):
+            continue
+        if candidate_id == discord_user_id:
+            return True
+    return False
+
+
+def _move_json_key(path: Path, container_key: str, old_name: str, new_name: str) -> bool:
+    """JSON内の指定dictキーを旧名から新名へ移す。移動できたら True。"""
+    data = _read_json_file(path, {})
+    if not isinstance(data, dict):
+        return False
+    container = data.get(container_key)
+    if not isinstance(container, dict) or old_name not in container or new_name in container:
+        return False
+    container[new_name] = container.pop(old_name)
+    _write_json_file(path, data)
+    return True
+
+
+def _move_nested_name_keys(path: Path, keys: tuple[str, ...], old_name: str, new_name: str) -> list[str]:
+    """監査状態など複数のユーザー名キーを持つJSONを移行する。"""
+    moved: list[str] = []
+    data = _read_json_file(path, {})
+    if not isinstance(data, dict):
+        return moved
+    changed = False
+    for key in keys:
+        container = data.get(key)
+        if isinstance(container, dict) and old_name in container and new_name not in container:
+            container[new_name] = container.pop(old_name)
+            moved.append(key)
+            changed = True
+    if changed:
+        _write_json_file(path, data)
+    return moved
+
+
+def _rename_data_file_if_possible(old_path: Path, new_path: Path) -> bool:
+    """既存の名前付き状態ファイルを、衝突しない場合だけ移動する。"""
+    if not old_path.exists() or new_path.exists():
+        return False
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    old_path.rename(new_path)
+    return True
+
+
+def _migrate_web_username(old_name: str, new_name: str) -> list[str]:
+    """Web認証側のユーザー名とセッションを名前変更へ追従させる。"""
+    moved: list[str] = []
+    users = web_auth._read_json(web_auth.WEB_USERS_PATH)
+    if old_name in users and new_name not in users:
+        users[new_name] = users.pop(old_name)
+        users[new_name]["username"] = new_name
+        web_auth._write_json(web_auth.WEB_USERS_PATH, users)
+        moved.append("web_users")
+
+    sessions = web_auth._read_json(web_auth.WEB_SESSIONS_PATH)
+    changed_sessions = False
+    for session in sessions.values():
+        if isinstance(session, dict) and session.get("username") == old_name:
+            session["username"] = new_name
+            changed_sessions = True
+    if changed_sessions:
+        web_auth._write_json(web_auth.WEB_SESSIONS_PATH, sessions)
+        moved.append("web_sessions")
+
+    auth_state = web_auth._read_json(web_auth.WEB_AUTH_STATE_PATH)
+    apps = auth_state.get("applications")
+    changed_apps = False
+    if isinstance(apps, dict):
+        for app_data in apps.values():
+            if isinstance(app_data, dict) and app_data.get("username") == old_name:
+                app_data["username"] = new_name
+                changed_apps = True
+    if changed_apps:
+        web_auth._write_json(web_auth.WEB_AUTH_STATE_PATH, auth_state)
+        moved.append("web_auth_state")
+    return moved
+
+
+def _migrate_child_name_references(old_name: str, new_name: str) -> list[str]:
+    """子どもの名前変更時に、名前キーの状態ファイルをできる範囲で移行する。"""
+    if old_name == new_name:
+        return []
+    moved: list[str] = []
+    data_dir = ROOT / "data"
+    if _move_json_key(data_dir / "wallet_state.json", "users", old_name, new_name):
+        moved.append("wallet_state")
+    moved.extend(
+        f"wallet_audit_state.{key}"
+        for key in _move_nested_name_keys(
+            data_dir / "wallet_audit_state.json",
+            (
+                "pending_by_user",
+                "initial_setup_pending_by_user",
+                "pending_intent_by_user",
+                "spending_record_pending_by_user",
+                "wallet_check_pending_by_user",
+                "wallet_check_penalties",
+            ),
+            old_name,
+            new_name,
+        )
+    )
+
+    log_dir = data_dir / "logs"
+    for suffix in ("events.jsonl", "pocket_journal.jsonl", "wallet_ledger.jsonl", "allowance_amounts.jsonl"):
+        if _rename_data_file_if_possible(log_dir / f"{old_name}_{suffix}", log_dir / f"{new_name}_{suffix}"):
+            moved.append(f"logs/{suffix}")
+
+    old_key = quote(old_name, safe="-_.")
+    new_key = quote(new_name, safe="-_.")
+    if _rename_data_file_if_possible(LEARNING_SUPPORT_STATE_DIR / f"{old_key}.json", LEARNING_SUPPORT_STATE_DIR / f"{new_key}.json"):
+        moved.append("learning_support_state")
+    if _rename_data_file_if_possible(GROWTH_PLANS_DIR / f"{old_key}.json", GROWTH_PLANS_DIR / f"{new_key}.json"):
+        moved.append("growth_plans")
+    moved.extend(_migrate_web_username(old_name, new_name))
+    return moved
+
+
+def _save_settings_json(path: Path, data: dict) -> None:
+    """ユーザー設定JSONをatomic replaceで保存する。"""
+    _write_json_file(path, data)
+
+
 def _learning_support_state_path(user_conf: dict, fallback_name: str) -> Path:
     return LEARNING_SUPPORT_STATE_DIR / f"{_user_key_for_storage(user_conf, fallback_name)}.json"
 
@@ -997,6 +1385,7 @@ def _build_user_stats(name: str, system_conf: dict, user_conf: Optional[dict] = 
 
     return {
         "name": name,
+        "settings_form": _editable_user_settings(user_conf or {}),
         "fixed_allowance": int((user_conf or {}).get("fixed_allowance", 0)),
         "parent_followup_note": follow_policy["parent_note"],
         "ai_follow_policy": follow_policy,
@@ -1229,7 +1618,28 @@ async def get_dashboard(
             name = u.get("name", "")
             if name:
                 stats = _build_user_stats(name, system_conf, u)
+                stats["dashboard_user_type"] = "child"
+                stats["dashboard_order_key"] = _dashboard_order_key("child", name)
                 user_stats.append(stats)
+        user_stats = _sort_dashboard_rows(user_stats)
+        for index, stats in enumerate(user_stats, start=1):
+            stats["settings_modal_id"] = f"child-settings-modal-{index}"
+
+        parent_settings = []
+        for parent in load_all_parents():
+            parent_form = _editable_parent_settings(parent)
+            parent_form["dashboard_user_type"] = "parent"
+            parent_form["dashboard_order_key"] = _dashboard_order_key("parent", parent_form["name"])
+            parent_settings.append(parent_form)
+        parent_settings = _sort_dashboard_rows(parent_settings)
+        for index, parent_form in enumerate(parent_settings, start=1):
+            parent_form["settings_modal_id"] = f"parent-settings-modal-{index}"
+
+        dashboard_user_rows = _sort_dashboard_rows(user_stats + parent_settings)
+        dashboard_user_order_json = json.dumps(
+            [row["dashboard_order_key"] for row in dashboard_user_rows],
+            ensure_ascii=False,
+        )
 
         # 承認待ち申請一覧を取得する
         pending_apps = await web_auth.list_pending_applications()
@@ -1242,7 +1652,13 @@ async def get_dashboard(
             "username": username,
             "is_admin": True,
             "users": user_stats,
+            "parent_settings": parent_settings,
+            "dashboard_user_rows": dashboard_user_rows,
+            "dashboard_user_order_json": dashboard_user_order_json,
             "pending_apps": pending_apps,
+            "user_gender_choices": USER_GENDER_CHOICES,
+            "bot_personality_choices": BOT_PERSONALITY_CHOICES,
+            "user_keyword_buckets": USER_KEYWORD_BUCKETS,
             "follow_focus_choices": FOLLOW_FOCUS_CHOICES,
             "follow_strength_choices": FOLLOW_STRENGTH_CHOICES,
             "follow_frequency_choices": FOLLOW_FREQUENCY_CHOICES,
@@ -1309,6 +1725,29 @@ def _op_redirect(msg: str = "", error: str = "") -> RedirectResponse:
     if error:
         return RedirectResponse(url=f"/compass-bot/dashboard?error={quote(error)}", status_code=303)
     return RedirectResponse(url=f"/compass-bot/dashboard?msg={quote(msg)}", status_code=303)
+
+
+@app.post("/compass-bot/op/user_order")
+async def op_user_order(
+    session_token: Optional[str] = Cookie(default=None),
+    user_order: str = Form(default="[]"),
+):
+    """管理者がダッシュボードのユーザー表示順を保存する。"""
+    current_user = await _get_current_user(session_token)
+    if not current_user or not _is_admin(current_user):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    try:
+        parsed = json.loads(user_order or "[]")
+    except json.JSONDecodeError:
+        return _op_redirect(error="並び順の保存データが正しくありません。")
+    if not isinstance(parsed, list):
+        return _op_redirect(error="並び順の保存データが正しくありません。")
+
+    normalized = _save_dashboard_user_order([str(item) for item in parsed])
+    if not normalized:
+        return _op_redirect(error="保存できるユーザーがありません。")
+    return _op_redirect(msg="ユーザー一覧の並び順を保存しました。")
 
 
 @app.post("/compass-bot/op/grant")
@@ -1418,6 +1857,117 @@ async def op_fixed_allowance(
         return _op_redirect(error=f"「{target_name}」の月額変更に失敗しました。")
 
     return _op_redirect(msg=f"{target_name}の月額お小遣いを変更しました（{old_value:,}円 → {amt:,}円）")
+
+
+@app.post("/compass-bot/op/user_settings")
+async def op_user_settings(
+    session_token: Optional[str] = Cookie(default=None),
+    user_type: str = Form(default="child"),
+    original_name: str = Form(...),
+    name: str = Form(...),
+    discord_user_id: str = Form(...),
+    age: str = Form(default=""),
+    gender: str = Form(default="unspecified"),
+    bot_personality: str = Form(default=""),
+    fixed_allowance: str = Form(default=""),
+    temporary_max: str = Form(default=""),
+    fixed_increase_cap: str = Form(default=""),
+    penalty_cap: str = Form(default=""),
+    keywords_investment: str = Form(default=""),
+    keywords_fun: str = Form(default=""),
+    keywords_danger: str = Form(default=""),
+):
+    """管理者が子ども・親ユーザーの設定JSONをWebから編集する。"""
+    current_user = await _get_current_user(session_token)
+    if not current_user or not _is_admin(current_user):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    scope = str(user_type or "child").strip()
+    if scope not in {"child", "parent"}:
+        return _op_redirect(error="ユーザー種別が正しくありません。")
+
+    old_name = str(original_name or "").strip()
+    new_name = str(name or "").strip()
+    if not old_name or not new_name:
+        return _op_redirect(error="名前を入力してください。")
+    if len(new_name) > 60 or any(ch in new_name for ch in ('/', '\\', '\0')):
+        return _op_redirect(error="名前に使えない文字が含まれています。")
+    if old_name != new_name and _name_exists_elsewhere(new_name, old_name, scope):
+        return _op_redirect(error=f"「{new_name}」は既に別ユーザーで使われています。")
+
+    web_users = web_auth._read_json(web_auth.WEB_USERS_PATH)
+    if old_name != new_name and old_name in web_users and new_name in web_users:
+        return _op_redirect(error=f"Webユーザー「{new_name}」が既に存在するため名前を変更できません。")
+
+    discord_id, id_error = _parse_discord_user_id(discord_user_id)
+    if id_error:
+        return _op_redirect(error=id_error)
+    if discord_id is None:
+        return _op_redirect(error="Discord IDを入力してください。")
+    if _same_scope_discord_id_exists(scope, discord_id, old_name):
+        return _op_redirect(error="同じ種類のユーザー内でDiscord IDが重複しています。")
+
+    path = _settings_path_for_scope(scope, old_name)
+    if path is None:
+        return _op_redirect(error=f"「{old_name}」の設定ファイルが見つかりませんでした。")
+    current_data = _read_json_file(path, {})
+    if not isinstance(current_data, dict):
+        return _op_redirect(error=f"「{old_name}」の設定ファイル形式が正しくありません。")
+
+    updated = dict(current_data)
+    updated["name"] = new_name
+    updated["discord_user_id"] = discord_id
+
+    if scope == "parent":
+        _save_settings_json(path, updated)
+        moved = _migrate_web_username(old_name, new_name) if old_name != new_name else []
+        if old_name != new_name and _migrate_dashboard_user_order("parent", old_name, new_name):
+            moved.append("web_dashboard_order")
+        suffix = f"（移行: {', '.join(moved)}）" if moved else ""
+        return _op_redirect(msg=f"{new_name}の親ユーザー設定を保存しました。{suffix}")
+
+    age_value, age_error = _parse_settings_int("年齢", age, minimum=0, maximum=120)
+    if age_error:
+        return _op_redirect(error=age_error)
+
+    gender_value = str(gender or "unspecified").strip()
+    if gender_value not in USER_GENDER_VALUES:
+        return _op_redirect(error="性別の指定が正しくありません。")
+
+    personality_value = str(bot_personality or "").strip()
+    if personality_value not in BOT_PERSONALITY_VALUES:
+        return _op_redirect(error="話し方の指定が正しくありません。")
+
+    fixed_value, fixed_error = _parse_settings_int("月額お小遣い", fixed_allowance)
+    temporary_value, temporary_error = _parse_settings_int("臨時上限", temporary_max)
+    fixed_cap_value, fixed_cap_error = _parse_settings_int("固定増額上限", fixed_increase_cap)
+    penalty_value, penalty_error = _parse_optional_settings_int("残高確認差額上限", penalty_cap)
+    for error in (fixed_error, temporary_error, fixed_cap_error, penalty_error):
+        if error:
+            return _op_redirect(error=error)
+
+    updated["age"] = age_value
+    updated["gender"] = gender_value
+    updated["fixed_allowance"] = fixed_value
+    updated["temporary_max"] = temporary_value
+    updated["fixed_increase_cap"] = fixed_cap_value
+    updated["penalty_cap"] = penalty_value
+    if personality_value:
+        updated["bot_personality"] = personality_value
+    else:
+        updated.pop("bot_personality", None)
+    updated["keywords"] = {
+        "investment": _parse_keyword_list(keywords_investment),
+        "fun": _parse_keyword_list(keywords_fun),
+        "danger": _parse_keyword_list(keywords_danger),
+    }
+
+    _save_settings_json(path, updated)
+    moved = _migrate_child_name_references(old_name, new_name) if old_name != new_name else []
+    if old_name != new_name and _migrate_dashboard_user_order("child", old_name, new_name):
+        moved.append("web_dashboard_order")
+    suffix = f"（移行: {', '.join(moved)}）" if moved else ""
+    return _op_redirect(msg=f"{new_name}のユーザー設定を保存しました。{suffix}")
 
 
 @app.post("/compass-bot/op/followup_policy")

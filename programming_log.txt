@@ -4111,3 +4111,274 @@ CommitID: 4e5feb4に含む
 
 CommitID: 4e5feb4（Fix Discord runtime handling and diagnostics）
 CommitID: 813d903（Record commit id in programming log）
+
+================================================================================
+[技術事業部長] 2026/05/05 23:50:31 JST — Web UIからユーザー設定全項目を編集する暫定導線を実装
+================================================================================
+
+【思考】
+  社長から「web uiから各ユーザ現状の設定項目の全てを変えられるように」と指示を受けた。
+  既存のWeb UIでは、親が直接変更できる設定は月額お小遣いとAIフォロー方針に偏っていた。
+  実運用ではDiscord ID、年齢、性別、話し方、臨時上限、増額上限、残高確認差額上限、キーワード配列も調整対象になるため、
+  settings/users/*.json の現行主要項目をWebから編集できる必要がある。
+
+  途中で社長から「先頭の表に設定ボタンを設け、そこから金額等を編集できるのがよいのでは」と指摘を受けた。
+  これは妥当で、管理者が最初に見る残高一覧の行コンテキストから直接編集できる方が、対象ユーザーの取り違えを減らせる。
+  そのため、この時点では独立した子ども設定カードではなく、先頭の全ユーザー残高一覧に `設定` ボタンを追加し、
+  各行直下へ設定フォームを展開する暫定設計に変更した。
+  後続のUI設計指示により、現行UIでは行展開を残さずモーダル方式へ置換した。
+
+  サブワーカー調査を2件使った。どちらもコード調査のみで、実インタビューや外部資料ではない。
+  調査結果として、Webルートは app/server.py、テンプレートは templates/dashboard.html、
+  設定読込は app/config.py の load_all_users/load_all_parents、既存保存は update_user_field の単一フィールド更新だと確認した。
+
+【実装】
+  - `app/server.py`
+    - `POST /compass-bot/op/user_settings` を追加。
+    - 子ども設定の `name`, `discord_user_id`, `age`, `gender`, `bot_personality`,
+      `fixed_allowance`, `temporary_max`, `fixed_increase_cap`, `penalty_cap`,
+      `keywords.investment/fun/danger` を保存できるようにした。
+    - 親設定の `name`, `discord_user_id` もWebから保存できるようにした。
+    - Discord IDは文字列入力からサーバー側で整数化し、ブラウザの数値桁落ちを避ける。
+    - 同種ユーザー内のDiscord ID重複、名前衝突、不正enum、不正整数を保存前に拒否する。
+    - 設定保存は一時ファイル経由のatomic replaceにした。
+    - `name` 変更時は、ウォレット状態、残高監査状態、ログファイル名、学習支援状態、成長プラン、Webユーザー名/セッション/申請状態を可能な範囲で移行する。
+  - `templates/dashboard.html`
+    - 先頭の全ユーザー残高一覧に `操作` 列と `設定` ボタンを追加。
+    - この時点では、設定ボタンで対象行の直下に設定フォームを展開する実装にした。
+    - 親ユーザー設定は別枠で編集できるようにした。
+  - `tests/learning_support_tests.py`
+    - 管理者テンプレートに設定ボタン/設定フォームが出ることを確認。
+    - `op_user_settings` が各設定項目を型付きで保存するテストを追加。
+  - `README.md` / `実装仕様.md`
+    - 親ダッシュボードからユーザー設定を編集できる仕様を追記。
+
+【テスト】
+  - `python3 -m py_compile app/server.py tests/learning_support_tests.py`: PASS
+  - Jinja2で `dashboard.html` を読み込み: PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 10件全PASS
+  - システムPythonでの `python3 tests/learning_support_tests.py` は `fastapi` 未導入のためWeb系のみ失敗。既存プロジェクトの `.venv` ではPASS。
+
+CommitID: 今回コミットに含む
+
+================================================================================
+[技術事業部長] 2026/05/05 23:51:30 JST — ユーザー設定Web編集の追加検証
+================================================================================
+
+【思考】
+  Web UIはBotと同一プロセス内のFastAPIで提供されているため、テンプレートとサーバーコードの変更はサービス再起動で反映する必要がある。
+  ただし先に、Web系テストだけでなく疑似Discordフローも確認して、既存の親/子操作や設定参照を壊していないかを見る必要がある。
+
+【テスト】
+  - `git diff --check`: PASS
+  - `python3 -m py_compile app/server.py tests/learning_support_tests.py`: PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 10件全PASS
+  - `.venv/bin/python tests/fake_discord_flow_tests.py`: 全ケースPASS
+
+CommitID: 今回コミットに含む
+
+================================================================================
+[技術事業部長] 2026/05/05 23:52:47 JST — ユーザー設定Web編集を本番サービスへ反映
+================================================================================
+
+【本番反映】
+  - systemctl 経由で `compass.service` を再起動した。
+  - `systemctl is-active compass.service`: `active`
+  - `curl -s http://127.0.0.1:8765/health`: `{"status":"ok"}`
+
+【思考】
+  Web UIはBotと同一プロセス内のFastAPIで提供されているため、テンプレートとサーバーコードの変更はサービス再起動で反映する必要がある。
+  再起動直後の初回ヘルスチェックは起動タイミングで間に合わなかったが、1秒後の再確認で正常応答を確認した。
+
+CommitID: 今回コミットに含む
+
+================================================================================
+[技術事業部長] 2026/05/06 00:11:15 JST — ユーザー設定UIをモーダル方式へ再設計・反映
+================================================================================
+
+【思考】
+  社長から「詳細設計して、チェックリストに入れてから実装して」と指示を受けた。
+  先の行展開方式は、一覧表の視認性を崩し、編集対象が増えるほど表の主目的である残高確認を邪魔する。
+  社長の提案どおり、一覧表は現状の一覧性を保ち、各行の `設定` から対象ユーザーの編集モーダルを開く設計にするのが妥当と判断した。
+
+  モーダルは画面外クリックでは閉じない。閉じる入口は `Esc` と `キャンセル` に寄せる。
+  未保存変更がある場合は破棄確認モーダルを重ね、`name` または `discord_user_id` の変更保存時は重要項目保存確認モーダルを重ねる。
+  確認モーダルで戻る場合は、入力状態を保持する。
+
+【詳細設計・チェックリスト】
+  - `実装仕様.md` に、ユーザー設定モーダル、親設定モーダル、未保存破棄確認、重要項目保存確認のチェックリストを追加してから実装した。
+  - 実装後、該当チェックリストを完了済みに更新した。
+
+【実装】
+  - `templates/dashboard.html`
+    - 子ども一覧の行展開フォームと `toggleUserSettingsRow` を削除。
+    - 子ども一覧の `設定` ボタンから `role="dialog"` / `aria-modal="true"` の編集モーダルを開くようにした。
+    - 親ユーザー設定の `<details>` を表 + `設定` ボタン + 編集モーダルへ変更した。
+    - 画面外クリックでは閉じず、`Esc` / `キャンセル` だけで閉じるJSにした。
+    - 未保存変更時の破棄確認モーダルと、`name` / `discord_user_id` 保存時の重要項目確認モーダルを追加した。
+    - 複数ユーザー表示でも `id` が重複しないよう、子ども/親/キーワード入力のIDを分離した。
+  - `tests/learning_support_tests.py`
+    - 管理者テンプレートテストで、モーダルID、`role="dialog"`、hidden項目、子ども/親フォーム、確認モーダル、旧行展開関数の不存在を確認するようにした。
+    - 子ども設定保存テストを独自テストランナーに追加した。
+    - 親設定保存テストを追加し、親の `discord_user_id` 保存を検証した。
+  - `README.md` / `実装仕様.md`
+    - 親ダッシュボードのユーザー設定編集をモーダル方式として記録した。
+
+【テスト】
+  - `python3 -m py_compile app/server.py tests/learning_support_tests.py`: PASS
+  - Jinja2で `dashboard.html` を読み込み: PASS
+  - `awk` で抽出したテンプレート内JavaScriptを `node --check` で構文確認: PASS
+  - 2子ども + 2親でテンプレートを描画し、HTML `id` 重複なしを確認: PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 12件全PASS
+  - `.venv/bin/python tests/fake_discord_flow_tests.py`: 全ケースPASS
+  - `git diff --check`: PASS
+
+【本番反映】
+  - systemctl 経由で `compass.service` を再起動した。
+  - `systemctl is-active compass.service`: `active`
+  - `curl -s http://127.0.0.1:8765/health`: `{"status":"ok"}`
+
+CommitID: 今回コミットに含む
+
+================================================================================
+[技術事業部長] 2026/05/06 00:17:32 JST — 親設定導線を子ども設定と同一UIへ統合
+================================================================================
+
+【思考】
+  社長から「親の設定も同じUI、同じ操作にして。下のカードのお小遣い操作も、各ユーザの設定と同じことができるものは削除して」と指示を受けた。
+  親設定だけ別カードにあると、同じ `設定` 操作なのに探す場所が分かれ、管理画面の操作モデルがぶれる。
+  そのため、先頭カードを「全ユーザー一覧」に変更し、子ども行と親行を同じ表に並べ、どちらも同じ `設定` ボタンからモーダルを開く設計に統一した。
+
+  お小遣い操作カードのうち、固定月額変更は子どもの設定モーダル内 `fixed_allowance` と完全に重複する。
+  一方で、個別支給、一括支給、残高調整は設定変更ではなく残高操作なので残した。
+  `/compass-bot/op/fixed_allowance` のサーバールートは互換性のため残し、Web UIからは露出しない形にした。
+
+【実装】
+  - `templates/dashboard.html`
+    - 先頭カード名を「全ユーザー一覧」に変更。
+    - 子ども行と親行を同じ表に並べ、同じ `設定` ボタン操作でそれぞれのモーダルを開くようにした。
+    - 親ユーザー設定の別カードを削除した。
+    - 横幅が詰まりやすい一覧表に横スクロール領域を追加した。
+    - お小遣い操作カードから、固定月額変更フォームと同期JSを削除した。
+  - `tests/learning_support_tests.py`
+    - `全ユーザー一覧` 表示、親設定ボタン、`/compass-bot/op/fixed_allowance` 非表示、旧月額変更フォーム非表示を検証するようにした。
+  - `README.md` / `実装仕様.md`
+    - 親設定も同じ全ユーザー一覧から編集する仕様へ更新。
+    - 固定月額変更フォームは設定モーダルに統合し、支給/一括支給/残高調整は残す方針を記録。
+
+【テスト】
+  - `python3 -m py_compile app/server.py tests/learning_support_tests.py`: PASS
+  - Jinja2で `dashboard.html` を読み込み: PASS
+  - `awk` で抽出したテンプレート内JavaScriptを `node --check` で構文確認: PASS
+  - 2子ども + 2親でテンプレートを描画し、HTML `id` 重複なし、設定ボタン4件、固定月額変更フォーム非表示を確認: PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 12件全PASS
+  - `.venv/bin/python tests/fake_discord_flow_tests.py`: 全ケースPASS
+  - `git diff --check`: PASS
+
+【本番反映】
+  - systemctl 経由で `compass.service` を再起動した。
+  - `systemctl is-active compass.service`: `active`
+  - `curl -s http://127.0.0.1:8765/health`: `{"status":"ok"}`
+
+CommitID: 今回コミットに含む
+
+================================================================================
+[技術事業部長] 2026/05/06 00:26:17 JST — ユーザー一覧の並び順保存と未保存リロード抑制を実装
+================================================================================
+
+【思考】
+  社長から「UIのユーザ一覧のユーザの並びがちろちろ変わるのなんで？並び替え機能と、その保存機能が欲しい」と指示を受けた。
+  調査したところ、`load_all_users()` / `load_all_parents()` が `Path.glob("*.json")` の列挙順をそのまま返しており、ファイルシステムの列挙順に依存していた。
+  これが、ファイル作成・更新・環境差で一覧順が安定しない原因だった。
+
+  また社長から「内容変更後、未保存でリロードしたとき、抑制できてない」と追加指摘を受けた。
+  既存実装はモーダルの `キャンセル` / `Esc` では未保存確認を出すが、ブラウザのリロードやページ離脱には `beforeunload` を入れていなかった。
+  そのため、設定フォームの未保存変更と並び順の未保存変更の両方を `beforeunload` で検知するようにした。
+
+【実装】
+  - `app/config.py`
+    - `load_all_users()` / `load_all_parents()` のファイル列挙をファイル名順へ変更し、保存順がない場合も安定表示になるようにした。
+  - `app/server.py`
+    - `settings/setting.json` の `web_dashboard.user_order` に親子混在の表示順を保存するようにした。
+    - 表示順キーは `child:{name}` / `parent:{name}` にした。
+    - `POST /compass-bot/op/user_order` を追加し、存在しないキーを捨て、新規ユーザーを安定順で補完して保存するようにした。
+    - ユーザー名変更時は保存済み表示順キーも追従させるようにした。
+    - ダッシュボード描画時は、保存済み順序を優先し、保存にないユーザーは種別・名前順で補完するようにした。
+  - `templates/dashboard.html`
+    - 全ユーザー一覧に並び順保存UIと `並び順を保存` を追加。
+    - 並び替え時に hidden JSON を更新し、保存ボタンを有効化するようにした。
+    - 設定フォーム変更または並び順変更が未保存なら、リロード・ページ離脱時にブラウザ確認を出すようにした。
+  - `tests/learning_support_tests.py`
+    - 並び順保存フォーム、表示順キー、`beforeunload` のテンプレート出力を検証。
+    - `op_user_order` が存在しないキーを除外し、正規化した順序を保存するテストを追加。
+  - `README.md` / `実装仕様.md`
+    - 並び順保存先、親子混在キー、未保存リロード抑制の仕様を追記。
+
+【テスト】
+  - `python3 -m py_compile app/config.py app/server.py tests/learning_support_tests.py`: PASS
+  - `awk` で抽出したテンプレート内JavaScriptを `node --check` で構文確認: PASS
+  - 2子ども + 2親でテンプレートを描画し、HTML `id` 重複なし、設定ボタン4件、並び替えフォーム、`beforeunload`、固定月額変更フォーム非表示を確認: PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 13件全PASS
+  - `.venv/bin/python tests/fake_discord_flow_tests.py`: 全ケースPASS
+  - `git diff --check`: PASS
+
+【本番反映】
+  - systemctl 経由で `compass.service` を再起動した。
+  - `systemctl is-active compass.service`: `active`
+  - `curl -s http://127.0.0.1:8765/health`: `{"status":"ok"}`
+
+CommitID: 今回コミットに含む
+
+================================================================================
+[技術事業部長] 2026/05/06 00:42:11 JST — 並び替えをドラッグUIへ変更しレスポンシブ幅と下部トーストを実装
+================================================================================
+
+【思考】
+  社長から「上下ボタンは使いにくい。通常ドラッグがUXとしていいのでは」と指摘を受けた。
+  一覧の順序変更は直接操作できるドラッグの方が、対象行と移動結果の対応が分かりやすい。
+  ただしキーボード操作も残す必要があるため、表示はドラッグハンドルにしつつ、上下キーでも移動できるようにした。
+
+  追加で「ドラッグ後にクリックしないと、ドラッグしているユーザ行をつかんだままになる」と指摘を受けた。
+  ハンドル側だけで `pointerup` を待つと、ポインタの取りこぼしやウィンドウ外リリースでドラッグ状態が残る。
+  そのため、ドラッグ中だけ document/window に終了監視を張り、`pointerup` / `pointercancel` / `blur` で必ず解除する設計へ変更した。
+
+  さらに、PCではカード幅が狭すぎ、スマホやタブレットでの見え方も調整が必要だった。
+  共通コンテナをPC最大1440pxへ広げ、タブレット・スマホでは余白とカードpaddingを段階的に縮める。
+  列数の多い全ユーザー一覧は、スマホでカード自体を壊さず横スクロールさせる。
+
+  操作結果メッセージは画面上部に出ていたため、ページ下部のフォーム操作後には見落としやすかった。
+  社長の提案どおり、操作結果だけを画面下部の5秒トーストに変更した。
+  ただし `?msg=...` / `?error=...` をURLに残したままだと、リロード時に同じトーストが繰り返し出る。
+  そのため、トースト表示後に `history.replaceState` で操作結果クエリだけを削除するようにした。
+
+【実装】
+  - `templates/dashboard.html`
+    - `上へ` / `下へ` ボタン前提をやめ、各行のドラッグハンドルで並び替えるUIに変更。
+    - ドラッグ中は document/window で `pointermove` / `pointerup` / `pointercancel` / `blur` を監視し、取りこぼし時もドラッグ状態を解除するようにした。
+    - 並び順は既存の hidden JSON と `POST /compass-bot/op/user_order` を維持し、保存形式は変えない。
+    - 全ユーザー一覧を `.dashboard-table-wrap` / `.dashboard-user-table` に分離し、狭い画面では横スクロールするようにした。
+    - `flash_msg` / `flash_error` を画面下部トーストに変更し、5秒後の自動消去と手動クローズを追加。
+    - トースト表示後にブラウザ履歴から `msg` / `error` クエリだけを削除し、リロード時の再表示を防ぐようにした。
+  - `templates/base.html`
+    - 共通 `.container` をPC最大1440pxに広げた。
+    - 1024px以下と640px以下のmedia queryを追加し、タブレット・スマホで余白とカードpaddingを調整。
+    - トースト共通CSSを追加。
+  - `tests/learning_support_tests.py`
+    - ドラッグハンドル、旧上下ボタン不存在、ドラッグ解除監視、レスポンシブCSS、下部トースト出力、トースト後のクエリ削除を検証するようにした。
+  - `README.md` / `実装仕様.md`
+    - ドラッグUI、ドラッグ解除、レスポンシブ幅、5秒トースト、トースト後のクエリ削除の仕様を追記。
+
+【テスト】
+  - `python3 -m py_compile app/config.py app/server.py tests/learning_support_tests.py`: PASS
+  - `awk` で抽出したテンプレート内JavaScriptを `node --check` で構文確認: PASS
+  - `.venv/bin/python tests/learning_support_tests.py`: 13件全PASS
+  - `.venv/bin/python tests/fake_discord_flow_tests.py`: 全ケースPASS
+  - 2子ども + 2親でテンプレートを描画し、HTML `id` 重複なし、ドラッグハンドル4件、旧上下ボタンなし、トースト後のクエリ削除コードありを確認: PASS
+  - `git diff --check`: PASS
+
+【本番反映】
+  - systemctl 経由で `compass.service` を再起動した。
+  - `systemctl is-active compass.service`: `active`
+  - `curl -s http://127.0.0.1:8765/health`: `{"status":"ok"}`
+
+CommitID: 今回コミットに含む
