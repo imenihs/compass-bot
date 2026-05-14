@@ -60,9 +60,16 @@ def _build_proactive_child_nudge_message(user_conf: dict, nudge: dict) -> str:
     prefix = f"{name}さん、" if name else ""
 
     if reason == "challenge_stale":
+        challenge_action = action.rstrip("。") if action else "前に決めたお金の記録"
         if age is not None and age <= 9:
-            return f"{prefix}このまえのチャレンジ、どうだった？\n「やった」「あとで」「ちがう」だけでも教えてね。"
-        return f"{prefix}この前の小さなチャレンジ、どうだった？\n「やった」「あとで」「ちがう」だけでも返してね。"
+            return (
+                f"{prefix}前に決めた「{challenge_action}」のことだよ。\n"
+                "できたら「やった」、まだなら「あとで」、ちがったら「ちがう」って返してね。"
+            )
+        return (
+            f"{prefix}前に決めた「{challenge_action}」の確認だよ。\n"
+            "できたら「やった」、まだなら「あとで」、合わなかったら「ちがう」って返してね。"
+        )
 
     if reason == "growth_plan_review":
         plan_action = action or "決めた行動"
