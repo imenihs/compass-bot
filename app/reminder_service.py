@@ -360,12 +360,7 @@ class ReminderService:
             if channel is None:
                 channel = await self.client.fetch_channel(channel_id)
 
-            member_ids = {m.id for m in getattr(channel, "members", [])}
-            channel_users = [
-                user_by_discord_id[mid]
-                for mid in member_ids
-                if mid in user_by_discord_id
-            ]
+            channel_users = self._channel_users(channel, users, user_by_discord_id)
 
             if channel_users:
                 for u in channel_users:
@@ -688,6 +683,38 @@ class ReminderService:
         }
         state["proactive_child_nudge_last_sent_by_user"] = sent_by_user
 
+    def _channel_users(
+        self,
+        channel,
+        users: list[dict],
+        user_by_discord_id: dict[int, dict],
+    ) -> list[dict]:
+        """チャンネルのメンバー情報またはチャンネル名から対象子どもを推定する"""
+        member_ids = {
+            int(getattr(member, "id", 0))
+            for member in getattr(channel, "members", [])
+            if getattr(member, "id", None)
+        }
+        member_users = [
+            user_by_discord_id[member_id]
+            for member_id in member_ids
+            if member_id in user_by_discord_id
+        ]
+        if member_users:
+            return member_users
+
+        # Discord のメンバーキャッシュが空でも、子ども別チャンネル名から一意に補完する。
+        channel_name = str(getattr(channel, "name", "") or "").strip()
+        if not channel_name:
+            return []
+        name_matches = [
+            user_conf
+            for user_conf in users
+            if str(user_conf.get("name", "")).strip()
+            and str(user_conf.get("name", "")).strip() in channel_name
+        ]
+        return name_matches if len(name_matches) == 1 else []
+
     async def _child_channels(self) -> dict[str, discord.abc.Messageable]:
         """allow_channel_ids から子どもごとの送信先チャンネルを1つ選ぶ"""
         users = self.load_all_users()
@@ -701,11 +728,7 @@ class ReminderService:
             channel = self.client.get_channel(channel_id)
             if channel is None:
                 channel = await self.client.fetch_channel(channel_id)
-            member_ids = {m.id for m in getattr(channel, "members", [])}
-            for member_id in member_ids:
-                user_conf = user_by_discord_id.get(member_id)
-                if not user_conf:
-                    continue
+            for user_conf in self._channel_users(channel, users, user_by_discord_id):
                 name = str(user_conf.get("name", "")).strip()
                 if name and name not in channels_by_name:
                     channels_by_name[name] = channel
@@ -801,12 +824,7 @@ class ReminderService:
             if channel is None:
                 channel = await self.client.fetch_channel(channel_id)
 
-            member_ids = {m.id for m in getattr(channel, "members", [])}
-            channel_users = [
-                user_by_discord_id[mid]
-                for mid in member_ids
-                if mid in user_by_discord_id
-            ]
+            channel_users = self._channel_users(channel, users, user_by_discord_id)
 
             for u in channel_users:
                 user_name = str(u.get("name", ""))
