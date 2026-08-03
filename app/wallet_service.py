@@ -183,19 +183,59 @@ class WalletService:
     # ------------------------------------------------------------------
 
     def load_audit_state(self) -> dict:
+        """監査状態を読み込む。読めない・形式が不正な場合は例外を上げて処理を止める。
+
+        呼び出し側は「読み込み → 変更 → save_audit_state」を1区間で行うため、
+        ここで空dictを返すと壊れたファイルをそのまま書き戻し、全児童の pending と
+        wallet_check_penalties を恒久的に消す。wallet_state.json 側の _load_wallet_state と
+        同じく「形式不正なら失敗させる」方針に揃える。
+
+        Returns:
+            dict: 監査状態。ファイル未作成の場合のみ初回起動として空の状態を返す。
+
+        Raises:
+            RuntimeError: ファイルは在るが読めない、または dict でない場合。
+        """
+        # ファイルが無いのは初回起動の正当な空状態であり、異常ではない
         if not self.wallet_audit_state_path.exists():
             return {"pending_by_user": {}}
         try:
             with open(self.wallet_audit_state_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, dict):
-                    data.setdefault("pending_by_user", {})
-                    return data
-        except Exception:
-            pass
-        return {"pending_by_user": {}}
+        except Exception as e:
+            # 破損JSONやI/O失敗を握りつぶすと、後段の save が空の状態で上書きしてしまう
+            self._log_wallet_error(
+                "wallet_audit_state_load_error", e, {"path": str(self.wallet_audit_state_path)}
+            )
+            raise RuntimeError("wallet_audit_state.json の読み込みに失敗しました") from e
+        # [] や null は json.load が例外を出さないため、ここで明示的に弾く
+        if not isinstance(data, dict):
+            self._log_wallet_error(
+                "wallet_audit_state_invalid_error",
+                ValueError("wallet_audit_state.json schema is invalid"),
+                {"path": str(self.wallet_audit_state_path), "loaded_type": type(data).__name__},
+            )
+            raise RuntimeError("wallet_audit_state.json の形式が不正です")
+        data.setdefault("pending_by_user", {})
+        return data
 
     def save_audit_state(self, state: dict) -> None:
+        """監査状態を保存する。既存データを空の状態で全消しする書き込みは拒否する。
+
+        Args:
+            state: 保存する監査状態。load_audit_state で読んだ dict を変更したものを渡す。
+
+        Raises:
+            RuntimeError: 既存ファイルが在るのに、キーを1つも持たない状態を書こうとした場合。
+        """
+        # 正常な呼び出しは必ず load 済みで pending_by_user を持つため、完全に空の state は異常とみなす
+        if not state and self.wallet_audit_state_path.exists():
+            self._log_wallet_error(
+                "wallet_audit_state_wipe_blocked",
+                ValueError("refused to overwrite existing audit state with an empty state"),
+                {"path": str(self.wallet_audit_state_path)},
+            )
+            raise RuntimeError("wallet_audit_state.json を空の状態で上書きしようとしました")
         self.wallet_audit_state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.wallet_audit_state_path.with_suffix(self.wallet_audit_state_path.suffix + ".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
