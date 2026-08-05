@@ -1,5 +1,5 @@
-/app/__pycache__
-/tests/__pycache__
+__pycache__/
+*.pyc
 /.venv
 .env
 /settings/users/*.json
