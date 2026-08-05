@@ -471,6 +471,71 @@ def get_child_income_report_setting() -> dict:
     return {"max_amount": int(max_amount)}
 
 
+def get_conversation_session_setting() -> dict:
+    """
+    会話セッション（対話層が所有する「いま何の話をしているか」状態）の設定を返す。
+
+    setting.json の "conversation_session": {"expiry_minutes": 30} を読み込む。
+    期限切れの会話セッションはこの分数で失効させる。未設定でも安全に既定値が効く。
+
+    Returns:
+        dict: {"expiry_minutes": int} 形式。1分〜1440分（24時間）にクランプする。
+    """
+    setting = load_setting()
+    conf = setting.get("conversation_session", {}) if isinstance(setting, dict) else {}
+    # 型不正な値は空扱いにして既定へ倒す
+    if not isinstance(conf, dict):
+        conf = {}
+
+    # 未設定でも期限が必ず効くよう既定30分を入れる
+    expiry_minutes = _safe_int(conf.get("expiry_minutes"), 30)
+    if expiry_minutes is None:
+        expiry_minutes = 30
+    # 短すぎ・長すぎを防ぐため 1〜1440 にクランプする
+    expiry_minutes = max(1, min(1440, expiry_minutes))
+
+    return {
+        "expiry_minutes": expiry_minutes,
+    }
+
+
+def get_conversation_log_setting() -> dict:
+    """
+    会話ログ（{name}_conversation.jsonl）の保持方針の設定を返す。
+
+    setting.json の "conversation_log": {"retention_days": 90, "max_lines": 2000} を読み込む。
+    保持日数を超えたアーカイブは削除し、行数上限を超えた分はアーカイブへ退避する（社長決定 2026/08/05）。
+
+    Returns:
+        dict: {"retention_days": int, "max_lines": int} 形式。
+              retention_days は 1〜3650 日、max_lines は 100〜1000000 行にクランプする。
+    """
+    setting = load_setting()
+    conf = setting.get("conversation_log", {}) if isinstance(setting, dict) else {}
+    # 型不正な値は空扱いにして既定へ倒す
+    if not isinstance(conf, dict):
+        conf = {}
+
+    # 社長決定により保持日数の既定は90日
+    retention_days = _safe_int(conf.get("retention_days"), 90)
+    if retention_days is None:
+        retention_days = 90
+    # 0日以下や極端な長期を防ぐため 1〜3650 日にクランプする
+    retention_days = max(1, min(3650, retention_days))
+
+    # 行数上限の既定は2000行（1子あたりの会話ログを妥当な範囲に抑える）
+    max_lines = _safe_int(conf.get("max_lines"), 2000)
+    if max_lines is None:
+        max_lines = 2000
+    # 小さすぎる・大きすぎる値を防ぐため 100〜1000000 行にクランプする
+    max_lines = max(100, min(1000000, max_lines))
+
+    return {
+        "retention_days": retention_days,
+        "max_lines": max_lines,
+    }
+
+
 def find_user_by_key(key: str) -> dict | None:
     """
     key は settings/users/*.json のファイル名（拡張子なし）

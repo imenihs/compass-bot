@@ -1861,8 +1861,8 @@ async def _dispatch_by_intent(
         )
         try:
             reply = await gemini_service.call_with_progress(
-                message.channel,
                 chat_prompt,
+                channel=message.channel,
                 timeout_reply=(
                     "ごめん、今AI側が混み合っているか応答が遅いみたいで、返事できなかったよ。"
                     "少し時間をおいてもう一度送ってね。何度も続くときは管理者に連絡してね。"
@@ -2386,8 +2386,8 @@ async def _on_message_impl(message: discord.Message):
             "少し時間をおいてもう一度送ってね。何度も続くときは管理者に連絡してね。"
         )
         reply = await gemini_service.call_with_progress(
-            message.channel,
             prompt,
+            channel=message.channel,
             timeout_reply=assessment_timeout_reply,
         )
     except Exception as e:
@@ -2425,7 +2425,7 @@ async def _on_message_impl(message: discord.Message):
             f"元の回答:\n{reply}"
         )
         try:
-            repaired = await gemini_service.call_with_progress(message.channel, repair_prompt)
+            repaired = await gemini_service.call_with_progress(repair_prompt, channel=message.channel)
             if ASSESS_KEYWORD not in (repaired or ""):
                 repaired = f"{ASSESS_KEYWORD}\n{repaired}"
             repaired_assessed = gemini_service.extract_assessed_amounts(repaired)

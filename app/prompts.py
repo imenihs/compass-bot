@@ -87,13 +87,68 @@ def _age_language_rule(age: int | None) -> str:
     )
 
 
+def _format_conversation_history_ja(history: list[dict] | None, name: str) -> str:
+    """会話履歴を雑談プロンプト用の読みやすい対話 log へ整形する。
+
+    履歴は `_recent_conversation_history`（`app/bot_utils.py:130-144`）が返す
+    `{"ts", "user", "assistant"}` 形式のリストを古い→新しい順で受け取る。
+    査定側 `build_prompt` は同じ履歴を JSON で差し込むが、雑談側は行志向の
+    「子/ボット」対話形式にして、直前の話題を取り違えないようにする。
+
+    Args:
+        history: 会話履歴のリスト。各要素は user / assistant を持つ dict。None・空なら差し込まない。
+        name: 子ユーザー名。発話者ラベルに使う。
+
+    Returns:
+        str: 「直前の会話」ブロックの文字列。履歴が無ければ空文字を返す。
+    """
+    # 履歴が無い初回ターンは何も差し込まない。空文字で呼び出し側の連結に影響を与えない
+    if not history:
+        return ""
+    lines: list[str] = []
+    for row in history:
+        # dict 以外の壊れた要素は無視する。1行崩れても会話全体を落とさない
+        if not isinstance(row, dict):
+            continue
+        user_text = str(row.get("user") or "").strip()
+        assistant_text = str(row.get("assistant") or "").strip()
+        # 子の発話が空の行は文脈にならないため飛ばす
+        if user_text:
+            lines.append(f"{name}さん: {user_text}")
+        # ボットの返答が空（未応答・記録漏れ）なら子の発話だけ残す
+        if assistant_text:
+            lines.append(f"Compass: {assistant_text}")
+    # 有効な発話が1件も無ければブロックごと省く
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    # 直前の会話であることを明示し、末尾に空行を足して次ブロックと分離する
+    return (
+        "【直前の会話（古い→新しい。この続きとして自然に返す）】\n"
+        f"{body}\n\n"
+    )
+
+
 def build_chat_prompt(
     user_conf: dict,
     input_text: str,
     bot_personality: str = "sibling",
+    conversation_history: list[dict] | None = None,
 ) -> str:
     """intent:none（雑談）用の楽しい会話プロンプトを構築する。
-    お金の話は子供から切り出した場合のみ乗る。"""
+    お金の話は子供から切り出した場合のみ乗る。
+
+    Args:
+        user_conf: 対象児童の設定 dict（name / age / bot_personality 等）。
+        input_text: 今回の子どもの発話。
+        bot_personality: 口調パーソナリティ。user_conf 未指定時のフォールバック。
+        conversation_history: 直近会話履歴（`{"ts","user","assistant"}` の古い→新しい順リスト）。
+            指定時は「直前の会話」として差し込み、査定側 build_prompt との非対称を解消する。
+            None・空なら差し込まない（従来どおりの単発会話プロンプトになる）。
+
+    Returns:
+        str: Gemini へ渡す雑談プロンプト全文。
+    """
     name = user_conf.get("name", "きみ")
     age = None
     raw_age = user_conf.get("age")
@@ -104,6 +159,8 @@ def build_chat_prompt(
     age_text = f"{age}歳" if age else "年齢不明"
     age_rule = _age_language_rule(age)
     tone_rule = _personality_tone_rule(bot_personality)
+    # 会話履歴を読みやすい対話 log へ整形する。履歴なしなら空文字で従来挙動を保つ
+    history_block = _format_conversation_history_ja(conversation_history, name)
 
     return (
         f"あなたはお小遣い管理ボット「Compass」です。\n"
@@ -114,7 +171,9 @@ def build_chat_prompt(
         "- 子供が楽しいと感じる返し方をする（共感・驚き・面白いリアクション）\n"
         "- 2〜3文程度で短く返す。長い説明は不要\n"
         "- お金の話は子供から出てきた場合のみ自然に乗る。こちらからは誘導しない\n"
-        "- 説教・アドバイスは一切しない\n\n"
+        "- 説教・アドバイスは一切しない\n"
+        "- 直前の会話があるときは、その話題を踏まえて自然に続ける。前に出た話を取り違えない\n\n"
+        f"{history_block}"
         f"【{name}さんのメッセージ】{input_text}"
     )
 

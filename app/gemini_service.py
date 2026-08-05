@@ -37,6 +37,8 @@ class GeminiService:
         except ValueError:
             self.max_wait_sec = 40.0
         self.client = genai.Client(api_key=api_key, http_options={"timeout": timeout_ms})
+        # 直近の call_with_progress がタイムアウト代替文を返したか。初期値は False
+        self.last_call_timed_out = False
 
     def call(self, prompt: str) -> str:
         last_error = None
@@ -71,10 +73,27 @@ class GeminiService:
 
     async def call_with_progress(
         self,
-        channel: discord.abc.Messageable,
         prompt: str,
+        *,
+        channel: discord.abc.Messageable | None = None,
         timeout_reply: str | None = None,
+        progress=None,
     ) -> str:
+        """
+        進捗通知付きでGeminiを非同期呼び出しする。
+
+        引数:
+            prompt: Geminiへ渡すプロンプト。
+            channel: 進捗通知の直接送信先。`progress` 未指定時のフォールバックに使う。
+            timeout_reply: max_wait超過時に返す代替文。None なら TimeoutError を送出する。
+            progress: 進捗通知コールバック（非同期）。指定時は `channel.send` の代わりに呼ぶ。
+        戻り値:
+            Geminiの応答文字列。タイムアウト時は timeout_reply（指定時）。
+        副作用:
+            self.last_call_timed_out に、今回タイムアウト代替文を返したか否かを記録する。
+        """
+        # 呼び出しごとにタイムアウト判別フラグを初期化する
+        self.last_call_timed_out = False
         task = asyncio.create_task(asyncio.to_thread(self.call, prompt))
         started = time.monotonic()
         wait_notice_sent = False
@@ -84,6 +103,8 @@ class GeminiService:
             if remaining <= 0:
                 task.cancel()
                 if timeout_reply is not None:
+                    # 代替文を返したことを呼び出し側が判別できるよう記録する
+                    self.last_call_timed_out = True
                     return timeout_reply
                 raise TimeoutError(f"Gemini response exceeded {self.max_wait_sec:.0f} seconds")
             try:
@@ -94,10 +115,37 @@ class GeminiService:
             except asyncio.TimeoutError:
                 if not wait_notice_sent:
                     wait_notice_sent = True
-                    try:
-                        await channel.send("時間がかかってるから、もう少しだけ待ってね。")
-                    except Exception:
-                        pass
+                    # 進捗通知は progress コールバックへ委譲する。応答の出口を経由させるため
+                    await self._notify_progress(
+                        "時間がかかってるから、もう少しだけ待ってね。",
+                        channel=channel,
+                        progress=progress,
+                    )
+
+    async def _notify_progress(self, text: str, *, channel=None, progress=None) -> None:
+        """
+        進捗通知を送る。progress コールバックがあれば優先し、無ければ channel へ直接送る。
+
+        引数:
+            text: 通知本文。
+            channel: フォールバック送信先。
+            progress: 進捗通知コールバック（非同期関数）。
+        注意:
+            通知失敗は握りつぶす。進捗通知は本処理の成否に影響させない。
+        """
+        # progress コールバック優先。応答の出口（会話ログ記録含む）を通せるようにするため
+        if progress is not None:
+            try:
+                await progress(text)
+            except Exception:
+                pass
+            return
+        # progress 未指定時は従来どおり channel へ直接送る（移行期間中の後方互換）
+        if channel is not None:
+            try:
+                await channel.send(text)
+            except Exception:
+                pass
 
     def extract_assessed_amounts(self, reply: str) -> dict | None:
         text = reply or ""
