@@ -37,8 +37,11 @@ _ARCHIVE_RE = re.compile(
 def append_conversation(path: Path, record: dict) -> None:
     """会話ログへ1行追記する。原子性もロックも持たない素の追記である。
 
-    append_jsonl と同じく単純追記に徹する。ターン間の直列化（同一ループの
-    2コルーチンが同時に書く場合の排他）は呼び出し側の session.py が担う。
+    append_jsonl と同じく単純追記に徹する。会話ログの記録は応答の出口（reply.py）が
+    session.py のロック外で呼ぶ（rotate と送信を臨界区間の外で回す設計のため）。したがって
+    本関数はターン間の順序を保証しない。同一児童の2ターンが並行すると入力→応答の並びが
+    乱れうるが、1回の write で行自体は壊れず、同一児童の同時ターンは実運用では稀である。
+    厳密な順序が要る場合は呼び出し側で直列化すること。
     ts が無い record には JST の現在時刻を補う。各行に発話時刻を残し、
     将来プロンプトへ渡す会話履歴を時系列・種別でフィルタできるようにするため。
 
@@ -53,7 +56,7 @@ def append_conversation(path: Path, record: dict) -> None:
     if "ts" not in record:
         record = {"ts": now_jst_iso(), **record}
     path.parent.mkdir(parents=True, exist_ok=True)
-    # 追記自体は排他を持たない。直列化は session.py の asyncio.Lock 側の責務
+    # 追記自体は排他を持たない。順序保証は無い（同一児童の同時ターンは稀）
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 

@@ -227,6 +227,64 @@ def conversation_log_setting() -> dict:
     return config.get_conversation_log_setting()
 
 
+def conversation_session_setting() -> dict:
+    """会話セッションの失効設定（expiry_minutes）を返す。
+
+    conversation_log_setting と対をなす解決口。app/conv/** は app.config を直接
+    import しない規約のため、セッションを張る側は open_session の ttl_minutes に
+    本関数の expiry_minutes を渡してセッション失効を設定値へ連動させる。SessionStore
+    自身は依存を持たず、設定の解決は必ずこの deps 経由に集約する。
+
+    Returns:
+        dict: {"expiry_minutes": int} 形式。会話セッションの失効判定に使う。
+    """
+    # log 設定と同じく app.config を遅延 import して直接読む
+    config = importlib.import_module("app.config")
+    return config.get_conversation_session_setting()
+
+
+# ------------------------------------------------------------------
+# 会話セッションストア（唯一のインスタンスを共有する）
+# ------------------------------------------------------------------
+# SessionStore の排他は per-instance の asyncio.Lock で行うため、同じ data ファイルを
+# 指すインスタンスを2つ作ると各々別ロックになり相互排他が黙って失われる（罠7が破れる）。
+# 対話層のハンドラは必ず本アクセサから唯一のインスタンスを取得し、SessionStore() を
+# 直接生成してはならない（生成はテストと本アクセサ内部だけ）。
+_session_store = None
+
+
+def session_store():
+    """唯一の SessionStore インスタンスを返す（無ければ生成して共有する）。
+
+    第2段以降のハンドラはセッション操作をすべてこの1点から取得する。呼び出しごとに
+    SessionStore() を new すると別ロックになり罠7を踏むため、生成口を1つに縛る。
+    保存先はリポジトリ直下 data/（SessionStore の既定）で、log_dir とは独立に
+    conversation_sessions.json / payout_requests.json を所有する。
+
+    Returns:
+        SessionStore: 会話セッションと支給要請を所有する唯一のストア。
+    """
+    global _session_store
+    if _session_store is None:
+        # 遅延 import で循環を避けつつ、唯一のインスタンスを1度だけ生成する
+        session = importlib.import_module("app.conv.session")
+        _session_store = session.SessionStore()
+    return _session_store
+
+
+def set_session_store(store) -> None:
+    """テスト用に SessionStore を差し替える。本番経路では呼ばない。
+
+    テストは一時ディレクトリを data_dir に持つ SessionStore を渡し、実データの
+    conversation_sessions.json / payout_requests.json を避ける。
+
+    Args:
+        store: 差し替える SessionStore（None を渡すと次回 session_store() が再生成）。
+    """
+    global _session_store
+    _session_store = store
+
+
 # ------------------------------------------------------------------
 # 設定値（import 時に bot 側で定数へ束縛される。テストは値ごと差し替える）
 # ------------------------------------------------------------------

@@ -78,6 +78,7 @@ class GeminiService:
         channel: discord.abc.Messageable | None = None,
         timeout_reply: str | None = None,
         progress=None,
+        result_meta: dict | None = None,
     ) -> str:
         """
         進捗通知付きでGeminiを非同期呼び出しする。
@@ -87,12 +88,20 @@ class GeminiService:
             channel: 進捗通知の直接送信先。`progress` 未指定時のフォールバックに使う。
             timeout_reply: max_wait超過時に返す代替文。None なら TimeoutError を送出する。
             progress: 進捗通知コールバック（非同期）。指定時は `channel.send` の代わりに呼ぶ。
+            result_meta: 呼び出しごとに一意な可変 dict。指定時は result_meta["timed_out"] へ
+                今回タイムアウト代替文を返したか否かを書く。並行呼び出しでも取り違えない、
+                タイムアウト判別の推奨手段。第3段の査定経路はこれを読む。
         戻り値:
             Geminiの応答文字列。タイムアウト時は timeout_reply（指定時）。
         副作用:
-            self.last_call_timed_out に、今回タイムアウト代替文を返したか否かを記録する。
+            self.last_call_timed_out にも同じ値を書くが、これは単一インスタンスで共有される
+            属性であり、Bot と Web が同一イベントループで並行呼び出しすると別の呼び出しに
+            上書きされる。直近1回しか正しくないため、確実な判別には result_meta を使うこと。
         """
-        # 呼び出しごとにタイムアウト判別フラグを初期化する
+        # 呼び出しごとに一意な result_meta へ書く。並行呼び出し間で取り違えない
+        if result_meta is not None:
+            result_meta["timed_out"] = False
+        # 共有属性は後方互換のため残すが、並行時は当てにならない（result_meta を推奨）
         self.last_call_timed_out = False
         task = asyncio.create_task(asyncio.to_thread(self.call, prompt))
         started = time.monotonic()
@@ -103,7 +112,10 @@ class GeminiService:
             if remaining <= 0:
                 task.cancel()
                 if timeout_reply is not None:
-                    # 代替文を返したことを呼び出し側が判別できるよう記録する
+                    # 代替文を返したことを呼び出し側が判別できるよう記録する。
+                    # 並行安全な result_meta を優先し、共有属性は後方互換で併記する
+                    if result_meta is not None:
+                        result_meta["timed_out"] = True
                     self.last_call_timed_out = True
                     return timeout_reply
                 raise TimeoutError(f"Gemini response exceeded {self.max_wait_sec:.0f} seconds")

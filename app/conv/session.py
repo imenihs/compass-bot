@@ -20,6 +20,7 @@ tmp+replace の一連を1区間として保持し、臨界区間の内側で `aw
 """
 
 import asyncio
+import copy
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,7 +30,10 @@ from app.storage import append_jsonl, now_jst_iso
 # JST。会話セッションの時刻表現は台帳・ログと揃える
 JST = timezone(timedelta(hours=9))
 
-# セッションの既定有効期限（分）。期限切れ判定の既定値であり、張る側は個別に上書きできる
+# セッションの既定有効期限（分）。期限切れ判定の既定値であり、張る側は個別に上書きできる。
+# 設定 setting.json の conversation_session.expiry_minutes と連動させるには、張る側が
+# deps.conversation_session_setting()["expiry_minutes"] を open_session の ttl_minutes へ渡す。
+# SessionStore 自身は依存を持たない設計を保つため、config の解決は呼び出し側に委ねる。
 DEFAULT_SESSION_TTL_MINUTES = 30
 
 
@@ -135,7 +139,10 @@ class SessionStore:
             )
             raise RuntimeError(f"{path.name} を不正な形（{top_key} キー欠落）で上書きしようとしました")
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 同一ディレクトリへ .tmp を書いてから replace することで、途中失敗でも本体を壊さない
+        # 同一ディレクトリへ .tmp を書いてから replace することで、途中失敗でも本体を壊さない。
+        # 同期は wallet_service（_save_wallet_state）に合わせ fsync しない。電源断直後の耐障害性を
+        # 上げるなら flush+os.fsync と親ディレクトリの fsync を足すが、その際は wallet_service と
+        # 同時に変更して両者の挙動を揃える前提とする。
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(doc, f, ensure_ascii=False, indent=2)
@@ -247,8 +254,10 @@ class SessionStore:
             }
             sessions[user_name] = session
             self._save_doc(self.sessions_path, doc, "sessions")
-            # 完全な内容を返す。呼び出し側は保存結果をそのまま参照できる
-            return dict(session)
+            # deepcopy で返す。浅いコピーだと data の nested dict を共有し、呼び出し側の
+            # in-place 変更が永続化されないのに参照だけ書き換わる罠になる（第3段で data に
+            # 支給要請の金額内訳を載せる際に効く）。変更は必ず open_session で保存し直す
+            return copy.deepcopy(session)
 
     async def get_session(self, user_name: str) -> dict | None:
         """児童のセッションを読む。期限切れは自動でクリアし None を返す。
@@ -274,8 +283,9 @@ class SessionStore:
                 sessions.pop(user_name, None)
                 self._save_doc(self.sessions_path, doc, "sessions")
                 return None
-            # 完全な内容を返す。呼び出し側は kind と data の両方を参照できる
-            return dict(session)
+            # deepcopy で返す。返り値 data の in-place 変更は永続化されないため、
+            # 変更は必ず open_session で保存し直す（open_session と同じ約束）
+            return copy.deepcopy(session)
 
     async def clear_session(self, user_name: str) -> bool:
         """児童のセッションを抜ける（削除する）。キャンセル語や完了時に呼ぶ。

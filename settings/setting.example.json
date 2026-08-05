@@ -28,6 +28,13 @@
   "child_income_report": {
     "max_amount": 5000
   },
+  "conversation_session": {
+    "expiry_minutes": 30
+  },
+  "conversation_log": {
+    "retention_days": 90,
+    "max_lines": 2000
+  },
   "low_balance_alert": {
     "enabled": false,
     "threshold": 500,
