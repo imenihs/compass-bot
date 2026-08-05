@@ -527,6 +527,54 @@ def _set_initial_setup_pending(user_name: str, enabled: bool) -> None:
     state["initial_setup_pending_by_user"] = pending
     wallet_service.save_audit_state(state)
 
+# 単独で「やめたい」と読める短い語。完全一致でのみ判定する
+_CANCEL_EXACT_KEYWORDS = ["やめ", "パス", "スキップ", "いいや", "キャンセル", "中止", "あとで", "あと"]
+# 他の語の一部として現れにくい言い回し。部分一致で判定してよい
+# 「わからない」「500円しかない」「レシートないや」を巻き込まないことを条件に選んでいる
+_CANCEL_PARTIAL_KEYWORDS = [
+    "キャンセル",
+    "やめる",
+    "やめとく",
+    "やめたい",
+    "やっぱいい",
+    "やっぱりいい",
+    "やっぱやめ",
+    "やっぱりやめ",
+    "もういい",
+    "またあとで",
+    "やっぱりあとで",
+    "やっぱあとで",
+    "あとでやる",
+    "あとでにする",
+    "あとにする",
+    "また今度",
+    "今度にする",
+    "中止",
+]
+
+
+def _is_cancel_reply(input_text: str) -> bool:
+    """会話の途中で「やめたい」と言われたかを判定する。
+
+    完全一致の語と部分一致してよい語を分けて持つ。
+    `is_no_reply` の語彙には「ない」「いい」が含まれ、部分一致に使うと
+    「わからない」「500円しかない」まで拾ってしまうため、ここでは使わない。
+
+    Args:
+        input_text: 子供が送ってきた本文。
+
+    Returns:
+        bool: キャンセルの意思と判定できる場合 True。
+    """
+    body = (input_text or "").strip()
+    if not body:
+        return False
+    # 短い語は完全一致に限る（「やめ」が他の語の一部に現れる誤判定を避ける）
+    if body in _CANCEL_EXACT_KEYWORDS:
+        return True
+    return _contains_any_keyword(body, _CANCEL_PARTIAL_KEYWORDS)
+
+
 async def _handle_initial_setup_pending(
     message: discord.Message,
     user_conf: dict,
@@ -539,11 +587,21 @@ async def _handle_initial_setup_pending(
     if not user_name or not _is_initial_setup_pending(user_name):
         return False
 
+    # 金額を待っている状態でも「やめたい」と言われたら必ず抜けられるようにする
+    if _is_cancel_reply(input_block):
+        _set_initial_setup_pending(user_name, False)
+        await message.channel.send(
+            "わかった、初期設定はいったんやめておくね。\n"
+            "またやりたくなったら「初期設定」って送ってね。"
+        )
+        return True
+
     # pending 状態: 金額入力を待っている
     amount = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
     if amount is None:
         await message.channel.send(
-            "初期設定を続けるよ。\nいまの所持金を `1234円` の形で送ってね。（円まで書いてね）"
+            "初期設定を続けるよ。\nいまの所持金を `1234円` の形で送ってね。（円まで書いてね）\n"
+            "やめたいときは「やめる」って送ってね。"
         )
         return True
 
@@ -1071,9 +1129,24 @@ async def _handle_wallet_check_pending(
     if not isinstance(wcp, dict) or user_name not in wcp:
         return False
 
+    # 金額を待っている状態でも「やめたい」と言われたら必ず抜けられるようにする
+    if _is_cancel_reply(input_block):
+        # 財布チェックの待ち状態だけ解除する。月次の未報告フラグ(pending_by_user)は親向け表示に要るため残す
+        wcp.pop(user_name, None)
+        state["wallet_check_pending_by_user"] = wcp
+        wallet_service.save_audit_state(state)
+        await message.channel.send(
+            "わかった、財布チェックはいったんやめておくね。\n"
+            "あとでやるときは「財布チェック」って送ってね。"
+        )
+        return True
+
     reported = _extract_confirmed_yen_amount(input_block, MAX_WALLET_INPUT_AMOUNT)
     if reported is None:
-        await message.channel.send("金額が読み取れなかったよ。「1500円」のように円まで書いて送ってね。")
+        await message.channel.send(
+            "金額が読み取れなかったよ。「1500円」のように円まで書いて送ってね。\n"
+            "やめたいときは「やめる」って送ってね。"
+        )
         return True
 
     await _do_wallet_check(message, user_conf, system_conf, reported)
