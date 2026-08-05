@@ -451,6 +451,26 @@ def get_log_dir(system_conf: dict) -> Path:
     rel = system_conf.get("log_dir", "data/logs")
     return ROOT / rel
 
+def get_child_income_report_setting() -> dict:
+    """
+    子供の自己申告入金（臨時入金）の上限設定を返す。
+
+    Returns:
+        dict: {"max_amount": int} 形式。1回の自己申告で反映できる上限額。
+              0 以下が設定された場合は上限なしとして扱う。
+    """
+    setting = load_setting()
+    conf = setting.get("child_income_report", {}) if isinstance(setting, dict) else {}
+    if not isinstance(conf, dict):
+        conf = {}
+
+    # 未設定でも安全側に倒したいので、既定値を入れて上限が必ず効くようにする
+    max_amount = _safe_int(conf.get("max_amount"), 5000)
+    if max_amount is None:
+        max_amount = 5000
+    return {"max_amount": int(max_amount)}
+
+
 def find_user_by_key(key: str) -> dict | None:
     """
     key は settings/users/*.json のファイル名（拡張子なし）

@@ -42,6 +42,7 @@ from app.config import (
     get_assess_keyword,
     get_allowance_reminder_setting,
     get_chat_setting,
+    get_child_income_report_setting,
     get_force_assess_test_keyword,
     get_gemini_model,
     get_log_dir,
@@ -103,6 +104,27 @@ PROACTIVE_CHILD_NUDGE = get_proactive_child_nudge_setting()
 
 # 初期設定・財布チェックで受け付ける現実的な財布上限。Discord ID等の誤入力を拒否する。
 MAX_WALLET_INPUT_AMOUNT = 1_000_000
+
+
+def _child_income_over_limit_message(amount: int, limit: int, user_name: str) -> str | None:
+    """子供の自己申告入金が上限を超えていないか判定し、超えていれば案内文を返す。
+
+    Args:
+        amount: 子供が申告した金額。
+        limit: 1回あたりの上限額。0 以下なら上限なしとして扱う。
+        user_name: 対象の子供の名前。案内文に含める。
+
+    Returns:
+        str | None: 上限超過なら親へ依頼する案内文。範囲内なら None。
+    """
+    # 0 以下は「上限を設けない」の意味として扱う
+    if limit <= 0 or int(amount) <= limit:
+        return None
+    return (
+        f"{int(amount):,}円 は自分で記録できる上限（{limit:,}円）を超えてるよ。\n"
+        "大きい金額は、おうちの人に記録してもらってね。\n"
+        f"（おうちの人へ: `残高調整 {user_name} +{int(amount)}円` で反映できます）"
+    )
 # 貯金目標の補完入力で受け付ける上限。通常の子供向け目標として十分な範囲にする。
 MAX_GOAL_INPUT_AMOUNT = 10_000_000
 _thinking_sent_message_keys: set[tuple[str, int]] = set()
@@ -1203,6 +1225,15 @@ async def _handle_manual_income_pending(
             await message.channel.send("いくらもらったか、`500円` の形で教えてね。（「やめる」でキャンセルもできるよ）")
         return True
 
+    # 自己申告は親の確認を経ないため、1回あたりの上限を超えたら親へ回す
+    over = _child_income_over_limit_message(
+        int(amount), int(get_child_income_report_setting().get("max_amount", 0)), user_name
+    )
+    if over:
+        _clear_manual_income_pending(user_name)
+        await message.channel.send(over)
+        return True
+
     partial = pending.get(user_name) if isinstance(pending.get(user_name), dict) else {}
     item = str(partial.get("item") or "").strip()
     before = wallet_service.get_balance(user_name)
@@ -1538,6 +1569,13 @@ async def _dispatch_by_intent(
         if not amount:
             _save_manual_income_pending(user_name, item)
             await message.channel.send("いくらもらったか、`500円` の形で教えてくれる？（「やめる」でキャンセルもできるよ）")
+            return True
+        # 自己申告は親の確認を経ないため、1回あたりの上限を超えたら親へ回す
+        over = _child_income_over_limit_message(
+            int(amount), int(get_child_income_report_setting().get("max_amount", 0)), user_name
+        )
+        if over:
+            await message.channel.send(over)
             return True
         before = wallet_service.get_balance(user_name)
         new_balance, achieved_goals = wallet_service.update_balance(

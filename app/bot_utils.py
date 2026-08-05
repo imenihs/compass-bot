@@ -582,7 +582,8 @@ def _ledger_history_message(user_conf: dict, rows: list[dict], limit: int = 10) 
         "manual_expense":            "手動支出",
         "manual_income":             "臨時入金",
         "balance_adjustment":        "残高調整",
-        "penalty":                   "ペナルティ",
+        # 減額処理は現在使われていない。罰ではなく記録調整として表示する
+        "penalty":                   "記録調整",
     }
 
     lines = []

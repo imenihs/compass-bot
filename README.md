@@ -244,6 +244,9 @@ Discord ID は桁落ちを避けるため画面では文字列入力として扱
 - `wallet_audit`: 月次残高監査設定
   - `enabled`, `check_day`, `check_time`, `penalty_rate`
   - 送信先は `allow_channel_ids` を使用（`channel_id` 設定は不要・無視される）
+- `child_income_report`: 子どもの自己申告入金（臨時入金）の上限設定
+  - `max_amount`: 1回の自己申告で反映できる上限額（円）。既定 5000。0 以下で上限なし
+  - 上限を超えた場合は残高を変えず、おうちの人に `残高調整` で記録してもらう案内を返す
 - `low_balance_alert`: 低残高アラート設定
   - `enabled`: true で有効化
   - `threshold`: 残高がこの値を下回ったときに通知（円）

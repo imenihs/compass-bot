@@ -25,6 +25,9 @@
     "check_time": "20:00",
     "penalty_rate": 1.0
   },
+  "child_income_report": {
+    "max_amount": 5000
+  },
   "low_balance_alert": {
     "enabled": false,
     "threshold": 500,
