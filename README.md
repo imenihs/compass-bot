@@ -22,7 +22,7 @@ Compass Bot は、子どもが自分のお小遣いを自主的に管理し、�
 
 ## 機能概要
 
-- Gemini でお小遣い査定（固定 / 臨時）を返す
+- AI（claude CLI）が会話を主導し、お小遣い査定（固定 / 臨時）を提案する（親承認で支給）
 - お小遣い帳（支出記録）を保存する
 - 財布残高（ウォレット）を管理する
 - 支出理由・満足度・記録漏れから、親子会話カードと子どもの小さなチャレンジを作る
@@ -33,12 +33,12 @@ Compass Bot は、子どもが自分のお小遣いを自主的に管理し、�
 
 ## 主な機能
 
-1. 査定Bot
-- メンション本文または自然文を解析して査定（設定で切替）
+1. 会話Bot（AI主導・Phase N-11）
+- 子どもの発話は claude CLI が会話を主導して処理する。会話文脈は claude セッションの `--resume` で継続する（会話が切れない）
+- 残高・支出・入金・目標・査定などお金を動かす処理は、AI が MCP wallet tool を呼び、Python（`wallet_service`）が実行する。金額計算は AI にさせない
+- 査定は AI が「提案」し、親が `査定承認 [名前]` / `査定却下 [名前]` で承認/却下する（子どもの自己支給を防ぐ）。支給上限は Python 側の4層ガードレール（固定増額 / 臨時 / 月次累計 / 1日の回数）で強制する
 - 親ユーザーは `名前の代理` で代理投稿可能
-- 応答が遅い場合、10秒ごとに進捗メッセージを送信
-- 査定結果は変更通知を `allowance_reminder.channel_id` に送信（変更がある項目のみ）
-- ルールベースでマッチしない短いコマンドは Gemini が意図を判定して処理する（ハイブリッド方式）
+- 応答が遅い場合（tool 使用時など）は「考えているよ」を送る
 
 2. お小遣い帳
 - 3〜4項目で記録
@@ -109,15 +109,19 @@ Compass Bot は、子どもが自分のお小遣いを自主的に管理し、�
 
 ## ディレクトリ構成
 
-- `app/bot.py`: Discordイベント（on_message/on_ready）・コアハンドラ（初期設定・支出記録・Gemini査定フロー）
-- `app/handlers_parent.py`: 親専用コマンドハンドラ群（支給・残高調整・ダッシュボード等10機能）
-- `app/handlers_child.py`: 子供向けコマンドハンドラ群（支出記録・目標貯金・振り返り等7機能）
+- `app/bot.py`: Discordイベント（on_message/on_ready）・入口処理・親コマンド配線。子どもの発話は `app/conv/ai_conversation.py` へ委譲する
+- `app/conv/ai_conversation.py`: AI主導の会話層（claude CLI を subprocess 起動、`--resume` で会話継続、金額処理は wallet tool へ委譲）
+- `app/conv/session.py`: 会話セッション（claude session_id）と支給要請の所有・排他（conversation_sessions.json / payout_requests.json）
+- `app/conv/reply.py`: 応答の唯一の出口（送信・会話ログ記録・分割）。`app/conv/deps.py`: 依存解決層
+- `app/mcp_wallet.py`: claude CLI へ財布操作を公開する MCP サーバ（get_balance / record_expense / record_income / set_savings_goal / propose_allowance / grant_allowance）。operation_key 冪等・本人性束縛・4層ガードレールを Python で強制
+- `app/handlers_parent.py`: 親専用コマンドハンドラ群（支給・残高調整・ダッシュボード・査定承認等）
+- `app/handlers_child.py`: 子供向けコマンドハンドラ群（一部は AI 主導層へ移行済み）
 - `app/bot_utils.py`: グローバル状態不使用の純粋ユーティリティ関数群
-- `app/gemini_service.py`: Gemini API 呼び出し・査定抽出（call_silent / call_with_progress）
+- `app/gemini_service.py`: 旧 Gemini API 呼び出し（N-11 で会話の主役は claude CLI へ移行。一部の補助処理でのみ使用）
 - `app/message_parser.py`: メッセージ解析（メンション除去・入力パース）
 - `app/reminder_service.py`: 月次リマインド・残高監査・月次サマリーの定期処理ループ
 - `app/wallet_service.py`: 残高管理・台帳・監査状態・目標貯金（wallet_state.json）
-- `app/prompts.py`: Gemini へ渡すプロンプトのビルド関数
+- `app/prompts.py`: プロンプトのビルド関数
 - `app/learning_insights.py`: 支出ログから親子会話カード、チャレンジ、プロンプト要点を生成する分析エンジン
 - `app/config.py`: 設定ファイル読み込み（users / setting / system）
 - `app/storage.py`: JSONL 追記・JST タイムスタンプなど共通I/Oユーティリティ
