@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "wallet": {
+      "command": "/web/compass-bot/.venv/bin/python",
+      "args": ["-m", "app.mcp_wallet"],
+      "cwd": "/web/compass-bot"
+    }
+  }
+}

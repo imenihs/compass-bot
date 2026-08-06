@@ -15,6 +15,7 @@ Phase N-11 の核。AI が会話を主導し、金額を動かす確定処理だ
 wallet_state.json など実データは wallet_service を通じてのみ触る（直接ファイルを開かない）。
 """
 import json
+import os
 import sys
 
 from app import config, wallet_service as wallet_module
@@ -25,6 +26,12 @@ MAX_AMOUNT = MAX_WALLET_INPUT_AMOUNT
 
 # 単一の WalletService を共有する。サーバは1プロセス1インスタンスで直列化される
 _wallet = wallet_module.WalletService()
+
+# 会話層が subprocess 起動時に env で渡す「今この会話をしている子ども」の名前。
+# tool の対象児童は AI が渡す name 引数ではなく必ずこの値で決める（AI がプロンプト
+# インジェクションで別の子を対象にする越境を、モデルの制御外で塞ぐ）。会話ボット用途では
+# 会話の相手は1人に固定されるため、この env が唯一の正当な対象児童になる。
+ACTIVE_CHILD = os.environ.get("COMPASS_ACTIVE_CHILD", "").strip()
 
 
 def _send(msg: dict) -> None:
@@ -46,14 +53,40 @@ def _system_conf() -> dict:
     return config.load_system()
 
 
-def _resolve_child(name: str) -> dict | None:
-    """名前から登録済み子ユーザー設定を引く。親・未登録名は None。
+class _ChildMismatch(Exception):
+    """AI が渡した name が、束縛された発話者（ACTIVE_CHILD）と食い違うことを表す。
 
-    find_user_by_name は親も返すため使わない。find_child_user_by_name（子ディレクトリのみ）を
-    使い、親名で残高操作されて親名義の偽の財布が実帳簿に混入するのを防ぐ。
+    越境操作の試みを tool 層で拒否し、AI へ明示エラーを返すために使う。
     """
-    # 子ユーザー限定で引く。親を金額操作の対象にしない
-    conf = config.find_child_user_by_name(name)
+
+
+def _resolve_child(name: str) -> dict | None:
+    """操作対象の子ユーザー設定を引く。親・未登録名は None。越境は例外。
+
+    ACTIVE_CHILD（会話層が env で束縛した発話者）が設定されていれば、対象児童は必ず
+    ACTIVE_CHILD にする。AI が渡す name はこの値と一致するときだけ許し、異なれば _ChildMismatch を
+    上げて越境を拒否する（プロンプトインジェクションで別の子の実残高を操作する穴を、モデルの
+    制御外で塞ぐ）。ACTIVE_CHILD 未設定時（会話以外の呼び出し）は従来どおり name で子を引く。
+
+    Args:
+        name: AI が tool 引数で渡した対象名。
+
+    Returns:
+        dict | None: 対象の子ユーザー設定。子に無ければ None。
+
+    Raises:
+        _ChildMismatch: ACTIVE_CHILD と異なる子を対象にしようとした場合。
+    """
+    supplied = (name or "").strip()
+    if ACTIVE_CHILD:
+        # 発話者が束縛されている。AI が別の子を指定したら越境として拒否する
+        if supplied and supplied != ACTIVE_CHILD:
+            raise _ChildMismatch(supplied)
+        # 対象は常に束縛された発話者。AI の name は無視して信頼値で引く
+        conf = config.find_child_user_by_name(ACTIVE_CHILD)
+    else:
+        # 会話以外の呼び出し。子ユーザー限定で引く（親は対象にしない）
+        conf = config.find_child_user_by_name(supplied)
     if not isinstance(conf, dict):
         return None
     return conf
@@ -334,6 +367,12 @@ def _handle_tool_call(req_id, params: dict) -> None:
         return
     try:
         text = handler(args)
+    except _ChildMismatch as mismatch:
+        # 別の子を対象にしようとした越境。実残高は動いていない。AI へ拒否を明示する
+        text = (
+            f"「{mismatch}」の財布は操作できないよ。この会話でさわれるのは "
+            f"{ACTIVE_CHILD}さん自身の分だけだよ。"
+        )
     except Exception as e:
         # tool 内の想定外例外は AI へエラーとして返し、残高処理の失敗を握りつぶさない
         text = f"内部エラーで処理できなかったよ（{type(e).__name__}）。"

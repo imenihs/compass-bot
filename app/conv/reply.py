@@ -69,9 +69,10 @@ def _rotate_conversation(path: Any) -> None:
         # ただし live ファイル破損などで毎ターン静かに失敗し続けると無制限に肥大するため、
         # 検知できるよう診断ログへ1行だけ残す（記録の失敗はさらに握って本処理を守る）
         try:
-            log_dir = deps.get_log_dir()
+            # get_log_dir は既に data/logs を指す。他層(bot.py/wallet_service)と同じ
+            # data/logs/runtime_diagnostics.jsonl へ集約する（"logs" を重ねない）
             storage.append_jsonl(
-                log_dir / "logs" / "runtime_diagnostics.jsonl",
+                deps.get_log_dir() / "runtime_diagnostics.jsonl",
                 {
                     "ts": storage.now_jst_iso(),
                     "event": "conversation_rotate_error",
