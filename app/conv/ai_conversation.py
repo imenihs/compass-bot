@@ -25,6 +25,7 @@ Phase N-11 の中核。子どもの発話ごとに claude CLI を subprocess 起
 - 応答の送信・会話ログ記録は reply.send_reply（唯一の出口）を通す。
 """
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -32,6 +33,20 @@ from pathlib import Path
 
 from app import storage
 from app.conv import deps
+
+# 子どもごとのターン直列化ロック。同じ子が連投すると2つの handle_conversation が並行し、
+# 同じ session_id を同時 resume して claude のセッションファイルを壊す・tool が二重実行される
+# （実残高の二重課金）ため、子ども単位で直列化する。子が違えば並行を保つ（ロックは per-child）。
+_child_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(user_name: str) -> asyncio.Lock:
+    """指定した子ども用のロックを返す（無ければ生成）。同じ子のターンを直列化する。"""
+    lock = _child_locks.get(user_name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _child_locks[user_name] = lock
+    return lock
 
 # 会話セッションの種別。SessionStore に張るセッションの kind を統一する
 SESSION_KIND = "ai_chat"
@@ -49,12 +64,14 @@ THINKING_DELAY_SEC = 3
 # MCP wallet サーバの設定ファイル。リポジトリ直下 config/wallet_mcp.json を使う
 WALLET_MCP_CONFIG = Path(__file__).resolve().parents[2] / "config" / "wallet_mcp.json"
 
-# AI へ許可する wallet tool。ここに無い tool は AI が呼べない（最小権限）
+# AI へ許可する wallet tool。ここに無い tool は AI が呼べない（最小権限）。
+# set_initial_balance（残高を任意額へ直接セットする管理操作）は意図的に含めない。
+# 自己申告入金の上限を迂回して子どもが自分の残高を書き換えられてしまうため、初期設定は
+# 親コマンド経路に限定する。会話では残高を「増減」だけできる（record_expense/record_income）。
 ALLOWED_WALLET_TOOLS = [
     "mcp__wallet__get_balance",
     "mcp__wallet__record_expense",
     "mcp__wallet__record_income",
-    "mcp__wallet__set_initial_balance",
     "mcp__wallet__get_savings_goals",
     "mcp__wallet__set_savings_goal",
 ]
@@ -103,8 +120,9 @@ def _build_system_prompt(user_conf: dict) -> str:
         f"あなたは子ども「{name}」（{age_text}）のお小遣い管理を手伝う、やさしい会話ボットです。"
         f"口調は「{personality}」。{age_text}の子が読める、やさしい日本語で短く話します。\n"
         "【重要な約束】\n"
-        "- お金（残高・支出・入金・初期設定・貯金目標）を動かすときは、必ず wallet ツールを使うこと。"
+        "- お金（残高・支出・入金・貯金目標）を動かすときは、必ず wallet ツールを使うこと。"
         "自分で金額を計算したり、残高を勝手に宣言したりしないこと。\n"
+        "- 残高を最初から決め直す「初期設定」はできない。頼まれてもおうちの人に相談するよう伝えること。\n"
         "- 残高や結果は、ツールが返した値だけを信じて伝えること。\n"
         "- 同じ操作を二度実行しないよう、ツールの operation_key には毎回ちがう一意な文字列を渡すこと。\n"
         "- お金以外の雑談は、ツールを使わず自然に会話すること。\n"
@@ -230,7 +248,8 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
         child_name: 発話者名（env 束縛用）。
 
     Returns:
-        tuple[bool, str, str | None]: (成功, 応答文, session_id)。
+        tuple[bool, str, str | None, bool]: (成功, 応答文, session_id, タイムアウトしたか)。
+            session_id は失敗時でも取れたものを返す（呼び出し側が捨てず継続に使える）。
     """
     # 1回目: 継続を試みる。タイムアウトと起動失敗は区別して診断する
     timed_out = False
@@ -247,8 +266,13 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
         _diag("ai_conversation_spawn_error", {"child": child_name, "error": f"{type(e).__name__}: {e}"})
 
     ok, result, new_sid = _parse_output(stdout)
-    if ok and returncode == 0:
-        return True, result, new_sid
+    # 正常な JSON 応答(is_error 偽・result 有)なら returncode に関わらず成功として扱う。
+    # wallet tool 実行時は MCP 子プロセスの teardown 等で returncode≠0 になりやすく、returncode で
+    # 弾くと「tool が残高を動かした後なのに失敗応答を返す」不一致になる（残高は動いたのに黙殺）。
+    if ok:
+        if returncode != 0:
+            _diag("ai_conversation_nonzero_exit_ok", {"child": child_name, "returncode": returncode})
+        return True, result, new_sid, timed_out
 
     # 再試行は「resume 対象が見つからない」失敗に限る。タイムアウト・その他失敗では絶対に再試行しない。
     # このシグナルは会話開始前に出るため、tool は1つも実行されておらず二重課金にならない
@@ -259,11 +283,15 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
             returncode2, stdout2, stderr2 = await _spawn_claude(prompt, None, system_prompt, child_name)
         except Exception as e:
             _diag("ai_conversation_spawn_error", {"child": child_name, "error": f"{type(e).__name__}: {e}", "retry": True})
-            return False, "", None
+            return False, "", None, False
         ok2, result2, new_sid2 = _parse_output(stdout2)
-        if ok2 and returncode2 == 0:
-            return True, result2, new_sid2
-        return False, "", None
+        # 再試行も returncode でなく ok（正常な JSON 応答）で判定する
+        if ok2:
+            if returncode2 != 0:
+                _diag("ai_conversation_nonzero_exit_ok", {"child": child_name, "returncode": returncode2, "retry": True})
+            return True, result2, new_sid2, False
+        # 再試行も失敗。取れた session_id は返す（呼び出し側が継続に使える）
+        return False, "", new_sid2, False
 
     # 再試行しない失敗。stderr を診断へ残して原因を追えるようにする
     if not ok:
@@ -271,7 +299,8 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
             "child": child_name, "returncode": returncode,
             "timed_out": timed_out, "stderr": stderr[:500],
         })
-    return False, "", None
+    # 失敗でも取れた session_id は返す。tool が動いたターンの文脈を次へ繋ぐため
+    return False, "", new_sid, timed_out
 
 
 async def handle_conversation(channel, user_conf: dict, input_text: str) -> str:
@@ -293,17 +322,28 @@ async def handle_conversation(channel, user_conf: dict, input_text: str) -> str:
     Returns:
         str: 送信した応答の完全な内容。空応答なら空文字。
     """
+    user_name = str(user_conf.get("name", ""))
+    # 同じ子のターンを直列化する。連投による session 破損・tool 二重実行を防ぐ。子が違えば並行
+    async with _lock_for(user_name):
+        return await _handle_conversation_locked(channel, user_conf, input_text, user_name)
+
+
+async def _handle_conversation_locked(channel, user_conf: dict, input_text: str, user_name: str) -> str:
+    """handle_conversation の本体。子どもごとのロック配下で1ターンを処理する。"""
     from app.conv import reply  # 遅延 import で循環を避ける
 
-    user_name = str(user_conf.get("name", ""))
     store = deps.session_store()
 
-    # 1. 継続する session_id を引く。会話セッションの data に保持する
-    session = await store.get_session(user_name)
+    # 1. 継続する session_id を引く。会話セッションの data に保持する。
+    #    セッション I/O の失敗で応答経路を止めない（新規扱いにして会話は必ず続ける）
     session_id = None
-    if isinstance(session, dict) and session.get("kind") == SESSION_KIND:
-        data = session.get("data") or {}
-        session_id = data.get("claude_session_id")
+    try:
+        session = await store.get_session(user_name)
+        if isinstance(session, dict) and session.get("kind") == SESSION_KIND:
+            data = session.get("data") or {}
+            session_id = data.get("claude_session_id")
+    except Exception as e:
+        _diag("ai_conversation_session_read_error", {"child": user_name, "error": f"{type(e).__name__}: {e}"})
 
     # 2. 入力を会話ログへ記録する
     reply.record_incoming(user_name, input_text, kind=SESSION_KIND)
@@ -325,25 +365,34 @@ async def handle_conversation(channel, user_conf: dict, input_text: str) -> str:
     # 4. 発話は素のまま、人格・約束は --append-system-prompt、本人性は env で渡して claude を起動する
     system_prompt = _build_system_prompt(user_conf)
     try:
-        ok, result, new_session_id = await _run_claude(input_text, session_id, system_prompt, user_name)
+        ok, result, new_session_id, timed_out = await _run_claude(input_text, session_id, system_prompt, user_name)
     finally:
-        # 応答が返ったら考え中タスクを止める（未送信なら送らずに済む）
+        # 応答が返ったら考え中タスクを止め、決着を待つ（考え中送信が本応答より後に来る競合を防ぐ）
         thinking_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await thinking_task
 
-    # 5. session_id の更新方針:
-    #    - 成功して新しい id が取れたら保存する（次ターンの継続用）
-    #    - 失敗したら既存 id を保持する（一時的な失敗で会話文脈を捨てない）
-    if ok and new_session_id:
-        ttl = int(deps.conversation_session_setting().get("expiry_minutes", 30))
-        await store.open_session(
-            user_name, SESSION_KIND,
-            data={"claude_session_id": new_session_id},
-            ttl_minutes=ttl,
-        )
+    # 5. session_id の保存: 成功・失敗を問わず、取れた新しい id があれば保存する。
+    #    tool が残高を動かしたターンでも失敗フラグが立つことがあり、その id を捨てると会話文脈が欠落する。
+    #    セッション保存の失敗で応答を止めない（保存は best-effort、応答は必ず送る）
+    if new_session_id:
+        try:
+            ttl = int(deps.conversation_session_setting().get("expiry_minutes", 30))
+            await store.open_session(
+                user_name, SESSION_KIND,
+                data={"claude_session_id": new_session_id},
+                ttl_minutes=ttl,
+            )
+        except Exception as e:
+            _diag("ai_conversation_session_write_error", {"child": user_name, "error": f"{type(e).__name__}: {e}"})
 
-    # 応答が取れなければやさしいフォールバックを返す（実残高は動いていない）
+    # 応答が取れなければフォールバック。タイムアウトは tool が既に残高を動かした後かもしれないため、
+    # 「何も起きていない」と断定せず、残高を確かめるよう促す文言にする（実残高との不一致を避ける）
     if not ok or not result:
-        result = "ごめんね、いまうまくお返事できなかったよ。もう一度言ってくれる？"
+        if timed_out:
+            result = "ちょっと時間がかかっちゃった。残高が変わってないか、あとで「ざんだか」って聞いて確かめてね。"
+        else:
+            result = "ごめんね、いまうまくお返事できなかったよ。もう一度言ってくれる？"
 
     # 6. 唯一の出口から送信する（会話ログ記録＋分割を集約）
     return await reply.send_reply(channel, result, user_name=user_name, kind=SESSION_KIND)
