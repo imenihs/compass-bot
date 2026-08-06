@@ -149,12 +149,15 @@ def _build_system_prompt(user_conf: dict) -> str:
     return base
 
 
-# 会話がお金・学習に関わるか判定するキーワード。これらを含むターンだけコーチングを付ける。
-# 純雑談（食べ物・学校の話等）や単なる残高照会・履歴照会ではコーチングを出さず、監視的にしない。
-_COACHING_TRIGGER_WORDS = (
-    "円", "お金", "おかね", "かった", "買っ", "つかった", "使っ", "もらった",
-    "ためた", "貯め", "ためる", "目標", "もくひょう", "ほしい", "欲しい", "査定",
-    "おこづかい", "お小遣い", "貯金", "ちょきん",
+# お金・貯金そのものを指す語。これ単独でもお金の話題とみなす（誤爆の少ない明確な語だけ）。
+_COACHING_MONEY_WORDS = (
+    "円", "お金", "おかね", "おこづかい", "お小遣い", "貯金", "ちょきん", "査定",
+)
+# 目標・購買・入金の動詞。ただし単独では純雑談を拾いやすいので、金額語との共起を必須にする。
+# （「ほしい」「かった」等の部分一致で「パンほしい」「たのしかった」を誤って拾うのを防ぐ）
+_COACHING_ACTION_WORDS = (
+    "買っ", "かいもの", "つかった", "使っ", "もらった", "ためた", "貯め", "ためる",
+    "目標", "もくひょう", "ほしい", "欲しい",
 )
 # 単なる残高・履歴の照会。これだけの発話ではコーチングを出さない（お金の話でも問いかけは邪魔）。
 _COACHING_SUPPRESS_ONLY = ("残高", "ざんだか", "いくらある", "履歴", "りれき", "台帳")
@@ -164,18 +167,30 @@ _last_coached_action: dict[str, str] = {}
 
 
 def _should_coach(input_text: str) -> bool:
-    """この発話でコーチングを付けるべきか判定する。お金・学習の話題のときだけ True。"""
+    """この発話でコーチングを付けるべきか判定する。お金・貯金の話題のときだけ True。
+
+    誤爆を避けるため、(1)お金語（円・お金・貯金等）を含むか、(2)金額の数字＋購買/貯金動詞が
+    共起するとき、をお金の話題とみなす。「ほしい」「かった」単独では発火させない（純雑談を拾わない）。
+    単なる残高・履歴照会だけのときも出さない（監視的にしない）。
+    """
     text = input_text or ""
-    if not any(w in text for w in _COACHING_TRIGGER_WORDS):
-        # お金・学習に関わらない純雑談ではコーチングを出さない
+    has_money = any(w in text for w in _COACHING_MONEY_WORDS)
+    # 数字（半角/全角）と購買・貯金動詞が共起していれば、お金語が無くてもお金の話題とみなす
+    import re as _re
+    has_amount_digit = bool(_re.search(r"[0-9０-９]", text))
+    has_action = any(w in text for w in _COACHING_ACTION_WORDS)
+    is_money_topic = has_money or (has_amount_digit and has_action)
+    if not is_money_topic:
         return False
-    # 残高・履歴の照会「だけ」ならコーチングを出さない（トリガー語が残高系のみの場合）
+    # 残高・履歴の照会「だけ」ならコーチングを出さない
     stripped = text
     for w in _COACHING_SUPPRESS_ONLY:
         stripped = stripped.replace(w, "")
-    if not any(w in stripped for w in _COACHING_TRIGGER_WORDS):
-        return False
-    return True
+    # 照会語を除いた残りに、まだお金の話題性が残っているか
+    still_money = any(w in stripped for w in _COACHING_MONEY_WORDS) or (
+        bool(_re.search(r"[0-9０-９]", stripped)) and any(w in stripped for w in _COACHING_ACTION_WORDS)
+    )
+    return still_money
 
 
 async def _build_coaching_block_async(user_conf: dict, input_text: str) -> str:

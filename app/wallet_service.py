@@ -1,11 +1,38 @@
+import fcntl
 import json
 import sys
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from app.config import get_log_dir
 from app.storage import append_jsonl, now_jst_iso
+
+
+@contextmanager
+def _interprocess_lock(lock_path: Path):
+    """複数プロセス間で残高ファイルの read-modify-write を直列化するファイルロック。
+
+    threading.RLock は同一プロセス内しか排他できない。claude が起動する mcp_wallet 子プロセスと、
+    親承認を実行する bot プロセスが同じ wallet_state.json / payout_requests.json を別々に
+    read→変更→save するとロストアップデート（片方の更新が上書きで消える）が起きる。fcntl.flock で
+    OS レベルの排他ロックを張り、両プロセスが同じロックファイルを取ることで直列化する。
+
+    Args:
+        lock_path: ロック用ファイルのパス（対象ファイル名 + ".lock"）。
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path, "w")
+    try:
+        # 排他ロックを取る。他プロセスが保持中ならブロックして待つ
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            f.close()
 
 # 1ユーザーが登録できる貯金目標の上限数
 MAX_SAVINGS_GOALS = 5
@@ -146,7 +173,10 @@ class WalletService:
         extra: dict | None = None,
         operation_key: str | None = None,
     ) -> tuple[int, list[dict]]:
-        with self._lock:
+        # プロセス内(RLock)に加え、プロセス間(flock)でも直列化する。mcp_wallet 子プロセスと
+        # bot プロセスが同じ wallet_state.json を read-modify-write するロストアップデートを防ぐ。
+        lock_path = self.wallet_state_path.with_suffix(self.wallet_state_path.suffix + ".lock")
+        with self._lock, _interprocess_lock(lock_path):
             user_name = str(user_conf.get("name", "unknown"))
             state = self._load_wallet_state()
             users = state.setdefault("users", {})
