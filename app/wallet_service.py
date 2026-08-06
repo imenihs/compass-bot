@@ -163,6 +163,41 @@ class WalletService:
             u["expected_balance"] = int(amount)
             self._save_wallet_state(state)
 
+    def _prune_aux_operation_keys(self, applied_keys: dict, max_age_days: int = 2) -> None:
+        """applied_operation_keys から、aux=True かつ ts が max_age_days より古い自然キーを削る。
+
+        自然キー(dup:)は2分窓の言い直し検知専用で長期保持の意味がない。主キー(aux が無い/False)は
+        監査の正本なので触らない。ts が解釈できないキーは安全側で残す。呼び出しは update_balance の
+        flock 内に限る(applied_keys の read-modify-write を直列化するため)。
+
+        Args:
+            applied_keys: applied_operation_keys 本体（in-place で削る）。
+            max_age_days: この日数より古い aux キーを削除する。
+        """
+        from datetime import datetime, timedelta
+        try:
+            cutoff = datetime.fromisoformat(now_jst_iso()) - timedelta(days=max_age_days)
+        except ValueError:
+            return
+        to_delete = []
+        for key, meta in applied_keys.items():
+            if not isinstance(meta, dict) or not meta.get("aux"):
+                continue  # 主キーは監査の正本。残す
+            ts_raw = meta.get("ts")
+            if not ts_raw:
+                continue  # ts 不明は安全側で残す
+            try:
+                ts = datetime.fromisoformat(str(ts_raw))
+            except ValueError:
+                continue
+            # TZ 有無を揃えて比較する（cutoff は now_jst_iso 由来で aware）
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=cutoff.tzinfo)
+            if ts < cutoff:
+                to_delete.append(key)
+        for key in to_delete:
+            applied_keys.pop(key, None)
+
     def update_balance(
         self,
         user_conf: dict,
@@ -189,6 +224,10 @@ class WalletService:
             user_state = users.setdefault(user_name, {})
             before = int(user_state.get("expected_balance", 0))
             applied_keys = state.setdefault("applied_operation_keys", {})
+            # aux 自然キー(dup:)は2分窓の言い直し検知にしか使わないため無期限に残す必要がない。主キー
+            # (grant/expense等)は監査の正本なので残すが、aux キーだけは ts が古いものを剪定して
+            # applied_operation_keys の単調肥大(=毎回の tmp+replace 書込コスト・ロック保持時間の悪化)を防ぐ。
+            self._prune_aux_operation_keys(applied_keys)
             safe_operation_key = str(operation_key or "").strip()
             if safe_operation_key and safe_operation_key in applied_keys:
                 return before, []

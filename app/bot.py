@@ -717,7 +717,11 @@ async def _on_message_impl(message: discord.Message):
     # ただし「親IDが子としても登録されている」兼務アカウント（家族共有端末・親が練習で使う等）では、
     # 本人が子として実在するので締め出さず会話層へ通す（wallet tool は env 束縛でその子だけを操作するため
     # 実残高は安全）。ブロックは「親であり、かつ子として実在しない」場合に限定する。
-    author_is_registered_child = find_user_by_discord_id(message.author.id) is not None
+    # 判定は必ず find_child_user_by_discord_id（子ディレクトリのみ走査）を使う。find_user_by_discord_id は
+    # 親→子の順で親を先に返すため、純粋な親でも「子として実在」判定になりブロックが不発になる（親の自然文が
+    # 子残高を動かす越境が復活する）。子ディレクトリだけを見て「子として実在するか」を厳密に判定する。
+    from app.config import find_child_user_by_discord_id
+    author_is_registered_child = find_child_user_by_discord_id(message.author.id) is not None
     if is_parent(message.author.id) and not proxy_name and not author_is_registered_child:
         await message.channel.send(
             "お子さんのお小遣いを動かすときは、明示コマンドか `お子さんの名前の代理 〜` で話しかけてね。"

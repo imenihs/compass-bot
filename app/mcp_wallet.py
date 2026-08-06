@@ -351,9 +351,19 @@ def _do_record_expense(args: dict) -> str:
     # 言い直しによる二重適用を弾く自然キー（直近2分・同一金額/品目）。tool後失敗で子が言い直すと AI が
     # 別の生キーを選び eff_key 冪等をすり抜けるため、内容ベースの補助キーで防ぐ。
     dup_keys = _natural_dup_keys(name, "spending_record", amount, item)
-    # 既適用キー（主キー or 自然キー）なら update_balance はスキップ。事前検知で誤った二重報告を避ける
-    if _wallet.is_operation_applied(eff_key) or any(_wallet.is_operation_applied(k) for k in dup_keys):
+    # 既適用キーの扱いを分ける。主キー命中は「同一操作の再送」なので黙って冪等でよい。
+    # 自然キー命中は「同じ金額・品目を2分以内にまた記録」で、言い直しの二重適用の可能性が高いが、
+    # 本当に別の買い物(同額の駄菓子を2つ等)の可能性も残る。黙って落とすと実残高が実支出より高く残り
+    # 静かに狂うため、子が別支出だと明示できる逃げ道(「べつのかいもの」等)を文面で必ず示す。
+    if _wallet.is_operation_applied(eff_key):
         return f"この支出はさっき記録したよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
+    if any(_wallet.is_operation_applied(k) for k in dup_keys):
+        return (
+            f"さっきも同じ「{amount}円{('・' + item) if item else ''}」を記録したよ。"
+            "二重にならないよう、今回はまだ記録していないよ（残高は変わっていないよ）。\n"
+            "もしこれが【べつの買いもの】なら、『べつのかいもので◯◯を◯円つかった』のように、"
+            "ちがう言い方でもう一度教えてね。"
+        )
     before = _wallet.get_balance(name)
     # delta は負数（支出）。主キー＋自然キーで二重記録を防ぐ
     after, _ = _wallet.update_balance(
@@ -387,8 +397,15 @@ def _do_record_income(args: dict) -> str:
     # 言い直しによる二重適用を弾く自然キー（直近2分・同一金額/メモ）。tool後失敗の言い直しを内容ベースで防ぐ。
     note_for_dup = str(args.get("note") or "").strip()
     dup_keys = _natural_dup_keys(name, "manual_income", amount, note_for_dup)
-    if _wallet.is_operation_applied(eff_key) or any(_wallet.is_operation_applied(k) for k in dup_keys):
+    if _wallet.is_operation_applied(eff_key):
         return f"この入金はさっき記録したよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
+    if any(_wallet.is_operation_applied(k) for k in dup_keys):
+        # 自然キー命中。黙って落とさず、別の入金なら明示できる逃げ道を示す
+        return (
+            f"さっきも同じ「{amount}円{('・' + note_for_dup) if note_for_dup else ''}」を記録したよ。"
+            "二重にならないよう、今回はまだ記録していないよ（残高は変わっていないよ）。\n"
+            "もしこれが【べつのお金】なら、ちがう言い方でもう一度教えてね。"
+        )
     income_conf = config.get_child_income_report_setting()
     # 安全弁1: 1回あたりの上限。max_amount が 0 以下（誤設定）なら安全側の既定 5000円へ倒す
     max_income = int(income_conf.get("max_amount", 0))
