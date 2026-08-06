@@ -484,6 +484,16 @@ def take_pending_nudge_bridge(user_conf: dict) -> str:
             text = str(bridge.get("text") or "").strip()
             # 読んだら必ず消す（同じ問いかけを毎ターン注入しない）
             state.pop("pending_nudge_bridge", None)
+            # 橋渡しを消費した=子が能動ナッジ(challenge_stale の声かけ)へ会話で返答した、とみなす。
+            # child_response に responded_at=now を記録し、reminder の _has_recent_child_response が
+            # 会話経由の応答も拾えるようにする。これで会話で解決済みの課題を能動ナッジで蒸し返す
+            # (監視的挙動)を防ぐ。既存の challenge_id/feedback 形式に合わせ、会話由来と分かる値を入れる。
+            storage_mod = importlib.import_module("app.storage")
+            state["child_response"] = {
+                "challenge_id": str(state.get("last_child_action") or ""),
+                "feedback": "conversation_reply",
+                "responded_at": storage_mod.now_jst_iso(),
+            }
             tmp = path.with_suffix(".json.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
