@@ -728,25 +728,39 @@ async def _on_message_impl(message: discord.Message):
     # 親が承認して初めて支給される。mcp_wallet は Discord を叩けないため、ここで未通知の提案を
     # 検知して発話チャンネルへ知らせる（承認/却下コマンドの書式も必ず添える）。通知漏れで支給が
     # 放置され子の頑張りが宙に浮くのを防ぐ。
-    # 親を確実に呼ぶため、通知本文へ親IDメンションを付ける。親がそのチャンネルを常時見ていなくても
-    # メンションで通知が飛ぶ。加えて未承認 pending は reminder_service の定期ループが親へ再通知する
-    # （見逃し対策。ここでの1回きり通知に依存しない）。
+    # 親を確実に呼ぶため、通知本文へ親IDメンションを付ける（親がチャンネル非常駐でも届く）。
+    # 送信に成功した提案だけを notified にマークする。送信が失敗した提案は notified が立たず、
+    # 次の発話ターンで再び未通知として拾われ再通知される（見逃し・一時エラーの救済）。
     try:
         from app import mcp_wallet
         proposals = mcp_wallet.take_unnotified_proposals()
         if proposals:
             parent_mention = " ".join(f"<@{pid}>" for pid in sorted(get_parent_ids())) or "おうちの人"
+            notified_names = []
             for proposal in proposals:
                 child = str(proposal.get("name", ""))
                 total = int(proposal.get("total", 0))
                 reason = str(proposal.get("reason", ""))
-                await message.channel.send(
-                    f"🔔 {parent_mention} {child} さんの査定の提案が来ています。\n"
-                    f"- 提案額: {total}円\n- 理由: {reason}\n"
-                    f"承認するには `査定承認 {child}`、見送るには `査定却下 {child}` と送ってください。"
-                )
+                try:
+                    await message.channel.send(
+                        f"🔔 {parent_mention} {child} さんの査定の提案が来ています。\n"
+                        f"- 提案額: {total}円\n- 理由: {reason}\n"
+                        f"承認するには `査定承認 {child}`、見送るには `査定却下 {child}` と送ってください。"
+                    )
+                    # 送信できた分だけ通知済みにする（この後まとめてマーク）
+                    notified_names.append(child)
+                except Exception as send_error:
+                    # 個別送信の失敗は notified を立てず、次ターンで再通知させる
+                    _log_runtime_event(
+                        system_conf, message, user_conf, input_block,
+                        "assessment_notify_send_error",
+                        {"child": child, "error": f"{type(send_error).__name__}: {send_error}"},
+                    )
+            # 送信に成功した提案だけ通知済みへ（送信前にマークしないことで永久ロストを防ぐ）
+            if notified_names:
+                mcp_wallet.mark_proposals_notified(notified_names)
     except Exception as e:
-        # 通知の失敗で応答経路を壊さない。診断ログにだけ残す
+        # 通知処理全体の失敗で応答経路を壊さない。診断ログにだけ残す
         _log_runtime_event(
             system_conf, message, user_conf, input_block,
             "assessment_notify_error",

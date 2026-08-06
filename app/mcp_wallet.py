@@ -70,6 +70,19 @@ def _payout_store():
     return SessionStore()
 
 
+def _payout_locked():
+    """payout_requests.json の read-modify-write をプロセス間で直列化する flock を返す。
+
+    wallet_state.json と同じく、claude 子プロセス(propose)と bot プロセス(approve/reject/take)が
+    同じ payout_requests.json を無ロックで read-modify-write するとロストアップデート(後勝ちの save が
+    相手の変更を全消し)が起きる。wallet_service の _interprocess_lock を流用し、payout 専用ロックファイルで
+    両プロセスを直列化する。write 系関数(propose/approve/reject/take)は必ずこのロック配下で行う。
+    """
+    from app.wallet_service import _interprocess_lock
+    lock_path = _payout_store().payout_requests_path.with_suffix(".json.lock")
+    return _interprocess_lock(lock_path)
+
+
 class _ChildMismatch(Exception):
     """AI が渡した name が、束縛された発話者（ACTIVE_CHILD）と食い違うことを表す。
 
@@ -677,24 +690,26 @@ def _do_propose_allowance(args: dict) -> str:
     if grant <= 0:
         return "今回は増額・臨時支給なしの査定だよ。"
 
-    # payout_requests へ pending として積む。残高はまだ動かさない
+    # payout_requests へ pending として積む。残高はまだ動かさない。
+    # プロセス間 flock で read-modify-write を直列化し、bot プロセスの承認処理との競合を防ぐ
     store = _payout_store()
-    doc = store._load_doc(store.payout_requests_path, "requests")
-    requests = doc["requests"]
-    # 同じ子の未承認提案は1件に保つ（名前をキーにする）
-    requests[name] = {
-        "name": name,
-        "fixed": fixed,
-        "temporary": temporary,
-        "total": grant,
-        "reason": reason,
-        "created": now.isoformat(),
-        "status": "pending",
-        # 親へ通知したか。bot 側が未通知の pending を検知して親へ知らせ、通知済みにする。
-        # mcp_wallet は claude の子プロセスで Discord を叩けないため、通知は bot 側に委ねる
-        "notified": False,
-    }
-    store._save_doc(store.payout_requests_path, doc, "requests")
+    with _payout_locked():
+        doc = store._load_doc(store.payout_requests_path, "requests")
+        requests = doc["requests"]
+        # 同じ子の未承認提案は1件に保つ（名前をキーにする）
+        requests[name] = {
+            "name": name,
+            "fixed": fixed,
+            "temporary": temporary,
+            "total": grant,
+            "reason": reason,
+            "created": now.isoformat(),
+            "status": "pending",
+            # 親へ通知したか。bot 側が未通知の pending を検知して親へ知らせ、通知済みにする。
+            # mcp_wallet は claude の子プロセスで Discord を叩けないため、通知は bot 側に委ねる
+            "notified": False,
+        }
+        store._save_doc(store.payout_requests_path, doc, "requests")
 
     msg = (
         f"査定の結果をおうちの人にお願いしたよ。\n- 提案: {grant}円（固定{fixed}円＋臨時{temporary}円）\n"
@@ -715,19 +730,40 @@ def take_unnotified_proposals() -> list[dict]:
     Returns:
         list[dict]: 通知すべき提案（name / total / fixed / temporary / reason）。無ければ空。
     """
+    # マークはここでせず、未通知の pending を返すだけにする。bot 側が送信に成功した分だけ
+    # mark_proposals_notified で notified を立てる（送信失敗時に notified が立って永久ロストするのを防ぐ）。
     store = _payout_store()
-    doc = store._load_doc(store.payout_requests_path, "requests")
-    requests = doc["requests"]
-    pending_to_notify = []
-    changed = False
-    for req in requests.values():
-        if isinstance(req, dict) and req.get("status") == "pending" and not req.get("notified"):
-            pending_to_notify.append(dict(req))
-            req["notified"] = True
-            changed = True
-    if changed:
-        store._save_doc(store.payout_requests_path, doc, "requests")
+    with _payout_locked():
+        doc = store._load_doc(store.payout_requests_path, "requests")
+        pending_to_notify = [
+            dict(req) for req in doc["requests"].values()
+            if isinstance(req, dict) and req.get("status") == "pending" and not req.get("notified")
+        ]
     return pending_to_notify
+
+
+def mark_proposals_notified(names: list[str]) -> None:
+    """指定した子の pending 提案を通知済みにする。bot が親へ送信できた分だけ呼ぶ。
+
+    take_unnotified_proposals と分離することで、Discord 送信が失敗した提案は notified が立たず、
+    次回また未通知として拾われ再通知される（見逃し・送信失敗の救済）。
+
+    Args:
+        names: 通知に成功した子ども名の一覧。
+    """
+    if not names:
+        return
+    targets = {(n or "").strip() for n in names}
+    store = _payout_store()
+    with _payout_locked():
+        doc = store._load_doc(store.payout_requests_path, "requests")
+        changed = False
+        for name, req in doc["requests"].items():
+            if name in targets and isinstance(req, dict) and req.get("status") == "pending" and not req.get("notified"):
+                req["notified"] = True
+                changed = True
+        if changed:
+            store._save_doc(store.payout_requests_path, doc, "requests")
 
 
 def read_pending_proposal(name: str) -> dict | None:
@@ -765,42 +801,44 @@ def approve_proposal(name: str, operation_key: str) -> str:
     if conf is None:
         return f"「{target}」は登録された子どもに見つからなかったよ。"
     store = _payout_store()
-    doc = store._load_doc(store.payout_requests_path, "requests")
-    req = doc["requests"].get(target)
-    if not isinstance(req, dict) or req.get("status") != "pending":
-        return f"「{target}」の承認待ちの査定は無いよ。"
+    # payout の read-modify-write をプロセス間 flock で直列化（propose との競合を防ぐ）
+    with _payout_locked():
+        doc = store._load_doc(store.payout_requests_path, "requests")
+        req = doc["requests"].get(target)
+        if not isinstance(req, dict) or req.get("status") != "pending":
+            return f"「{target}」の承認待ちの査定は無いよ。"
 
-    op_key = str(operation_key or "").strip()
-    if op_key and _wallet.is_operation_applied(op_key):
-        # 既適用なら二重支給しない。提案だけ消しておく
+        op_key = str(operation_key or "").strip()
+        if op_key and _wallet.is_operation_applied(op_key):
+            # 既適用なら二重支給しない。提案だけ消しておく
+            doc["requests"].pop(target, None)
+            store._save_doc(store.payout_requests_path, doc, "requests")
+            return f"この査定はすでに承認済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(target)}円。"
+
+        reason = str(req.get("reason", ""))
+        # 承認時点で4層ガードレールを再適用する。提案作成から承認までに時間が空き、その間に同月の
+        # 査定支給が増えた／月境界をまたいだ場合、提案時の判定と実態がずれるため、支給直前に最終担保する。
+        now = datetime.now(_JST)
+        r_fixed, r_temp, notes, rejected = _apply_guardrails(
+            conf, int(req.get("fixed", 0)), int(req.get("temporary", 0)), now
+        )
+        if rejected:
+            # 承認時に日次・月次上限へ達していたら支給しない。提案は残す（親が翌日以降に再承認できる）
+            return f"いま {target} は上限に達しているため支給できないよ。（{rejected}）"
+        grant = r_fixed + r_temp
+        if grant <= 0:
+            doc["requests"].pop(target, None)
+            store._save_doc(store.payout_requests_path, doc, "requests")
+            return f"いま支給できる枠が無いため {target} の査定は見送ったよ（残高は変わっていないよ）。"
+        before = _wallet.get_balance(target)
+        after, achieved = _wallet.update_balance(
+            user_conf=conf, system_conf=_system_conf(),
+            delta=grant, action="allowance_grant", note=reason,
+            operation_key=op_key,
+        )
+        # 承認済みの提案は消す
         doc["requests"].pop(target, None)
         store._save_doc(store.payout_requests_path, doc, "requests")
-        return f"この査定はすでに承認済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(target)}円。"
-
-    reason = str(req.get("reason", ""))
-    # 承認時点で4層ガードレールを再適用する。提案作成から承認までに時間が空き、その間に同月の
-    # 査定支給が増えた／月境界をまたいだ場合、提案時の判定と実態がずれるため、支給直前に最終担保する。
-    now = datetime.now(_JST)
-    r_fixed, r_temp, notes, rejected = _apply_guardrails(
-        conf, int(req.get("fixed", 0)), int(req.get("temporary", 0)), now
-    )
-    if rejected:
-        # 承認時に日次・月次上限へ達していたら支給しない。提案は残す（親が翌日以降に再承認できる）
-        return f"いま {target} は上限に達しているため支給できないよ。（{rejected}）"
-    grant = r_fixed + r_temp
-    if grant <= 0:
-        doc["requests"].pop(target, None)
-        store._save_doc(store.payout_requests_path, doc, "requests")
-        return f"いま支給できる枠が無いため {target} の査定は見送ったよ（残高は変わっていないよ）。"
-    before = _wallet.get_balance(target)
-    after, achieved = _wallet.update_balance(
-        user_conf=conf, system_conf=_system_conf(),
-        delta=grant, action="allowance_grant", note=reason,
-        operation_key=op_key,
-    )
-    # 承認済みの提案は消す
-    doc["requests"].pop(target, None)
-    store._save_doc(store.payout_requests_path, doc, "requests")
     msg = f"✅ {target} の査定を承認して {grant}円 支給したよ。\n- 理由: {reason}\n残高: {before}円 → {after}円"
     for goal in achieved:
         msg += f"\n🎉 目標「{goal.get('title')}」を達成！"
@@ -818,12 +856,14 @@ def reject_proposal(name: str) -> str:
     """
     target = (name or "").strip()
     store = _payout_store()
-    doc = store._load_doc(store.payout_requests_path, "requests")
-    req = doc["requests"].get(target)
-    if not isinstance(req, dict) or req.get("status") != "pending":
-        return f"「{target}」の承認待ちの査定は無いよ。"
-    doc["requests"].pop(target, None)
-    store._save_doc(store.payout_requests_path, doc, "requests")
+    # payout の read-modify-write をプロセス間 flock で直列化
+    with _payout_locked():
+        doc = store._load_doc(store.payout_requests_path, "requests")
+        req = doc["requests"].get(target)
+        if not isinstance(req, dict) or req.get("status") != "pending":
+            return f"「{target}」の承認待ちの査定は無いよ。"
+        doc["requests"].pop(target, None)
+        store._save_doc(store.payout_requests_path, doc, "requests")
     return f"{target} の査定を却下したよ。残高は変わっていないよ。"
 
 

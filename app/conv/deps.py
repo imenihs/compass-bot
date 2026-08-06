@@ -249,7 +249,41 @@ def learning_insights(user_conf: dict, system_conf: dict | None = None, days: in
     if system_conf is None:
         config = importlib.import_module("app.config")
         system_conf = config.load_system()
-    return li.build_learning_insights(user_conf, system_conf, days=days)
+    # learning_support_state（同テーマの連続抑制・親の抑制・子のフィードバック）を読み、audit_state として
+    # 渡す。これで会話コーチングも、ダッシュボード・reminder と同じ永続 dedup（要件: 短期間に同じテーマを
+    # 繰り返さない）を尊重する。読み取りのみ（書き戻しは server/reminder と競合するため行わない）。
+    audit_state = None
+    try:
+        audit_state = {"learning_support_state": _load_learning_support_state(user_conf)}
+    except Exception:
+        # state 読み取りの失敗は致命でない。抑制なしで通常のインサイトを返す
+        audit_state = None
+    return li.build_learning_insights(user_conf, system_conf, audit_state=audit_state, days=days)
+
+
+def _load_learning_support_state(user_conf: dict) -> dict:
+    """その子の learning_support_state（data/learning_support_state/{key}.json）を読む。
+
+    server.py と同じ user_key・パスで読み、会話コーチングの抑制判定に使う。読めなければ空 dict。
+    """
+    import json
+    from pathlib import Path
+    from urllib.parse import quote
+    # server.py の _user_key_for_storage と同じ規則で user_key を作る（同じ state ファイルを読むため
+    # safe="-_." と 120文字制限を厳密に合わせる）。ずれると別ファイルを読み抑制が効かない
+    raw_key = str(user_conf.get("user_key") or user_conf.get("name") or "").strip()
+    key = quote(raw_key, safe="-_.")
+    key = key[:120] if key else "unknown"
+    root = Path(__file__).resolve().parents[2]
+    path = root / "data" / "learning_support_state" / f"{key}.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def conversation_session_setting() -> dict:
