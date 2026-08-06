@@ -17,7 +17,10 @@
     "payday_day": 1,
     "notify_offset": "-7day,-3day,-1day,0day",
     "notify_time": "20:00",
-    "auto_grant_on_payday": false
+    "auto_grant_on_payday": false,
+    "pending_reminder_min_days": 1,
+    "_comment_channel_id": "親向けチャンネル。未設定だと承認待ちの査定提案が親へ定期再通知されず、親が発話ターンの1通を見逃すと支給が放置される。査定機能を使うなら必ず設定する。",
+    "_comment_pending_reminder_min_days": "同一の承認待ち集合を再通知する最小間隔（日）。連投を避ける。"
   },
   "wallet_audit": {
     "enabled": true,

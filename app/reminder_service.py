@@ -881,12 +881,24 @@ class ReminderService:
         """
         cfg = self.allowance_reminder_conf or {}
         channel_id = cfg.get("channel_id")
-        if not channel_id:
-            # 親チャンネル未設定なら再通知しない（発話ターンでの親メンション通知に委ねる）
-            return
         from app import mcp_wallet
         # take はマークするので使わず、pending を読むだけの read_all を使う（マークは発話ターン側の責務）
         pending = mcp_wallet.read_all_pending_proposals()
+        if not channel_id:
+            # 親チャンネル未設定なら定期再通知はできない（発話ターンでの親メンション通知に委ねる）。
+            # ただし pending があるのにこの経路が無効だと、親が発話ターンの1通を見逃すと査定支給が
+            # 永久放置される単一障害点になる。pending が滞留しているときだけ運用診断へ warn を残し、
+            # 設定漏れ・無効化を後から検知できるようにする（子の頑張りが宙に浮くのを見えなくしない）。
+            if pending:
+                self._write_runtime_diagnostic({
+                    "event": "assessment_pending_reminder_channel_unset",
+                    "severity": "warn",
+                    "pending_count": len(pending),
+                    "pending_names": sorted(str(p.get("name", "")) for p in pending),
+                    "hint": "settings/setting.json の allowance_reminder.channel_id を設定すると"
+                            "承認待ちの査定を親チャンネルへ定期再通知できる（未設定だと発話ターン通知のみ）。",
+                })
+            return
         if not pending:
             return
         # 同じ pending 集合を短期間に何度も出さない。名前集合＋日付をキーに min_days 間隔で抑制
