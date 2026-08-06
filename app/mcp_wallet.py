@@ -17,9 +17,13 @@ wallet_state.json など実データは wallet_service を通じてのみ触る�
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 from app import config, wallet_service as wallet_module
 from app.config import MAX_WALLET_INPUT_AMOUNT
+
+# JST。査定の月次・日次集計は台帳の ts（JST の isoformat）と揃える
+_JST = timezone(timedelta(hours=9))
 
 # 金額入力の上限。AI 経由でも桁あふれ・異常値を弾く（本文パースの上限と揃える）
 MAX_AMOUNT = MAX_WALLET_INPUT_AMOUNT
@@ -188,6 +192,25 @@ def _tool_defs() -> list[dict]:
                 "required": ["name", "title", "target_amount"],
             },
         },
+        {
+            "name": "grant_allowance",
+            "description": (
+                "査定の結果としてお小遣いを支給する（残高を増やす）。fixed（固定の増額）と "
+                "temporary（臨時支給）を指定する。金額の上限は Python 側で強制され、超える分は支給されない。"
+                "何でもかんでも増額・追加支給はできない。理由を reason に必ず書くこと。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "子どもの名前"},
+                    "fixed": {"type": "integer", "description": "固定の増額（円、0以上）。省略時0。"},
+                    "temporary": {"type": "integer", "description": "臨時支給（円、0以上）。省略時0。"},
+                    "reason": {"type": "string", "description": "査定の理由（必須）"},
+                    "operation_key": op_key,
+                },
+                "required": ["name", "reason", "operation_key"],
+            },
+        },
     ]
 
 
@@ -346,6 +369,166 @@ def _do_set_savings_goal(args: dict) -> str:
     return f"貯金目標を{action_word}したよ。\n・目標: {title} {target}円"
 
 
+def _read_grant_ledger(name: str) -> list[dict]:
+    """その子の台帳から action=allowance_grant の記録だけを読む。査定の集計に使う。
+
+    台帳ファイルを直接読む（bot.py 経路に依存しない）。読めなければ空リスト。
+    """
+    log_dir = config.get_log_dir(_system_conf())
+    path = log_dir / f"{name}_wallet_ledger.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # 査定支給の行だけを対象にする
+                if isinstance(rec, dict) and rec.get("action") == "allowance_grant":
+                    rows.append(rec)
+    except Exception:
+        # 読めない場合は空。集計は 0 件として安全側（上限に余裕がある側）ではなく、
+        # 呼び出し側で「読めない＝拒否」に倒すため、ここでは空を返し呼び出し側が判断する
+        return []
+    return rows
+
+
+def _grant_month_total_and_day_count(name: str, now: datetime) -> tuple[int, int]:
+    """今月の査定支給の累計額と、今日の査定支給回数を返す。ガードレール判定に使う。
+
+    Args:
+        name: 子ども名。
+        now: 現在時刻（JST aware）。
+
+    Returns:
+        tuple[int, int]: (今月の支給累計額, 今日の支給回数)。
+    """
+    month_total = 0
+    day_count = 0
+    for rec in _read_grant_ledger(name):
+        raw_ts = rec.get("ts")
+        if not raw_ts:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(raw_ts))
+        except ValueError:
+            continue
+        # naive な ts は JST とみなす
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_JST)
+        # 同じ年月なら今月の累計へ加える（delta は支給額）
+        if ts.year == now.year and ts.month == now.month:
+            try:
+                month_total += int(rec.get("delta", 0))
+            except (TypeError, ValueError):
+                pass
+        # 同じ年月日なら今日の回数へ数える
+        if ts.year == now.year and ts.month == now.month and ts.day == now.day:
+            day_count += 1
+    return month_total, day_count
+
+
+def _do_grant_allowance(args: dict) -> str:
+    """査定支給。fixed/temporary を支給する。4層のガードレールを Python で強制する。
+
+    「何でもかんでも増額・追加支給しない」ため、AI が決めた額でも次の上限を必ず適用する:
+      1. fixed（固定増額）は、その子の設定 fixed_increase_cap（1回あたり）以内。
+      2. temporary（臨時支給）は、設定 assessment_guardrail.temporary_max 以内。
+      3. 今月の査定支給の累計が monthly_total_max を超える分は支給しない。
+      4. 今日の査定支給回数が daily_count_max 以上なら、その日はもう支給しない。
+    いずれも AI の判断でなく Python が最終決定する。理由（reason）は必須。
+    """
+    conf = _resolve_child(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return "査定の理由が必要だよ。何をがんばったか教えてね。"
+    op_key = str(args.get("operation_key") or "").strip()
+    if not op_key:
+        return "内部エラー: 操作キーが無いため支給できなかったよ。"
+    name = str(conf.get("name", ""))
+
+    # 既適用キーなら二重支給を避ける
+    if _wallet.is_operation_applied(op_key):
+        return f"この査定はすでに反映済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
+
+    # AI が渡した額を安全に整数化する（負数は 0 に丸め、支給をマイナスにしない）
+    def _nonneg(v) -> int:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, n)
+    fixed_req = _nonneg(args.get("fixed"))
+    temp_req = _nonneg(args.get("temporary"))
+
+    guard = config.get_assessment_guardrail_setting()
+    notes: list[str] = []
+
+    # ガード1: 固定増額は その子の fixed_increase_cap 以内に頭打ち
+    fixed_cap = _nonneg(conf.get("fixed_increase_cap"))
+    fixed = min(fixed_req, fixed_cap)
+    if fixed < fixed_req:
+        notes.append(f"固定の増額は1回 {fixed_cap}円までなので {fixed}円にしたよ")
+
+    # ガード2: 臨時支給は temporary_max 以内に頭打ち
+    temp_cap = int(guard["temporary_max"])
+    temporary = min(temp_req, temp_cap)
+    if temporary < temp_req:
+        notes.append(f"臨時支給は1回 {temp_cap}円までなので {temporary}円にしたよ")
+
+    now = datetime.now(_JST)
+    month_total, day_count = _grant_month_total_and_day_count(name, now)
+
+    # ガード4: 今日の査定回数が上限に達していたら支給しない
+    if day_count >= int(guard["daily_count_max"]):
+        return (
+            f"今日はもう査定でお小遣いをあげられる回数（{guard['daily_count_max']}回）を使いきったよ。"
+            "また明日にしようね。"
+        )
+
+    grant = fixed + temporary
+    if grant <= 0:
+        return "今回は増額・臨時支給なしの査定だよ。"
+
+    # ガード3: 今月の累計が上限を超える分は支給しない（残り枠まで頭打ち）
+    monthly_cap = int(guard["monthly_total_max"])
+    remaining = monthly_cap - month_total
+    if remaining <= 0:
+        return (
+            f"今月はもう査定で増やせる上限（{monthly_cap}円）に届いているよ。"
+            "来月またがんばろうね。"
+        )
+    if grant > remaining:
+        # 固定を優先して残り枠に収め、あふれた分は臨時から削る
+        notes.append(f"今月の合計が上限 {monthly_cap}円を超えないよう {remaining}円だけにしたよ")
+        grant = remaining
+
+    before = _wallet.get_balance(name)
+    after, achieved = _wallet.update_balance(
+        user_conf=conf, system_conf=_system_conf(),
+        delta=grant, action="allowance_grant", note=reason,
+        operation_key=op_key,
+    )
+    msg = (
+        f"査定でお小遣いを {grant}円 あげたよ。\n- 理由: {reason}\n"
+        f"残高: {before}円 → {after}円"
+    )
+    for note in notes:
+        # 頭打ちした場合はその旨を伝える（子どもに上限を分かってもらう）
+        msg += f"\n（{note}）"
+    for goal in achieved:
+        msg += f"\n🎉 目標「{goal.get('title')}」を達成したよ！"
+    return msg
+
+
 # tool 名から実装への対応表。dispatch はここを引く
 _HANDLERS = {
     "get_balance": _do_get_balance,
@@ -354,6 +537,7 @@ _HANDLERS = {
     "set_initial_balance": _do_set_initial_balance,
     "get_savings_goals": _do_get_savings_goals,
     "set_savings_goal": _do_set_savings_goal,
+    "grant_allowance": _do_grant_allowance,
 }
 
 

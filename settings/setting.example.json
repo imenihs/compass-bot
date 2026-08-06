@@ -28,6 +28,11 @@
   "child_income_report": {
     "max_amount": 5000
   },
+  "assessment_guardrail": {
+    "temporary_max": 1000,
+    "monthly_total_max": 3000,
+    "daily_count_max": 3
+  },
   "conversation_session": {
     "expiry_minutes": 30
   },

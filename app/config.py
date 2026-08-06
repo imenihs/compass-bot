@@ -581,3 +581,44 @@ def find_user_by_key(key: str) -> dict | None:
 
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def get_assessment_guardrail_setting() -> dict:
+    """
+    査定支給のガードレール設定を返す。AI が査定で決めた支給額を Python 側で頭打ちにするための上限群。
+
+    「何でもかんでも増額・追加支給しない」ため、AI の判断に委ねず tool 内でこれらの上限を強制する。
+    1回の固定増額の上限は各児童の fixed_increase_cap（ユーザー設定）を使うため、ここには持たない。
+
+    Returns:
+        dict: {
+            "temporary_max": int,      # 臨時支給の1回あたり上限（円）
+            "monthly_total_max": int,  # 1ヶ月の査定支給の累計上限（円）
+            "daily_count_max": int,    # 1日に査定支給できる回数
+        }
+    """
+    setting = load_setting()
+    conf = setting.get("assessment_guardrail", {}) if isinstance(setting, dict) else {}
+    if not isinstance(conf, dict):
+        conf = {}
+
+    # 臨時支給の1回上限。既定1000円（fixed_increase_cap=100より大きめだが桁外れを防ぐ）
+    temporary_max = _safe_int(conf.get("temporary_max"), 1000)
+    if temporary_max is None or temporary_max <= 0:
+        temporary_max = 1000
+
+    # 月次累計上限。何度も査定して積み上げるのを防ぐ。既定3000円
+    monthly_total_max = _safe_int(conf.get("monthly_total_max"), 3000)
+    if monthly_total_max is None or monthly_total_max <= 0:
+        monthly_total_max = 3000
+
+    # 1日の査定回数上限。連打での支給を防ぐ。既定3回
+    daily_count_max = _safe_int(conf.get("daily_count_max"), 3)
+    if daily_count_max is None or daily_count_max <= 0:
+        daily_count_max = 3
+
+    return {
+        "temporary_max": temporary_max,
+        "monthly_total_max": monthly_total_max,
+        "daily_count_max": daily_count_max,
+    }
