@@ -2172,6 +2172,18 @@ async def _on_message_impl(message: discord.Message):
     # 旧 B案（Gemini で intent 正規化 → _dispatch_by_intent → 査定フロー）は廃止し、handle_conversation へ一本化。
     # 雑談・残高・支出入金・目標・査定提案はすべて AI が会話の中で判断し、必要なら wallet tool を呼ぶ。
     # 会話文脈は claude session の --resume で継続する（現行で切れていた会話永続性の根本解決）。
+
+    # 会話層は子ども本人の会話を前提とする。対象が子として実在しない（＝親が子チャンネル外で
+    # 自然文を送った等）場合は会話層へ流さず案内する。wallet tool は本人性を env で束縛して親を
+    # 弾くため実残高は元々安全だが、AI が親を子ども扱いして雑談する不自然さを手前で止める。
+    from app.config import find_child_user_by_name
+    if find_child_user_by_name(str(user_conf.get("name", ""))) is None:
+        await message.channel.send(
+            "お小遣いの相談は、お子さん本人のチャンネルか `名前の代理 〜` で話しかけてね。"
+        )
+        _mark_thinking_sent(message, True)
+        return
+
     from app.conv.ai_conversation import handle_conversation
     await handle_conversation(message.channel, user_conf, input_block)
     _mark_thinking_sent(message, True)
