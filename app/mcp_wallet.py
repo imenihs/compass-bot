@@ -296,10 +296,10 @@ def _do_record_income(args: dict) -> str:
     amount = _parse_amount(args.get("amount"))
     if amount is None:
         return f"金額が正しくないよ（1〜{MAX_AMOUNT}円の正の数で教えてね）。"
-    # 自己申告入金の上限を Python で検証する。AI がすり抜けさせない安全弁。
-    # max_amount が 0 以下（未設定・誤設定）なら「無制限」にはせず、安全側に倒して
-    # 既定 5000円を上限にする。安全弁が設定ミスで無効化される事故を防ぐ。
-    max_income = int(config.get_child_income_report_setting().get("max_amount", 0))
+    name = str(conf.get("name", ""))
+    income_conf = config.get_child_income_report_setting()
+    # 安全弁1: 1回あたりの上限。max_amount が 0 以下（誤設定）なら安全側の既定 5000円へ倒す
+    max_income = int(income_conf.get("max_amount", 0))
     if max_income <= 0:
         max_income = 5000
     if amount > max_income:
@@ -307,10 +307,30 @@ def _do_record_income(args: dict) -> str:
             f"1回に自分で入金できるのは {max_income}円までだよ。"
             f"{amount}円は多いから、おうちの人に相談してね。"
         )
+    # 安全弁2〜4: 自己申告入金の連打で残高を無制限に膨らませられないよう、回数・日次累計・月次累計を強制。
+    # 査定支給と同じく Python 側で最終判定する（AI・operation_key ではすり抜けを止められないため）。
+    now = datetime.now(_JST)
+    day_count, day_total, month_total = _income_day_month_totals(name, now)
+    if day_count >= int(income_conf["daily_count_max"]):
+        return (
+            f"今日はもう自分で入金できる回数（{income_conf['daily_count_max']}回）を使いきったよ。"
+            "また明日にしようね。大きいお金はおうちの人に相談してね。"
+        )
+    if day_total + amount > int(income_conf["daily_total_max"]):
+        remaining = max(0, int(income_conf["daily_total_max"]) - day_total)
+        return (
+            f"今日じぶんで入金できるのは合計 {income_conf['daily_total_max']}円までで、"
+            f"あと {remaining}円だよ。それ以上はおうちの人に相談してね。"
+        )
+    if month_total + amount > int(income_conf["monthly_total_max"]):
+        remaining = max(0, int(income_conf["monthly_total_max"]) - month_total)
+        return (
+            f"今月じぶんで入金できるのは合計 {income_conf['monthly_total_max']}円までで、"
+            f"あと {remaining}円だよ。それ以上はおうちの人に相談してね。"
+        )
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
         return "内部エラー: 操作キーが無いため入金を記録できなかったよ。"
-    name = str(conf.get("name", ""))
     note = str(args.get("note") or "").strip()
     # 既適用キーなら誤った二重報告を避ける
     if _wallet.is_operation_applied(op_key):
@@ -400,10 +420,17 @@ def _do_set_savings_goal(args: dict) -> str:
     return f"貯金目標を{action_word}したよ。\n・目標: {title} {target}円"
 
 
-def _read_grant_ledger(name: str) -> list[dict]:
-    """その子の台帳から action=allowance_grant の記録だけを読む。査定の集計に使う。
+def _read_ledger_by_action(name: str, action: str) -> list[dict]:
+    """その子の台帳から指定 action の記録だけを読む。査定・自己申告入金の集計に使う。
 
     台帳ファイルを直接読む（bot.py 経路に依存しない）。読めなければ空リスト。
+
+    Args:
+        name: 子ども名。
+        action: 集計対象の action（allowance_grant / manual_income 等）。
+
+    Returns:
+        list[dict]: 指定 action の台帳レコード。
     """
     log_dir = config.get_log_dir(_system_conf())
     path = log_dir / f"{name}_wallet_ledger.jsonl"
@@ -420,14 +447,59 @@ def _read_grant_ledger(name: str) -> list[dict]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                # 査定支給の行だけを対象にする
-                if isinstance(rec, dict) and rec.get("action") == "allowance_grant":
+                # 指定 action の行だけを対象にする
+                if isinstance(rec, dict) and rec.get("action") == action:
                     rows.append(rec)
     except Exception:
-        # 読めない場合は空。集計は 0 件として安全側（上限に余裕がある側）ではなく、
-        # 呼び出し側で「読めない＝拒否」に倒すため、ここでは空を返し呼び出し側が判断する
+        # 読めない場合は空を返し、呼び出し側が判断する
         return []
     return rows
+
+
+def _read_grant_ledger(name: str) -> list[dict]:
+    """その子の台帳から action=allowance_grant の記録を読む（後方互換の薄いラッパ）。"""
+    return _read_ledger_by_action(name, "allowance_grant")
+
+
+def _income_day_month_totals(name: str, now: datetime) -> tuple[int, int, int]:
+    """今日の自己申告入金の回数・累計と、今月の累計を返す。record_income の上限判定に使う。
+
+    delta が正の manual_income を集計する。ts を JST とみなして年月日で仕分ける。
+
+    Args:
+        name: 子ども名。
+        now: 現在時刻（JST aware）。
+
+    Returns:
+        tuple[int, int, int]: (今日の回数, 今日の累計額, 今月の累計額)。
+    """
+    day_count = 0
+    day_total = 0
+    month_total = 0
+    for rec in _read_ledger_by_action(name, "manual_income"):
+        raw_ts = rec.get("ts")
+        if not raw_ts:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(raw_ts))
+        except ValueError:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_JST)
+        try:
+            delta = int(rec.get("delta", 0))
+        except (TypeError, ValueError):
+            delta = 0
+        if delta <= 0:
+            continue
+        # 今月の累計へ
+        if ts.year == now.year and ts.month == now.month:
+            month_total += delta
+            # 今日の回数・累計へ
+            if ts.day == now.day:
+                day_count += 1
+                day_total += delta
+    return day_count, day_total, month_total
 
 
 def _grant_month_total_and_day_count(name: str, now: datetime) -> tuple[int, int]:
@@ -618,6 +690,9 @@ def _do_propose_allowance(args: dict) -> str:
         "reason": reason,
         "created": now.isoformat(),
         "status": "pending",
+        # 親へ通知したか。bot 側が未通知の pending を検知して親へ知らせ、通知済みにする。
+        # mcp_wallet は claude の子プロセスで Discord を叩けないため、通知は bot 側に委ねる
+        "notified": False,
     }
     store._save_doc(store.payout_requests_path, doc, "requests")
 
@@ -628,6 +703,31 @@ def _do_propose_allowance(args: dict) -> str:
     for note in notes:
         msg += f"\n（{note}）"
     return msg
+
+
+def take_unnotified_proposals() -> list[dict]:
+    """親へまだ通知していない査定提案を取り出し、通知済みにマークして返す（in-process）。
+
+    mcp_wallet は claude の子プロセスで Discord を叩けないため、通知は bot 側が行う。bot は
+    子の発話処理後に本関数を呼び、返ってきた提案を親チャンネルへ通知する。通知済みマークは
+    ここで原子的に書き戻すため、同じ提案を二度通知しない。
+
+    Returns:
+        list[dict]: 通知すべき提案（name / total / fixed / temporary / reason）。無ければ空。
+    """
+    store = _payout_store()
+    doc = store._load_doc(store.payout_requests_path, "requests")
+    requests = doc["requests"]
+    pending_to_notify = []
+    changed = False
+    for req in requests.values():
+        if isinstance(req, dict) and req.get("status") == "pending" and not req.get("notified"):
+            pending_to_notify.append(dict(req))
+            req["notified"] = True
+            changed = True
+    if changed:
+        store._save_doc(store.payout_requests_path, doc, "requests")
+    return pending_to_notify
 
 
 def read_pending_proposal(name: str) -> dict | None:
@@ -677,8 +777,21 @@ def approve_proposal(name: str, operation_key: str) -> str:
         store._save_doc(store.payout_requests_path, doc, "requests")
         return f"この査定はすでに承認済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(target)}円。"
 
-    grant = int(req.get("total", 0))
     reason = str(req.get("reason", ""))
+    # 承認時点で4層ガードレールを再適用する。提案作成から承認までに時間が空き、その間に同月の
+    # 査定支給が増えた／月境界をまたいだ場合、提案時の判定と実態がずれるため、支給直前に最終担保する。
+    now = datetime.now(_JST)
+    r_fixed, r_temp, notes, rejected = _apply_guardrails(
+        conf, int(req.get("fixed", 0)), int(req.get("temporary", 0)), now
+    )
+    if rejected:
+        # 承認時に日次・月次上限へ達していたら支給しない。提案は残す（親が翌日以降に再承認できる）
+        return f"いま {target} は上限に達しているため支給できないよ。（{rejected}）"
+    grant = r_fixed + r_temp
+    if grant <= 0:
+        doc["requests"].pop(target, None)
+        store._save_doc(store.payout_requests_path, doc, "requests")
+        return f"いま支給できる枠が無いため {target} の査定は見送ったよ（残高は変わっていないよ）。"
     before = _wallet.get_balance(target)
     after, achieved = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),

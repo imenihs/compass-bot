@@ -118,11 +118,18 @@ def _build_system_prompt(user_conf: dict) -> str:
     name = str(user_conf.get("name", "きみ"))
     age = user_conf.get("age")
     age_text = f"{age}歳" if isinstance(age, int) else "年齢不明"
-    personality = str(user_conf.get("bot_personality", "sibling"))
-    # 人格の口調は既存プロンプトの語彙に合わせ、年齢に応じた易しさを求める
+    # bot_personality は英語 enum なので日本語の口調説明へ変換する。そのまま「口調は teacher」と
+    # 渡すと AI が英単語を口調ラベルとして扱えず不自然になるため、意味を日本語で明示する。
+    personality_key = str(user_conf.get("bot_personality", "sibling"))
+    personality_label = {
+        "teacher": "やさしい先生のように、ていねいに教えてくれる口調",
+        "sibling": "年上のきょうだいのように、親しみやすくフランクな口調",
+        "friend": "友だちのように、気さくで楽しい口調",
+        "parent": "おうちの人のように、あたたかく見守る口調",
+    }.get(personality_key, "年上のきょうだいのように親しみやすい口調")
     base = (
         f"あなたは子ども「{name}」（{age_text}）のお小遣い管理を手伝う、やさしい会話ボットです。"
-        f"口調は「{personality}」。{age_text}の子が読める、やさしい日本語で短く話します。\n"
+        f"{personality_label}で、{age_text}の子が読める、やさしい日本語で短く話します。\n"
         "【最重要・お金の記録は必ずツールを使う】\n"
         "- 子どもが「◯円つかった／買った」と言ったら、雑談で流さず 必ず record_expense を呼ぶこと。\n"
         "- 「◯円もらった／お小遣いもらった」と言ったら、必ず record_income を呼ぶこと。\n"
@@ -137,27 +144,61 @@ def _build_system_prompt(user_conf: dict) -> str:
         "- お金がまったく出てこない雑談（好きな食べ物・学校の話など）は、ツールを使わず自然に会話すること。\n"
         f"- 相手は {name} さん本人です。ほかの子の財布は操作できません。"
     )
-    # その子の学習支援インサイトを注入し、「がんばろうね」で終わらせず要件どおりのコーチングをさせる。
-    # 目標や支出の話が出たら、観察→問い→次の5分の小さな行動、へ会話を接続する（学習支援要件再定義.md）。
-    coaching = _build_coaching_block(user_conf)
-    return base + coaching
+    # コーチングは呼び出し側（handle_conversation）で input_text を見て付けるか決め、
+    # coaching_block を渡してくる。ここでは base に連結するだけ（出し分け・抑制は非同期側で行う）。
+    return base
 
 
-def _build_coaching_block(user_conf: dict) -> str:
-    """その子の learning_insights を system prompt 用のコーチング指示へ整形する。
+# 会話がお金・学習に関わるか判定するキーワード。これらを含むターンだけコーチングを付ける。
+# 純雑談（食べ物・学校の話等）や単なる残高照会・履歴照会ではコーチングを出さず、監視的にしない。
+_COACHING_TRIGGER_WORDS = (
+    "円", "お金", "おかね", "かった", "買っ", "つかった", "使っ", "もらった",
+    "ためた", "貯め", "ためる", "目標", "もくひょう", "ほしい", "欲しい", "査定",
+    "おこづかい", "お小遣い", "貯金", "ちょきん",
+)
+# 単なる残高・履歴の照会。これだけの発話ではコーチングを出さない（お金の話でも問いかけは邪魔）。
+_COACHING_SUPPRESS_ONLY = ("残高", "ざんだか", "いくらある", "履歴", "りれき", "台帳")
 
-    build_learning_insights（deps 経由）の child_challenge / insight_cards を要点化して渡す。
-    子どもには insight_cards の分析や親向けメモをそのまま見せず、child_action を1つ、自然な会話の中で
-    さりげなく促す。失敗の指摘や叱責はしない。計算失敗時は空文字（コーチングなしでも会話は成立する）。
+# 直近にその子へ注入したコーチング行動（プロセス内メモ）。同じ行動を連続で促すくどさを防ぐ。
+_last_coached_action: dict[str, str] = {}
+
+
+def _should_coach(input_text: str) -> bool:
+    """この発話でコーチングを付けるべきか判定する。お金・学習の話題のときだけ True。"""
+    text = input_text or ""
+    if not any(w in text for w in _COACHING_TRIGGER_WORDS):
+        # お金・学習に関わらない純雑談ではコーチングを出さない
+        return False
+    # 残高・履歴の照会「だけ」ならコーチングを出さない（トリガー語が残高系のみの場合）
+    stripped = text
+    for w in _COACHING_SUPPRESS_ONLY:
+        stripped = stripped.replace(w, "")
+    if not any(w in stripped for w in _COACHING_TRIGGER_WORDS):
+        return False
+    return True
+
+
+async def _build_coaching_block_async(user_conf: dict, input_text: str) -> str:
+    """お金・学習の話題のターンだけ、その子の learning_insights をコーチング指示へ整形する。
+
+    出し分け（_should_coach）と反復抑制（直近同一 child_action は出さない）を行い、build_learning_insights
+    の同期 I/O は asyncio.to_thread でオフロードしてイベントループをブロックしない。子どもには分析や親メモを
+    そのまま見せず、child_action を1つさりげなく促す。叱責しない。取得失敗時は空文字。
 
     Args:
         user_conf: 対象児童の設定 dict。
+        input_text: 今回の子どもの発話（出し分け判定に使う）。
 
     Returns:
-        str: system prompt へ足すコーチング指示。取得失敗時は空文字。
+        str: system prompt へ足すコーチング指示。出さない場合は空文字。
     """
+    # 出し分け: お金・学習の話題でなければコーチングなし
+    if not _should_coach(input_text):
+        return ""
+    user_name = str(user_conf.get("name", ""))
     try:
-        insights = deps.learning_insights(user_conf)
+        # 同期 I/O（90日ログ読取）をスレッドへ逃がしイベントループを止めない
+        insights = await asyncio.to_thread(deps.learning_insights, user_conf)
     except Exception:
         # インサイト計算の失敗で会話を止めない。コーチングなしで通常会話にフォールバック
         return ""
@@ -168,15 +209,18 @@ def _build_coaching_block(user_conf: dict) -> str:
     skill = str(top.get("skill") or "").strip()
     child_action = str(top.get("child_action") or challenge_action).strip()
     if not child_action:
-        # 促す行動が無ければコーチング指示を足さない
         return ""
+    # 反復抑制: 直近このターンと同じ child_action を促していたら、今回は促さない（くどさ・監視感を避ける）
+    if _last_coached_action.get(user_name) == child_action:
+        return ""
+    _last_coached_action[user_name] = child_action
     return (
-        "\n【学習支援コーチング（お金の話になったら意識する）】\n"
+        "\n【学習支援コーチング（この発話はお金・学習の話。意識する）】\n"
         f"- この子に今そっと促したい小さな行動は「{child_action}」"
         + (f"（伸ばしたい力: {skill}）" if skill else "")
         + "。\n"
-        "- 目標貯金・支出・お金の使い方の話になったら、「がんばろうね」で終わらせず、"
-        "①今どうなっているか一言そえて、②5分でできる小さな行動を1つだけ、押しつけずに提案すること。\n"
+        "- 「がんばろうね」で終わらせず、①今どうなっているか一言そえて、②5分でできる小さな行動を1つだけ、"
+        "押しつけずに提案すること。\n"
         "- 上の分析や親向けメモはそのまま読み上げない。子どもが自分で選べる形（今買う/待つ/別にする 等）にする。\n"
         "- 叱ったり、できていない点を並べたりしない。一度に出す提案は1つだけにする。"
     )
@@ -415,7 +459,10 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
     thinking_task = asyncio.create_task(_thinking_after_delay())
 
     # 4. 発話は素のまま、人格・約束は --append-system-prompt、本人性は env で渡して claude を起動する
+    # 基本プロンプトに、お金・学習の話題のターンだけコーチング指示を足す（出し分け・反復抑制・to_thread は
+    # _build_coaching_block_async 内で行い、イベントループをブロックしない）。
     system_prompt = _build_system_prompt(user_conf)
+    system_prompt += await _build_coaching_block_async(user_conf, input_text)
     try:
         ok, result, new_session_id, timed_out = await _run_claude(input_text, session_id, system_prompt, user_name)
     finally:

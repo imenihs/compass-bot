@@ -483,8 +483,13 @@ def get_child_income_report_setting() -> dict:
     子供の自己申告入金（臨時入金）の上限設定を返す。
 
     Returns:
-        dict: {"max_amount": int} 形式。1回の自己申告で反映できる上限額。
-              0 以下が設定された場合は上限なしとして扱う。
+        dict: {
+            "max_amount": int,       # 1回の自己申告で反映できる上限額
+            "daily_count_max": int,  # 1日に自己申告できる回数
+            "daily_total_max": int,  # 1日に自己申告できる累計額
+            "monthly_total_max": int,# 1ヶ月に自己申告できる累計額
+        }
+        0 以下が設定された場合、それぞれ安全側の既定値へ倒す（無制限にはしない）。
     """
     setting = load_setting()
     conf = setting.get("child_income_report", {}) if isinstance(setting, dict) else {}
@@ -493,9 +498,24 @@ def get_child_income_report_setting() -> dict:
 
     # 未設定でも安全側に倒したいので、既定値を入れて上限が必ず効くようにする
     max_amount = _safe_int(conf.get("max_amount"), 5000)
-    if max_amount is None:
+    if max_amount is None or max_amount <= 0:
         max_amount = 5000
-    return {"max_amount": int(max_amount)}
+    # 査定と同様、回数・累計の上限も持たせる。自己申告入金の連打で残高を無制限に膨らませられないようにする
+    daily_count_max = _safe_int(conf.get("daily_count_max"), 5)
+    if daily_count_max is None or daily_count_max <= 0:
+        daily_count_max = 5
+    daily_total_max = _safe_int(conf.get("daily_total_max"), 5000)
+    if daily_total_max is None or daily_total_max <= 0:
+        daily_total_max = 5000
+    monthly_total_max = _safe_int(conf.get("monthly_total_max"), 20000)
+    if monthly_total_max is None or monthly_total_max <= 0:
+        monthly_total_max = 20000
+    return {
+        "max_amount": int(max_amount),
+        "daily_count_max": int(daily_count_max),
+        "daily_total_max": int(daily_total_max),
+        "monthly_total_max": int(monthly_total_max),
+    }
 
 
 def get_conversation_session_setting() -> dict:

@@ -723,6 +723,29 @@ async def _on_message_impl(message: discord.Message):
     from app.conv.ai_conversation import handle_conversation
     await handle_conversation(message.channel, user_conf, input_block)
     _mark_thinking_sent(message, True)
+
+    # 査定提案が出ていたら親へ通知する。propose_allowance は残高を動かさず pending を積むだけで、
+    # 親が承認して初めて支給される。mcp_wallet は Discord を叩けないため、ここで未通知の提案を
+    # 検知して発話チャンネルへ知らせる（承認/却下コマンドの書式も必ず添える）。通知漏れで支給が
+    # 放置され子の頑張りが宙に浮くのを防ぐ。
+    try:
+        from app import mcp_wallet
+        for proposal in mcp_wallet.take_unnotified_proposals():
+            child = str(proposal.get("name", ""))
+            total = int(proposal.get("total", 0))
+            reason = str(proposal.get("reason", ""))
+            await message.channel.send(
+                f"🔔 {child} さんの査定の提案が来ています。\n"
+                f"- 提案額: {total}円\n- 理由: {reason}\n"
+                f"おうちの人が承認するには `査定承認 {child}`、見送るには `査定却下 {child}` と送ってね。"
+            )
+    except Exception as e:
+        # 通知の失敗で応答経路を壊さない。診断ログにだけ残す
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "assessment_notify_error",
+            {"error": f"{type(e).__name__}: {e}"},
+        )
     return
 
 
