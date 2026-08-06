@@ -1,4 +1,5 @@
 import json
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -78,7 +79,7 @@ class WalletService:
         tmp_path.replace(self.wallet_state_path)
 
     def _log_wallet_error(self, event: str, error: Exception, details: dict | None = None) -> None:
-        """ウォレット状態の異常を診断ログへ残す。ログ失敗は標準出力に逃がす。"""
+        """ウォレット状態の異常を診断ログへ残す。ログ失敗は標準エラーへ逃がす。"""
         try:
             root = Path(__file__).resolve().parents[1]
             log_path = root / "data" / "logs" / "runtime_diagnostics.jsonl"
@@ -90,7 +91,9 @@ class WalletService:
                 "details": details or {},
             })
         except Exception as log_error:
-            print(f"[wallet_diagnostics] log error: {type(log_error).__name__}: {log_error}")
+            # stderr へ出す。MCP サーバ(mcp_wallet)から共有されるため、stdout に書くと
+            # JSON-RPC ストリームを汚して claude CLI のパースを壊す。stderr なら安全。
+            print(f"[wallet_diagnostics] log error: {type(log_error).__name__}: {log_error}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # 残高操作
@@ -99,6 +102,25 @@ class WalletService:
     def has_wallet(self, user_name: str) -> bool:
         state = self._load_wallet_state()
         return user_name in state.get("users", {})
+
+    def is_operation_applied(self, operation_key: str) -> bool:
+        """指定の operation_key が既に適用済みかを返す。
+
+        冪等スキップを呼び出し側が事前に判別するために使う。update_balance は既適用キーを
+        黙ってスキップして (before, []) を返すため、成功時と区別がつかない。AI 主導層の
+        wallet tool が「もう反映済み」と正しく伝えられるよう、呼ぶ前に本メソッドで確認する。
+
+        Args:
+            operation_key: 判定する冪等キー。空文字なら常に False。
+
+        Returns:
+            bool: 既に適用済みなら True。
+        """
+        key = str(operation_key or "").strip()
+        if not key:
+            return False
+        state = self._load_wallet_state()
+        return key in state.get("applied_operation_keys", {})
 
     def get_balance(self, user_name: str) -> int:
         state = self._load_wallet_state()

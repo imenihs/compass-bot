@@ -4,6 +4,11 @@ import re
 from pathlib import Path
 from typing import Optional
 
+# 金額入力の上限（円）。桁あふれ・異常値を弾く共通上限。bot.py と mcp_wallet.py が共有する。
+# 従来は bot.py 内に定義していたが、AI 主導層（mcp_wallet）が bot.py を import せず参照できるよう
+# config へ移した（bot.py の import で GeminiService 初期化が走る問題を避けるため）。
+MAX_WALLET_INPUT_AMOUNT = 1_000_000
+
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_DIR = ROOT / "settings"
 USERS_DIR = SETTINGS_DIR / "users"
@@ -108,6 +113,28 @@ def find_user_by_name(name: str) -> Optional[dict]:
     if not target:
         return None
     for u in load_all_users() + load_all_parents():
+        if str(u.get("name", "")).strip() == target:
+            return u
+    return None
+
+def find_child_user_by_name(name: str) -> Optional[dict]:
+    """名前で子ユーザーだけを検索する。親は一切対象にしない。
+
+    金額を動かす操作（AI 主導層の wallet tool）の対象特定に使う。find_user_by_name は
+    親も返すため、親名で残高操作されて親名義の偽の財布が実帳簿に混入するのを防ぐ。
+    子ディレクトリ（load_all_users）のみを走査する。
+
+    Args:
+        name: 子ユーザー名。
+
+    Returns:
+        Optional[dict]: 一致する子ユーザー設定。子に無ければ（親名でも）None。
+    """
+    target = (name or "").strip()
+    if not target:
+        return None
+    # 子ディレクトリのみ走査する。親は含めない
+    for u in load_all_users():
         if str(u.get("name", "")).strip() == target:
             return u
     return None

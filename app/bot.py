@@ -34,6 +34,7 @@ from app.bot_utils import (
     _usage_guide_text_parent,
 )
 from app.config import (
+    MAX_WALLET_INPUT_AMOUNT,
     find_parent_by_discord_id,
     find_user_by_discord_id,
     find_user_by_name,
@@ -102,8 +103,9 @@ MONTHLY_SUMMARY = get_monthly_summary_setting()
 POCKET_JOURNAL_REMINDER = get_pocket_journal_reminder_setting()
 PROACTIVE_CHILD_NUDGE = get_proactive_child_nudge_setting()
 
-# 初期設定・財布チェックで受け付ける現実的な財布上限。Discord ID等の誤入力を拒否する。
-MAX_WALLET_INPUT_AMOUNT = 1_000_000
+# 初期設定・財布チェックで受け付ける現実的な財布上限（円）は config.MAX_WALLET_INPUT_AMOUNT。
+# 定義は config へ移し（AI 主導層 mcp_wallet と共有するため）、上の import ブロックで取り込んでいる。
+# Discord ID 等の誤入力を拒否する用途は従来どおり。
 
 
 def _child_income_over_limit_message(amount: int, limit: int, user_name: str) -> str | None:
