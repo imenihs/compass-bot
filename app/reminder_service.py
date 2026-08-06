@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 import discord
 
+from app.config import get_parent_ids
 from app.storage import JST, append_jsonl, now_jst_iso
 
 
@@ -861,6 +862,59 @@ class ReminderService:
         state["sent_pocket_journal_reminder_keys"] = sent_keys
         self._save_reminder_state(state)
 
+    async def maybe_remind_pending_proposals(self) -> None:
+        """未承認の査定提案を親チャンネルへ定期再通知する（親統制の見逃し対策）。
+
+        propose_allowance の通知は子の発話ターン依存で、親がそのチャンネルを見ていないと放置される。
+        本ステップは allowance_reminder_conf.channel_id（親向けチャンネル）へ、未承認 pending を親メンション
+        付きでまとめて再通知する。親チャンネル宛なので全児童分をまとめてよい（親は全員の保護者）。連投を
+        避けるため、同一 pending 集合は min_days 間隔でのみ再通知する（reminder_state で管理）。
+        """
+        cfg = self.allowance_reminder_conf or {}
+        channel_id = cfg.get("channel_id")
+        if not channel_id:
+            # 親チャンネル未設定なら再通知しない（発話ターンでの親メンション通知に委ねる）
+            return
+        from app import mcp_wallet
+        # take はマークするので使わず、pending を読むだけの read_all を使う（マークは発話ターン側の責務）
+        pending = mcp_wallet.read_all_pending_proposals()
+        if not pending:
+            return
+        # 同じ pending 集合を短期間に何度も出さない。名前集合＋日付をキーに min_days 間隔で抑制
+        state = self._load_reminder_state()
+        min_days = int(cfg.get("pending_reminder_min_days", 1))
+        now = datetime.now(JST)
+        names_key = ",".join(sorted(p.get("name", "") for p in pending))
+        last_map = state.get("assessment_pending_reminder_last") or {}
+        last_iso = last_map.get(names_key)
+        if last_iso:
+            try:
+                last_dt = datetime.fromisoformat(str(last_iso))
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=JST)
+                if (now - last_dt).total_seconds() < min_days * 86400:
+                    return
+            except ValueError:
+                pass
+        try:
+            channel = self.client.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.client.fetch_channel(int(channel_id))
+            parent_mention = " ".join(f"<@{pid}>" for pid in sorted(get_parent_ids())) or "おうちの人"
+            lines = [f"🔔 {parent_mention} 承認待ちの査定提案があります。"]
+            for p in pending:
+                lines.append(
+                    f"・{p.get('name','')}: {int(p.get('total',0))}円（理由: {p.get('reason','')}）"
+                    f" → `査定承認 {p.get('name','')}` / `査定却下 {p.get('name','')}`"
+                )
+            await channel.send("\n".join(lines))
+            last_map[names_key] = now.isoformat()
+            state["assessment_pending_reminder_last"] = last_map
+            self._save_reminder_state(state)
+        except Exception:
+            # 再通知の失敗はループを止めない（_run_notification_step が例外を分離する）
+            raise
+
     async def loop(self) -> None:
         while not self.client.is_closed():
             steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
@@ -869,6 +923,7 @@ class ReminderService:
                 ("monthly_summary", self.maybe_send_monthly_summary),
                 ("pocket_journal_reminder", self.maybe_send_pocket_journal_reminder),
                 ("proactive_child_nudge", self.maybe_send_proactive_child_nudges),
+                ("assessment_pending_reminder", self.maybe_remind_pending_proposals),
             ]
             for step_name, handler in steps:
                 await self._run_notification_step(step_name, handler)

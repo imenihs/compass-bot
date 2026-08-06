@@ -770,6 +770,24 @@ def mark_proposals_notified(names: list[str]) -> None:
             store._save_doc(store.payout_requests_path, doc, "requests")
 
 
+def read_all_pending_proposals() -> list[dict]:
+    """未承認の査定提案を全児童分まとめて返す（親チャンネルへの定期再通知が使う。読み取りのみ）。
+
+    親向けの通知に使うため全児童分を返してよい（親は全員の保護者）。notified はマークしない
+    （マークは子チャンネルへの発話ターン通知側の責務）。
+
+    Returns:
+        list[dict]: status==pending の提案一覧。無ければ空。
+    """
+    store = _payout_store()
+    with _payout_locked():
+        doc = store._load_doc(store.payout_requests_path, "requests")
+        return [
+            dict(req) for req in doc["requests"].values()
+            if isinstance(req, dict) and req.get("status") == "pending"
+        ]
+
+
 def read_pending_proposal(name: str) -> dict | None:
     """その子の未承認の査定提案を返す（親承認ハンドラが使う。in-process 呼び出し）。
 
