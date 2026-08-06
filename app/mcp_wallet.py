@@ -144,7 +144,7 @@ def _tool_defs() -> list[dict]:
         },
         {
             "name": "record_expense",
-            "description": "子どもの支出を記録し、残高を減らす。金額は必ず正の整数（円）。",
+            "description": "子どもの支出を記録し、残高を減らす。金額は必ず正の整数（円）。子どもが「◯円つかった／買った」と言ったら、雑談で流さず必ずこのツールを呼ぶこと。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -158,7 +158,7 @@ def _tool_defs() -> list[dict]:
         },
         {
             "name": "record_income",
-            "description": "子どもの臨時入金を記録し、残高を増やす。自己申告のため1回の上限を超えると拒否する。",
+            "description": "子どもの臨時入金を記録し、残高を増やす。自己申告のため1回の上限を超えると拒否する。子どもが「◯円もらった」と言ったら、雑談で流さず必ずこのツールを呼ぶこと。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
