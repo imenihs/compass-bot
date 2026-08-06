@@ -52,7 +52,9 @@ def _lock_for(user_name: str) -> asyncio.Lock:
 SESSION_KIND = "ai_chat"
 
 # claude CLI の実行ファイル名。PATH 解決に任せる（サーバ導入済み /usr/local/bin/claude）
-CLAUDE_BIN = "claude"
+# claude CLI の実行ファイル。systemd 配下は PATH が最小限で /usr/local/bin を含まないことがあるため、
+# PATH 解決に頼らず絶対パスを既定にする。環境が違う場合は env COMPASS_CLAUDE_BIN で上書きできる。
+CLAUDE_BIN = os.environ.get("COMPASS_CLAUDE_BIN", "/usr/local/bin/claude")
 
 # 応答生成のタイムアウト（秒）。素の会話は3〜5秒、wallet tool 込みで最大20秒程度かかる実測に基づき、
 # 余裕を見て30秒で打ち切る。これを超える応答は返さずフォールバックへ倒す
