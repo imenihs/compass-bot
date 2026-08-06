@@ -374,11 +374,17 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
         child_name: 発話者名（env 束縛用）。
 
     Returns:
-        tuple[bool, str, str | None, bool]: (成功, 応答文, session_id, タイムアウトしたか)。
+        tuple[bool, str, str | None, bool, bool]:
+            (成功, 応答文, session_id, タイムアウトしたか, tool未実行が確実か)。
             session_id は失敗時でも取れたものを返す（呼び出し側が捨てず継続に使える）。
+            最後の tool_never_ran は「claude を起動できず tool が1つも実行されていないと
+            確証できる失敗」だけ True。ここが True のときだけ呼び出し側は「もう一度言って」と
+            再入力を促してよい。False（tool 実行後に壊れた可能性が少しでもある失敗）では、
+            同じ発話の再入力は operation_key が変わって二重課金を招くため促してはならない。
     """
     # 1回目: 継続を試みる。タイムアウトと起動失敗は区別して診断する
     timed_out = False
+    spawn_failed = False  # claude 起動自体に失敗＝プロセスが立たず tool は絶対に走っていない
     stderr = ""
     try:
         returncode, stdout, stderr = await _spawn_claude(prompt, session_id, system_prompt, child_name)
@@ -388,6 +394,8 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
         returncode, stdout = 1, ""
         _diag("ai_conversation_timeout", {"child": child_name, "had_session": bool(session_id)})
     except Exception as e:
+        # 起動例外は tool 実行前。プロセスが立っていないので再入力を促してよい
+        spawn_failed = True
         returncode, stdout = 1, ""
         _diag("ai_conversation_spawn_error", {"child": child_name, "error": f"{type(e).__name__}: {e}"})
 
@@ -398,7 +406,7 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
     if ok:
         if returncode != 0:
             _diag("ai_conversation_nonzero_exit_ok", {"child": child_name, "returncode": returncode})
-        return True, result, new_sid, timed_out
+        return True, result, new_sid, timed_out, False
 
     # 再試行は「resume 対象が見つからない」失敗に限る。タイムアウト・その他失敗では絶対に再試行しない。
     # このシグナルは会話開始前に出るため、tool は1つも実行されておらず二重課金にならない
@@ -408,25 +416,29 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
         try:
             returncode2, stdout2, stderr2 = await _spawn_claude(prompt, None, system_prompt, child_name)
         except Exception as e:
+            # 新規再試行の起動失敗も tool 実行前。プロセスが立たず tool は走っていない
             _diag("ai_conversation_spawn_error", {"child": child_name, "error": f"{type(e).__name__}: {e}", "retry": True})
-            return False, "", None, False
+            return False, "", None, False, True
         ok2, result2, new_sid2 = _parse_output(stdout2)
         # 再試行も returncode でなく ok（正常な JSON 応答）で判定する
         if ok2:
             if returncode2 != 0:
                 _diag("ai_conversation_nonzero_exit_ok", {"child": child_name, "returncode": returncode2, "retry": True})
-            return True, result2, new_sid2, False
-        # 再試行も失敗。取れた session_id は返す（呼び出し側が継続に使える）
-        return False, "", new_sid2, False
+            return True, result2, new_sid2, False, False
+        # 再試行も失敗。新規セッションで claude が起動し tool を実行した可能性があるため、tool未実行と
+        # 断定できない（tool_never_ran=False）。取れた session_id は返す（呼び出し側が継続に使える）
+        return False, "", new_sid2, False, False
 
     # 再試行しない失敗。stderr を診断へ残して原因を追えるようにする
     if not ok:
         _diag("ai_conversation_failed", {
             "child": child_name, "returncode": returncode,
-            "timed_out": timed_out, "stderr": stderr[:500],
+            "timed_out": timed_out, "spawn_failed": spawn_failed, "stderr": stderr[:500],
         })
+    # tool 実行後に壊れた（is_error・部分出力・非JSON）可能性がある失敗は、起動失敗と確証できた
+    # ケース（spawn_failed）を除き tool_never_ran=False にする。timed_out も当然 False 側。
     # 失敗でも取れた session_id は返す。tool が動いたターンの文脈を次へ繋ぐため
-    return False, "", new_sid, timed_out
+    return False, "", new_sid, timed_out, spawn_failed
 
 
 async def handle_conversation(channel, user_conf: dict, input_text: str) -> str:
@@ -494,7 +506,7 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
     system_prompt = _build_system_prompt(user_conf)
     system_prompt += await _build_coaching_block_async(user_conf, input_text)
     try:
-        ok, result, new_session_id, timed_out = await _run_claude(input_text, session_id, system_prompt, user_name)
+        ok, result, new_session_id, timed_out, tool_never_ran = await _run_claude(input_text, session_id, system_prompt, user_name)
     finally:
         # 応答が返ったら考え中タスクを止め、決着を待つ（考え中送信が本応答より後に来る競合を防ぐ）
         thinking_task.cancel()
@@ -516,13 +528,16 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
         except Exception as e:
             _diag("ai_conversation_session_write_error", {"child": user_name, "error": f"{type(e).__name__}: {e}"})
 
-    # 応答が取れなければフォールバック。タイムアウトは tool が既に残高を動かした後かもしれないため、
-    # 「何も起きていない」と断定せず、残高を確かめるよう促す文言にする（実残高との不一致を避ける）
+    # 応答が取れなければフォールバック。tool が既に残高を動かした後に壊れた失敗（タイムアウト・
+    # is_error・部分出力・非JSON）では「もう一度言って」と促してはいけない。子が同じ発話を繰り返すと
+    # 新ターンとして operation_key が別値で再生成され、支出・入金が二重適用される（実残高の二重課金）。
+    # tool が絶対に走っていないと確証できる失敗（tool_never_ran＝claude 起動自体の失敗）だけ再入力を促し、
+    # それ以外は残高を確かめるよう促す安全文言に倒す（実残高との不一致・二重課金を避ける）。
     if not ok or not result:
-        if timed_out:
-            result = "ちょっと時間がかかっちゃった。残高が変わってないか、あとで「ざんだか」って聞いて確かめてね。"
-        else:
+        if tool_never_ran:
             result = "ごめんね、いまうまくお返事できなかったよ。もう一度言ってくれる？"
+        else:
+            result = "ちょっとうまくお返事できなかったよ。残高が変わってないか、あとで「ざんだか」って聞いて確かめてね。もう一度言うときは、変わってないのを確かめてからにしてね。"
 
     # 6. 唯一の出口から送信する（会話ログ記録＋分割を集約）
     return await reply.send_reply(channel, result, user_name=user_name, kind=SESSION_KIND)

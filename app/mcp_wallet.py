@@ -127,6 +127,33 @@ def _resolve_child(name: str) -> dict | None:
     return conf
 
 
+def _scoped_op_key(child_name: str, action: str, ai_op_key: str) -> str:
+    """AI が渡す operation_key を、子ども・操作種別でサーバ側名前空間化した実効キーにする。
+
+    二重課金根絶の核が「AI が毎回グローバル一意な文字列を渡すこと」だけに依存すると、
+    claude セッションは子ごとに完全分離されるため、子 A と子 B が独立に低エントロピーな
+    同一キー（例 "expense_1" "income" "1"）を選ぶ確率が構造的に高い。冪等判定は
+    applied_operation_keys という単一フラット dict を全体共有しているので、先に子 A が
+    そのキーを適用済みにすると、後から子 B の本当に別の支出が「すでに記録済み」に化けて
+    黙って消え、実残高が乖離する。同一児童でも弱いキー（日付ベース等）の使い回しで
+    2件目の実取引が消える。
+
+    そこで update_balance へ渡す前・is_operation_applied 判定の両方で、
+    f"{child}:{action}:{ai_key}" に組み立てる。これで最低限クロス児童・クロス操作種別の
+    衝突は構造的に不可能になる（設計が明言する「operation_key で二重課金を根絶」を、
+    モデル任せでなく Python 境界で担保する）。
+
+    Args:
+        child_name: 対象児童名（_resolve_child で確定した信頼値）。
+        action: 操作種別（spending_record / manual_income / initial_setup / allowance_grant）。
+        ai_op_key: AI が tool 引数で渡した生の operation_key（strip 済み想定）。
+
+    Returns:
+        str: 名前空間化した実効 operation_key。
+    """
+    return f"{child_name}:{action}:{ai_op_key}"
+
+
 def _parse_amount(raw) -> int | None:
     """金額を安全に整数化する。1〜MAX_AMOUNT の範囲外・非数値は None。
 
@@ -290,15 +317,17 @@ def _do_record_expense(args: dict) -> str:
         return "内部エラー: 操作キーが無いため支出を記録できなかったよ。"
     name = str(conf.get("name", ""))
     item = str(args.get("item") or "").strip()
+    # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
+    eff_key = _scoped_op_key(name, "spending_record", op_key)
     # 既適用キーなら update_balance はスキップする。事前に検知して誤った二重報告を避ける
-    if _wallet.is_operation_applied(op_key):
+    if _wallet.is_operation_applied(eff_key):
         return f"この支出はすでに記録済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
     before = _wallet.get_balance(name)
-    # delta は負数（支出）。operation_key で二重記録を防ぐ
+    # delta は負数（支出）。名前空間化した operation_key で二重記録を防ぐ
     after, _ = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
         delta=-amount, action="spending_record", note=item,
-        operation_key=op_key,
+        operation_key=eff_key,
     )
     return (
         f"支出を記録したよ。\n- 金額: {amount}円\n- 何に: {item if item else 'なし'}\n"
@@ -321,7 +350,9 @@ def _do_record_income(args: dict) -> str:
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
         return "内部エラー: 操作キーが無いため入金を記録できなかったよ。"
-    if _wallet.is_operation_applied(op_key):
+    # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
+    eff_key = _scoped_op_key(name, "manual_income", op_key)
+    if _wallet.is_operation_applied(eff_key):
         return f"この入金はすでに記録済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
     income_conf = config.get_child_income_report_setting()
     # 安全弁1: 1回あたりの上限。max_amount が 0 以下（誤設定）なら安全側の既定 5000円へ倒す
@@ -360,7 +391,7 @@ def _do_record_income(args: dict) -> str:
     after, achieved = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
         delta=amount, action="manual_income", note=note,
-        operation_key=op_key,
+        operation_key=eff_key,
     )
     msg = (
         f"入金を記録したよ。\n- 金額: {amount}円\n- メモ: {note if note else 'なし'}\n"
@@ -392,8 +423,10 @@ def _do_set_initial_balance(args: dict) -> str:
     if not op_key:
         return "内部エラー: 操作キーが無いため初期設定できなかったよ。"
     name = str(conf.get("name", ""))
+    # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
+    eff_key = _scoped_op_key(name, "initial_setup", op_key)
     # 既適用キーなら誤った二重報告を避ける
-    if _wallet.is_operation_applied(op_key):
+    if _wallet.is_operation_applied(eff_key):
         return f"この初期設定はすでに反映済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
     before = _wallet.get_balance(name)
     # 現在残高との差分だけ動かして指定額へ合わせる
@@ -401,7 +434,7 @@ def _do_set_initial_balance(args: dict) -> str:
     after, _ = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
         delta=delta, action="initial_setup", note="set_current_wallet_balance",
-        operation_key=op_key,
+        operation_key=eff_key,
     )
     return f"初期設定を反映したよ。\n対象: {name}\n所持金: {before}円 → {after}円"
 
@@ -586,9 +619,11 @@ def _do_grant_allowance(args: dict) -> str:
     if not op_key:
         return "内部エラー: 操作キーが無いため支給できなかったよ。"
     name = str(conf.get("name", ""))
+    # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
+    eff_key = _scoped_op_key(name, "allowance_grant", op_key)
 
     # 既適用キーなら二重支給を避ける
-    if _wallet.is_operation_applied(op_key):
+    if _wallet.is_operation_applied(eff_key):
         return f"この査定はすでに反映済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
 
     # AI が渡した額を安全に整数化する（負数は 0 に丸め、支給をマイナスにしない）
@@ -613,7 +648,7 @@ def _do_grant_allowance(args: dict) -> str:
     after, achieved = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
         delta=grant, action="allowance_grant", note=reason,
-        operation_key=op_key,
+        operation_key=eff_key,
     )
     msg = (
         f"査定でお小遣いを {grant}円 あげたよ。\n- 理由: {reason}\n"
@@ -847,7 +882,9 @@ def approve_proposal(name: str, operation_key: str) -> str:
             return f"「{target}」の承認待ちの査定は無いよ。"
 
         op_key = str(operation_key or "").strip()
-        if op_key and _wallet.is_operation_applied(op_key):
+        # 他 tool と冪等空間を共有するため、承認支給も子ども・操作種別で名前空間化する
+        eff_key = _scoped_op_key(target, "allowance_grant", op_key) if op_key else ""
+        if eff_key and _wallet.is_operation_applied(eff_key):
             # 既適用なら二重支給しない。提案だけ消しておく
             doc["requests"].pop(target, None)
             store._save_doc(store.payout_requests_path, doc, "requests")
@@ -872,7 +909,7 @@ def approve_proposal(name: str, operation_key: str) -> str:
         after, achieved = _wallet.update_balance(
             user_conf=conf, system_conf=_system_conf(),
             delta=grant, action="allowance_grant", note=reason,
-            operation_key=op_key,
+            operation_key=eff_key,
         )
         # 承認済みの提案は消す
         doc["requests"].pop(target, None)

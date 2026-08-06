@@ -709,6 +709,26 @@ async def _on_message_impl(message: discord.Message):
     # 雑談・残高・支出入金・目標・査定提案はすべて AI が会話の中で判断し、必要なら wallet tool を呼ぶ。
     # 会話文脈は claude session の --resume で継続する（現行で切れていた会話永続性の根本解決）。
 
+    # 親（is_parent）が代理指定なしで子チャンネルに自然文を投げた場合は、会話層へ入れない。
+    # chat.require_mention=false・natural_chat_enabled=true の本番設定では、親の素の発話が
+    # そのチャンネルの子として解決され、AI が「子ども本人の発話」として受け取る。親が試しに
+    # 「300円のジュース買った」等と書くと COMPASS_ACTIVE_CHILD=その子で record_expense が走り、
+    # 親の発話で子の実残高が動く／子の会話文脈が汚染される。金額変更系語だけ弾く
+    # _parent_natural_management_guide では素の「◯円使った/もらった」を止められないため、
+    # 親の自然文は会話層の手前で一律ブロックし、明示コマンド or `名前の代理 〜` へ誘導する。
+    if is_parent(message.author.id) and not proxy_name:
+        await message.channel.send(
+            "お子さんのお小遣いを動かすときは、明示コマンドか `お子さんの名前の代理 〜` で話しかけてね。"
+            "（このチャンネルの自然文はお子さん本人用だよ）"
+        )
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "parent_natural_conversation_blocked",
+            {"selected_user_source": selected_user_source},
+        )
+        _mark_thinking_sent(message, True)
+        return
+
     # 会話層は子ども本人の会話を前提とする。対象が子として実在しない（＝親が子チャンネル外で
     # 自然文を送った等）場合は会話層へ流さず案内する。wallet tool は本人性を env で束縛して親を
     # 弾くため実残高は元々安全だが、AI が親を子ども扱いして雑談する不自然さを手前で止める。
