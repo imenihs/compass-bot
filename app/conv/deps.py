@@ -334,6 +334,105 @@ def save_coaching_nudge(user_conf: dict, card_type: str, child_action: str) -> N
         pass
 
 
+def save_pending_nudge_bridge(user_conf: dict, nudge_text: str) -> None:
+    """能動伴走ナッジ（reminder が channel.send で直接送る問いかけ）を、次の会話ターンへ
+    橋渡しするため learning_support_state へ best-effort で記録する。
+
+    能動ナッジは claude セッションにも会話ログにも claude 経由では載らないため、次に子が
+    「やった」「あとで」と返すと claude はその問いかけを送った記憶が無い孤立発話として受け取り、
+    伴走が会話として成立しない（学習支援要件『未反応の小さなチャレンジに返答しやすい形で
+    声をかける』が切れる）。そこで直近ナッジ本文をここへ残し、次ターンの system prompt に
+    「前回きみに《…》と聞いたよ」として1回だけ注入して文脈を繋ぐ（take で消費）。
+
+    Args:
+        user_conf: 対象児童の設定 dict。
+        nudge_text: 送った能動ナッジの本文。
+    """
+    import json
+    import os as _os
+    from pathlib import Path
+    from urllib.parse import quote
+    try:
+        raw_key = str(user_conf.get("user_key") or user_conf.get("name") or "").strip()
+        key = quote(raw_key, safe="-_.")[:120] or "unknown"
+        root = Path(__file__).resolve().parents[2]
+        path = root / "data" / "learning_support_state" / f"{key}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        from app.wallet_service import _interprocess_lock
+        with _interprocess_lock(path.with_suffix(".json.lock")):
+            state = {}
+            if path.exists():
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    state = loaded if isinstance(loaded, dict) else {}
+                except Exception:
+                    state = {}
+            storage_mod = importlib.import_module("app.storage")
+            # 橋渡しは会話コーチングの last_nudge_at とは別キーに持つ。challenge_stale 判定が
+            # 会話コーチングの副作用で抑制されないよう、状態を混ぜない。
+            state["pending_nudge_bridge"] = {
+                "text": nudge_text,
+                "at": storage_mod.now_jst_iso(),
+            }
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            _os.replace(tmp, path)
+    except Exception:
+        # 橋渡し記録の失敗はナッジ送信・会話を止めない
+        pass
+
+
+def take_pending_nudge_bridge(user_conf: dict) -> str:
+    """未消費の能動ナッジ橋渡し本文を返し、同時にクリアする（1回だけ注入するため）。
+
+    会話ターンの system prompt 構築時に呼ぶ。存在すれば本文を返しクリアし、無ければ空文字。
+    読み取り・クリアの失敗では空文字を返し会話を止めない。
+
+    Args:
+        user_conf: 対象児童の設定 dict。
+
+    Returns:
+        str: 橋渡しナッジ本文。無ければ空文字。
+    """
+    import json
+    import os as _os
+    from pathlib import Path
+    from urllib.parse import quote
+    try:
+        raw_key = str(user_conf.get("user_key") or user_conf.get("name") or "").strip()
+        key = quote(raw_key, safe="-_.")[:120] or "unknown"
+        root = Path(__file__).resolve().parents[2]
+        path = root / "data" / "learning_support_state" / f"{key}.json"
+        if not path.exists():
+            return ""
+        from app.wallet_service import _interprocess_lock
+        with _interprocess_lock(path.with_suffix(".json.lock")):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+            except Exception:
+                return ""
+            if not isinstance(state, dict):
+                return ""
+            bridge = state.get("pending_nudge_bridge")
+            if not isinstance(bridge, dict):
+                return ""
+            text = str(bridge.get("text") or "").strip()
+            # 読んだら必ず消す（同じ問いかけを毎ターン注入しない）
+            state.pop("pending_nudge_bridge", None)
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            _os.replace(tmp, path)
+            return text
+    except Exception:
+        return ""
+
+
 def conversation_session_setting() -> dict:
     """会話セッションの失効設定（expiry_minutes）を返す。
 

@@ -763,8 +763,9 @@ class ReminderService:
             nudge = self._select_proactive_nudge(user_conf, log_dir, now_dt)
             if not nudge:
                 continue
+            nudge_message = _build_proactive_child_nudge_message(user_conf, nudge)
             try:
-                await channel.send(_build_proactive_child_nudge_message(user_conf, nudge))
+                await channel.send(nudge_message)
             except Exception as e:
                 self._log_reminder_delivery_error(
                     "proactive_child_nudge",
@@ -772,6 +773,14 @@ class ReminderService:
                     {"user_name": user_name},
                 )
                 continue
+            # 送った問いかけを次の会話ターンへ橋渡しする。claude セッションには載らないため、
+            # 次に子が「やった/あとで」と返しても孤立しないよう system prompt へ1回注入させる。
+            try:
+                from app.conv import deps as _conv_deps
+                _conv_deps.save_pending_nudge_bridge(user_conf, nudge_message)
+            except Exception:
+                # 橋渡し記録の失敗はナッジ本体を止めない
+                pass
             self._mark_proactive_sent(state, user_name, nudge, now_dt)
             self._save_reminder_state(state)
             sent_count += 1

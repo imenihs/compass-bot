@@ -158,14 +158,16 @@ def _build_system_prompt(user_conf: dict) -> str:
 
 
 # お金・貯金そのものを指す語。これ単独でもお金の話題とみなす（誤爆の少ない明確な語だけ）。
+# 明確なお金語。これ単独でお金の話題とみなしてよい（食べ物・遊びの雑談には出ない語だけ）。
+# 「円」は数量にも付くため（100円のパン等）ここには入れない。下で購買動詞との共起を要求する。
 _COACHING_MONEY_WORDS = (
-    "円", "お金", "おかね", "おこづかい", "お小遣い", "貯金", "ちょきん", "査定",
+    "お金", "おかね", "おこづかい", "お小遣い", "貯金", "ちょきん", "査定", "入金", "支給",
 )
-# 目標・購買・入金の動詞。ただし単独では純雑談を拾いやすいので、金額語との共起を必須にする。
+# 購買・入金・貯金の動詞。単独では純雑談を拾いやすいので、お金の文脈（お金語 or 金額）との共起を要求する。
 # （「ほしい」「かった」等の部分一致で「パンほしい」「たのしかった」を誤って拾うのを防ぐ）
 _COACHING_ACTION_WORDS = (
     "買っ", "かいもの", "つかった", "使っ", "もらった", "ためた", "貯め", "ためる",
-    "目標", "もくひょう", "ほしい", "欲しい",
+    "目標", "もくひょう",
 )
 # 単なる残高・履歴の照会。これだけの発話ではコーチングを出さない（お金の話でも問いかけは邪魔）。
 _COACHING_SUPPRESS_ONLY = ("残高", "ざんだか", "いくらある", "履歴", "りれき", "台帳")
@@ -174,29 +176,42 @@ _COACHING_SUPPRESS_ONLY = ("残高", "ざんだか", "いくらある", "履歴"
 _last_coached_action: dict[str, str] = {}
 
 
+def _has_amount_expr(text: str) -> bool:
+    """金額表現（数字＋円）を含むか。個数・時刻の裸の数字は金額とみなさない。
+
+    「100円」は金額だが「3匹」「5分」「あと5個」は金額ではない。数字に『円』が隣接する
+    ときだけ金額文脈とみなし、コーチングの誤爆（個数・時刻の数字での発火）を防ぐ。
+    """
+    import re as _re
+    # 半角/全角数字の直後に（空白を挟んでも）『円』が続くパターンだけを金額とみなす
+    return bool(_re.search(r"[0-9０-９]+\s*円", text))
+
+
 def _should_coach(input_text: str) -> bool:
     """この発話でコーチングを付けるべきか判定する。お金・貯金の話題のときだけ True。
 
-    誤爆を避けるため、(1)お金語（円・お金・貯金等）を含むか、(2)金額の数字＋購買/貯金動詞が
-    共起するとき、をお金の話題とみなす。「ほしい」「かった」単独では発火させない（純雑談を拾わない）。
+    誤爆を避けるため、お金の話題を次のいずれかに限定する:
+      (1) 明確なお金語（お金・貯金・査定・入金・支給等）を含む。
+      (2) 金額表現（数字＋円）と購買/貯金動詞が共起する（例「300円つかった」）。
+    「ほしい」「100円のパン」単独では発火させない（食べ物・遊びの雑談を拾わない）。
     単なる残高・履歴照会だけのときも出さない（監視的にしない）。
     """
     text = input_text or ""
-    has_money = any(w in text for w in _COACHING_MONEY_WORDS)
-    # 数字（半角/全角）と購買・貯金動詞が共起していれば、お金語が無くてもお金の話題とみなす
-    import re as _re
-    has_amount_digit = bool(_re.search(r"[0-9０-９]", text))
+    has_money_word = any(w in text for w in _COACHING_MONEY_WORDS)
+    has_amount = _has_amount_expr(text)
     has_action = any(w in text for w in _COACHING_ACTION_WORDS)
-    is_money_topic = has_money or (has_amount_digit and has_action)
+    # 明確なお金語があるか、金額表現＋購買/貯金動詞が共起するときだけお金の話題とみなす。
+    # 金額表現だけ（「100円のパンたべたい」）や動詞だけ（「ポケモンほしい」）では発火しない。
+    is_money_topic = has_money_word or (has_amount and has_action)
     if not is_money_topic:
         return False
     # 残高・履歴の照会「だけ」ならコーチングを出さない
     stripped = text
     for w in _COACHING_SUPPRESS_ONLY:
         stripped = stripped.replace(w, "")
-    # 照会語を除いた残りに、まだお金の話題性が残っているか
+    # 照会語を除いた残りに、まだお金の話題性が残っているか（同じ二条件で再判定）
     still_money = any(w in stripped for w in _COACHING_MONEY_WORDS) or (
-        bool(_re.search(r"[0-9０-９]", stripped)) and any(w in stripped for w in _COACHING_ACTION_WORDS)
+        _has_amount_expr(stripped) and any(w in stripped for w in _COACHING_ACTION_WORDS)
     )
     return still_money
 
@@ -253,6 +268,40 @@ async def _build_coaching_block_async(user_conf: dict, input_text: str) -> str:
         "押しつけずに提案すること。\n"
         "- 上の分析や親向けメモはそのまま読み上げない。子どもが自分で選べる形（今買う/待つ/別にする 等）にする。\n"
         "- 叱ったり、できていない点を並べたりしない。一度に出す提案は1つだけにする。"
+    )
+
+
+async def _build_nudge_bridge_block_async(user_conf: dict) -> str:
+    """未消費の能動伴走ナッジがあれば、system prompt へ「前回きみに聞いたこと」を1回だけ注入する。
+
+    reminder が channel.send で直接送った問いかけは claude セッションに載らないため、次に子が
+    「やった/あとで/ちがう」と短く返しても claude はその問いかけを送った記憶が無く、伴走が会話
+    として噛み合わない。deps.take_pending_nudge_bridge で橋渡し本文を取り出し（取り出したら消費）、
+    直前に自分が投げかけた文脈として claude に持たせる。お金・学習の話題判定（_should_coach）とは
+    独立に効かせる（返答『やった』等はお金語を含まないため）。
+
+    Args:
+        user_conf: 対象児童の設定 dict。
+
+    Returns:
+        str: system prompt へ足す橋渡し指示。無ければ空文字。
+    """
+    try:
+        # 状態ファイル I/O をスレッドへ逃がしイベントループを止めない
+        bridge_text = await asyncio.to_thread(deps.take_pending_nudge_bridge, user_conf)
+    except Exception:
+        # 橋渡し取得の失敗で会話を止めない
+        return ""
+    bridge_text = (bridge_text or "").strip()
+    if not bridge_text:
+        return ""
+    # 改行はプロンプト内で1行に畳む（system prompt の可読性のため）
+    one_line = " ".join(bridge_text.split())
+    return (
+        "\n【前回きみから声をかけた続き（意識する）】\n"
+        f"- 少し前にきみからこの子へ《{one_line}》と声をかけたよ。\n"
+        "- 今回の発話がその返事（例: やった／あとで／ちがう／まだ）なら、その文脈を踏まえて自然に受け止めること。\n"
+        "- 関係ない話題なら、この声かけには触れず、今の話にふつうに応じること。しつこく蒸し返さない。"
     )
 
 
@@ -505,6 +554,8 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
     # _build_coaching_block_async 内で行い、イベントループをブロックしない）。
     system_prompt = _build_system_prompt(user_conf)
     system_prompt += await _build_coaching_block_async(user_conf, input_text)
+    # 直前に能動ナッジを送っていれば、その問いかけを1回だけ橋渡しして会話を噛み合わせる
+    system_prompt += await _build_nudge_bridge_block_async(user_conf)
     try:
         ok, result, new_session_id, timed_out, tool_never_ran = await _run_claude(input_text, session_id, system_prompt, user_name)
     finally:
