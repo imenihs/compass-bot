@@ -720,7 +720,7 @@ def _do_propose_allowance(args: dict) -> str:
     return msg
 
 
-def take_unnotified_proposals() -> list[dict]:
+def take_unnotified_proposals(only_name: str | None = None) -> list[dict]:
     """親へまだ通知していない査定提案を取り出し、通知済みにマークして返す（in-process）。
 
     mcp_wallet は claude の子プロセスで Discord を叩けないため、通知は bot 側が行う。bot は
@@ -732,12 +732,16 @@ def take_unnotified_proposals() -> list[dict]:
     """
     # マークはここでせず、未通知の pending を返すだけにする。bot 側が送信に成功した分だけ
     # mark_proposals_notified で notified を立てる（送信失敗時に notified が立って永久ロストするのを防ぐ）。
+    # only_name を渡すとその子の提案だけ返す。全児童分をまとめて返すと、別の子の査定理由（頑張った内容や
+    # 家庭事情）が無関係な子のチャンネルへ漏れる越境表示になるため、通知は必ず対象児1人に絞る。
+    target = (only_name or "").strip()
     store = _payout_store()
     with _payout_locked():
         doc = store._load_doc(store.payout_requests_path, "requests")
         pending_to_notify = [
             dict(req) for req in doc["requests"].values()
             if isinstance(req, dict) and req.get("status") == "pending" and not req.get("notified")
+            and (not target or str(req.get("name", "")).strip() == target)
         ]
     return pending_to_notify
 

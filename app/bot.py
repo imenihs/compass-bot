@@ -733,7 +733,10 @@ async def _on_message_impl(message: discord.Message):
     # 次の発話ターンで再び未通知として拾われ再通知される（見逃し・一時エラーの救済）。
     try:
         from app import mcp_wallet
-        proposals = mcp_wallet.take_unnotified_proposals()
+        # 今発話した子の提案だけを、その子のチャンネル(=発話チャンネル)へ通知する。全児童分を返すと
+        # 別の子の査定理由が無関係な子のチャンネルへ漏れる越境表示になるため、対象児を発話者に限定する。
+        speaker_name = str(user_conf.get("name", "")).strip()
+        proposals = mcp_wallet.take_unnotified_proposals(only_name=speaker_name)
         if proposals:
             parent_mention = " ".join(f"<@{pid}>" for pid in sorted(get_parent_ids())) or "おうちの人"
             notified_names = []
