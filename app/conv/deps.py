@@ -286,6 +286,54 @@ def _load_learning_support_state(user_conf: dict) -> dict:
         return {}
 
 
+def save_coaching_nudge(user_conf: dict, card_type: str, child_action: str) -> None:
+    """会話でコーチングを注入したターンの last_card_type / last_nudge_at / last_child_action を
+    learning_support_state へ best-effort で書き戻す。
+
+    これにより (a) 再起動を跨いだ反復抑制、(b) reminder の能動伴走(challenge_stale)が会話で出した課題を
+    追える、(c) learning_insights の3日 dedup が会話経路にも効く。server.py / reminder との競合を避けるため
+    payout と同じ flock で直列化し、read→更新→原子的 tmp+replace で書く。失敗は握って会話を止めない。
+
+    Args:
+        user_conf: 対象児童の設定 dict。
+        card_type: 注入したカード種別（insight_card の type）。
+        child_action: 注入した child_action。
+    """
+    import json
+    import os as _os
+    from pathlib import Path
+    from urllib.parse import quote
+    try:
+        raw_key = str(user_conf.get("user_key") or user_conf.get("name") or "").strip()
+        key = quote(raw_key, safe="-_.")[:120] or "unknown"
+        root = Path(__file__).resolve().parents[2]
+        path = root / "data" / "learning_support_state" / f"{key}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # server/reminder と同じ state ファイルを触るため flock で直列化する
+        from app.wallet_service import _interprocess_lock
+        with _interprocess_lock(path.with_suffix(".json.lock")):
+            state = {}
+            if path.exists():
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    state = loaded if isinstance(loaded, dict) else {}
+                except Exception:
+                    state = {}
+            storage_mod = importlib.import_module("app.storage")
+            state["last_card_type"] = card_type
+            state["last_child_action"] = child_action
+            state["last_nudge_at"] = storage_mod.now_jst_iso()
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            _os.replace(tmp, path)
+    except Exception:
+        # 書き戻しの失敗はコーチング・会話を止めない
+        pass
+
+
 def conversation_session_setting() -> dict:
     """会話セッションの失効設定（expiry_minutes）を返す。
 

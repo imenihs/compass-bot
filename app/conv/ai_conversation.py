@@ -237,6 +237,13 @@ async def _build_coaching_block_async(user_conf: dict, input_text: str) -> str:
     if _last_coached_action.get(user_name) == child_action:
         return ""
     _last_coached_action[user_name] = child_action
+    # learning_support_state へ書き戻し、再起動を跨いだ反復抑制・能動伴走(challenge_stale)・3日dedup を
+    # 会話経路にも効かせる（best-effort、失敗は握る）。card_type は insight_card の type
+    card_type = str(top.get("type") or "").strip()
+    try:
+        deps.save_coaching_nudge(user_conf, card_type, child_action)
+    except Exception:
+        pass
     return (
         "\n【学習支援コーチング（この発話はお金・学習の話。意識する）】\n"
         f"- この子に今そっと促したい小さな行動は「{child_action}」"
