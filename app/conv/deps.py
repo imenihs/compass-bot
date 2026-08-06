@@ -399,7 +399,9 @@ def recent_coaching_action(user_conf: dict, within_hours: int = 20) -> str:
         return ""
 
 
-def save_pending_nudge_bridge(user_conf: dict, nudge_text: str) -> None:
+def save_pending_nudge_bridge(
+    user_conf: dict, nudge_text: str, reason: str = "", challenge_action: str = ""
+) -> None:
     """能動伴走ナッジ（reminder が channel.send で直接送る問いかけ）を、次の会話ターンへ
     橋渡しするため learning_support_state へ best-effort で記録する。
 
@@ -409,9 +411,16 @@ def save_pending_nudge_bridge(user_conf: dict, nudge_text: str) -> None:
     声をかける』が切れる）。そこで直近ナッジ本文をここへ残し、次ターンの system prompt に
     「前回きみに《…》と聞いたよ」として1回だけ注入して文脈を繋ぐ（take で消費）。
 
+    reason と challenge_action も保存する。take 側は「元ナッジが challenge_stale で、その返事とみなせる」
+    ときだけ child_response を書くため、どのチャレンジ由来かを区別する必要がある。no_record や
+    growth_plan_review の橋渡しで child_response を書くと、無関係な会話1回で別チャレンジの
+    challenge_stale が誤って抑制される（要件が構造的に無効化される）ため、reason を持ち回す。
+
     Args:
         user_conf: 対象児童の設定 dict。
         nudge_text: 送った能動ナッジの本文。
+        reason: ナッジの種別（challenge_stale / no_record / growth_plan_review 等）。
+        challenge_action: challenge_stale のとき、その対象アクション（child_response 照合用）。
     """
     import json
     import os as _os
@@ -437,6 +446,8 @@ def save_pending_nudge_bridge(user_conf: dict, nudge_text: str) -> None:
             state["pending_nudge_bridge"] = {
                 "text": nudge_text,
                 "at": storage_mod.now_jst_iso(),
+                "reason": str(reason or ""),
+                "challenge_action": str(challenge_action or ""),
             }
             tmp = path.with_suffix(".json.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
@@ -482,18 +493,25 @@ def take_pending_nudge_bridge(user_conf: dict) -> str:
             if not isinstance(bridge, dict):
                 return ""
             text = str(bridge.get("text") or "").strip()
+            bridge_reason = str(bridge.get("reason") or "")
+            bridge_action = str(bridge.get("challenge_action") or "")
             # 読んだら必ず消す（同じ問いかけを毎ターン注入しない）
             state.pop("pending_nudge_bridge", None)
-            # 橋渡しを消費した=子が能動ナッジ(challenge_stale の声かけ)へ会話で返答した、とみなす。
-            # child_response に responded_at=now を記録し、reminder の _has_recent_child_response が
-            # 会話経由の応答も拾えるようにする。これで会話で解決済みの課題を能動ナッジで蒸し返す
-            # (監視的挙動)を防ぐ。既存の challenge_id/feedback 形式に合わせ、会話由来と分かる値を入れる。
-            storage_mod = importlib.import_module("app.storage")
-            state["child_response"] = {
-                "challenge_id": str(state.get("last_child_action") or ""),
-                "feedback": "conversation_reply",
-                "responded_at": storage_mod.now_jst_iso(),
-            }
+            # child_response は「元ナッジが challenge_stale で、その返事とみなせる」ときだけ書く。
+            # no_record / growth_plan_review の橋渡しで書くと、無関係な会話1回で別チャレンジの
+            # challenge_stale が誤って抑制され、要件『未反応の小さなチャレンジに声をかける』が
+            # 構造的に無効化される。かつ challenge_id は当時のナッジ対象アクションに固定し、
+            # _has_recent_child_response 側で last_child_action と照合できるようにする（別チャレンジの
+            # 放置を会話返答で免罪しない）。橋渡し本文の会話注入(text)は reason に関わらず毎回行う。
+            if bridge_reason == "challenge_stale":
+                # 照合キーは当時のナッジ対象を優先し、無ければ現在の last_child_action にフォールバック
+                challenge_id = bridge_action or str(state.get("last_child_action") or "")
+                storage_mod = importlib.import_module("app.storage")
+                state["child_response"] = {
+                    "challenge_id": challenge_id,
+                    "feedback": "conversation_reply",
+                    "responded_at": storage_mod.now_jst_iso(),
+                }
             tmp = path.with_suffix(".json.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)

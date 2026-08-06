@@ -619,14 +619,28 @@ class ReminderService:
         return None
 
     def _has_recent_child_response(self, state: dict, now: datetime, days: int) -> bool:
-        """子どもが最近チャレンジへ反応したかを判定する"""
+        """子どもが最近「そのチャレンジ」へ反応したかを判定する。
+
+        responded_at の新しさに加え challenge_id を last_child_action と照合する。照合しないと、
+        別チャレンジへの反応（や会話橋渡しの消費）で、いま放置されている challenge_stale まで
+        『反応済み』扱いになり伴走が発火しなくなる（要件『未反応の小さなチャレンジに声をかける』の
+        取りこぼし）。challenge_id が一致するときだけ、その対象への最近の反応とみなす。
+        """
         response = state.get("child_response")
         if not isinstance(response, dict):
             return False
         responded_at = self._parse_datetime(response.get("responded_at"))
         if responded_at is None:
             return False
-        return responded_at >= now - timedelta(days=days)
+        if responded_at < now - timedelta(days=days):
+            return False
+        # challenge_id を現在の対象アクション(last_child_action)と照合する。両方空でない一致のみ有効。
+        response_cid = str(response.get("challenge_id") or "").strip()
+        current_action = str(state.get("last_child_action") or "").strip()
+        # challenge_id が記録されている場合は一致必須。空(旧データ)なら後方互換で時刻のみ判定に倒す。
+        if response_cid:
+            return response_cid == current_action
+        return True
 
     def _select_proactive_nudge(self, user_conf: dict, log_dir: Path, now: datetime) -> dict | None:
         """記録空白・未反応・確認日から、送るべき伴走メッセージを1つ選ぶ"""
@@ -775,9 +789,16 @@ class ReminderService:
                 continue
             # 送った問いかけを次の会話ターンへ橋渡しする。claude セッションには載らないため、
             # 次に子が「やった/あとで」と返しても孤立しないよう system prompt へ1回注入させる。
+            # reason/action も渡し、challenge_stale の返事だけが child_response を書けるようにする
+            # （no_record 等の橋渡しは会話注入のみ。無関係な会話での challenge_stale 誤抑制を防ぐ）。
             try:
                 from app.conv import deps as _conv_deps
-                _conv_deps.save_pending_nudge_bridge(user_conf, nudge_message)
+                _conv_deps.save_pending_nudge_bridge(
+                    user_conf,
+                    nudge_message,
+                    reason=str(nudge.get("reason") or ""),
+                    challenge_action=str(nudge.get("action") or ""),
+                )
             except Exception:
                 # 橋渡し記録の失敗はナッジ本体を止めない
                 pass

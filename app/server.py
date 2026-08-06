@@ -8,6 +8,7 @@ import json
 import re
 import traceback
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
@@ -1121,6 +1122,39 @@ def _save_learning_support_state(user_conf: dict, fallback_name: str, state: dic
     _write_json_file(_learning_support_state_path(user_conf, fallback_name), state)
 
 
+@contextmanager
+def _locked_learning_support_state(user_conf: dict, fallback_name: str):
+    """learning_support_state を flock 配下で read-modify-write する contextmanager。
+
+    同じ data/learning_support_state/{key}.json を、会話層(app/conv/deps)は
+    wallet_service._interprocess_lock 配下の flock で read-modify-write する。server 側が
+    flock に参加せず tmp+replace だけで書くと、親の Web 保存と子の会話ターン書込が交差した
+    ときに後勝ちの原子的 replace が相手の更新を丸ごと消す（ロストアップデート）。会話ターン毎に
+    書く高頻度ライタ(coaching/bridge)が増えて衝突面が実運用頻度まで広がったため、server も
+    同一ロックファイル(.json.lock)配下で「flock 取得→再読込→更新→書込」に統一する。
+
+    使い方:
+        with _locked_learning_support_state(conf, name) as state:
+            state[...] = ...   # ブロック内で state を更新すれば、抜けるとき flock 内で保存される
+
+    Args:
+        user_conf: 対象児童の設定 dict。
+        fallback_name: user_conf に有効フィールドが無いときのフォールバック名。
+
+    Yields:
+        dict: ロック取得後に再読込した最新 state。ブロック内の更新が保存される。
+    """
+    from app.wallet_service import _interprocess_lock
+    path = _learning_support_state_path(user_conf, fallback_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 会話層(deps)と同じロックファイル名で相互排他する
+    with _interprocess_lock(path.with_suffix(".json.lock")):
+        # ロック取得後に再読込する（ロック外で読んだ古い state で上書きしない）
+        state = _load_learning_support_state(user_conf, fallback_name)
+        yield state
+        _save_learning_support_state(user_conf, fallback_name, state)
+
+
 def _load_growth_plans(user_conf: dict, fallback_name: str) -> dict:
     default = {"user_key": _user_key_for_storage(user_conf, fallback_name), "plans": []}
     loaded = _read_json_file(_growth_plans_path(user_conf, fallback_name), default)
@@ -2075,34 +2109,34 @@ async def op_learning_card_feedback(
         return _op_redirect(error="会話カードの反応が正しくありません。")
 
     now = now_jst_iso()
-    state = _load_learning_support_state(target_conf, target_name)
-    event = {
-        "ts": now,
-        "actor": current_user,
-        "feedback": feedback_value,
-        "card_id": _short_text(card_id, 120),
-        "card_type": _short_text(card_type, 80),
-    }
-    _append_capped_event(state, "feedback_events", event)
-
-    if feedback_value == "use_this_week":
-        state["last_card_id"] = event["card_id"]
-        state["last_card_type"] = event["card_type"]
-        state["last_nudge_at"] = now
-        state["last_parent_question"] = _short_text(parent_question, 220)
-        state["last_child_action"] = _short_text(child_action, 220)
-    elif feedback_value == "suppress_week":
-        suppressed = state.get("suppressed_card_types")
-        if not isinstance(suppressed, list):
-            suppressed = []
-        suppressed.append({
-            "card_id": event["card_id"],
-            "card_type": event["card_type"],
+    # flock 配下で read-modify-write する（会話層の高頻度書込とのロストアップデートを防ぐ）
+    with _locked_learning_support_state(target_conf, target_name) as state:
+        event = {
             "ts": now,
-        })
-        state["suppressed_card_types"] = suppressed[-20:]
+            "actor": current_user,
+            "feedback": feedback_value,
+            "card_id": _short_text(card_id, 120),
+            "card_type": _short_text(card_type, 80),
+        }
+        _append_capped_event(state, "feedback_events", event)
 
-    _save_learning_support_state(target_conf, target_name, state)
+        if feedback_value == "use_this_week":
+            state["last_card_id"] = event["card_id"]
+            state["last_card_type"] = event["card_type"]
+            state["last_nudge_at"] = now
+            state["last_parent_question"] = _short_text(parent_question, 220)
+            state["last_child_action"] = _short_text(child_action, 220)
+        elif feedback_value == "suppress_week":
+            suppressed = state.get("suppressed_card_types")
+            if not isinstance(suppressed, list):
+                suppressed = []
+            suppressed.append({
+                "card_id": event["card_id"],
+                "card_type": event["card_type"],
+                "ts": now,
+            })
+            state["suppressed_card_types"] = suppressed[-20:]
+
     label = LEARNING_CARD_FEEDBACK_CHOICES[feedback_value]
     return _op_redirect(msg=f"{target_name}の会話カード反応を保存しました（{label}）。")
 
@@ -2135,24 +2169,24 @@ async def op_child_challenge_feedback(
         return _op_redirect(error="チャレンジの反応が正しくありません。")
 
     now = now_jst_iso()
-    state = _load_learning_support_state(target_conf, target_name)
-    event = {
-        "ts": now,
-        "actor": current_user,
-        "feedback": feedback_value,
-        "challenge_id": _short_text(challenge_id, 120),
-        "child_action": _short_text(child_action, 220),
-    }
-    _append_capped_event(state, "child_challenge_events", event)
-    state["child_response"] = {
-        "challenge_id": event["challenge_id"],
-        "feedback": feedback_value,
-        "responded_at": now,
-    }
-    if event["child_action"]:
-        state["last_child_action"] = event["child_action"]
+    # flock 配下で read-modify-write する（会話層の高頻度書込とのロストアップデートを防ぐ）
+    with _locked_learning_support_state(target_conf, target_name) as state:
+        event = {
+            "ts": now,
+            "actor": current_user,
+            "feedback": feedback_value,
+            "challenge_id": _short_text(challenge_id, 120),
+            "child_action": _short_text(child_action, 220),
+        }
+        _append_capped_event(state, "child_challenge_events", event)
+        state["child_response"] = {
+            "challenge_id": event["challenge_id"],
+            "feedback": feedback_value,
+            "responded_at": now,
+        }
+        if event["child_action"]:
+            state["last_child_action"] = event["child_action"]
 
-    _save_learning_support_state(target_conf, target_name, state)
     label = CHILD_CHALLENGE_FEEDBACK_CHOICES[feedback_value]
     return _op_redirect(msg=f"チャレンジの反応を保存しました（{label}）。")
 
@@ -2236,12 +2270,12 @@ async def op_growth_plan(
     plans_data["plans"] = plans
     _save_growth_plans(target_conf, target_name, plans_data)
 
-    state = _load_learning_support_state(target_conf, target_name)
-    if status_value == "active":
-        state["active_growth_plan_id"] = target_plan_id
-    elif state.get("active_growth_plan_id") == target_plan_id:
-        state["active_growth_plan_id"] = ""
-    _save_learning_support_state(target_conf, target_name, state)
+    # flock 配下で read-modify-write する（会話層の高頻度書込とのロストアップデートを防ぐ）
+    with _locked_learning_support_state(target_conf, target_name) as state:
+        if status_value == "active":
+            state["active_growth_plan_id"] = target_plan_id
+        elif state.get("active_growth_plan_id") == target_plan_id:
+            state["active_growth_plan_id"] = ""
 
     return _op_redirect(msg=f"{target_name}の成長行動プランを保存しました。")
 

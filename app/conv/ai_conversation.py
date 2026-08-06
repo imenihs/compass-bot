@@ -393,6 +393,12 @@ async def _spawn_claude(prompt: str, session_id: str | None, system_prompt: str,
     # env に発話者を束縛して渡す。mcp_wallet はこの子だけを操作対象にする
     child_env = dict(os.environ)
     child_env["COMPASS_ACTIVE_CHILD"] = child_name
+    # 管理操作ガード(grant_allowance/set_initial_balance)の解禁フラグは、子会話 spawn へ絶対に継承させない。
+    # mcp_wallet の安全は「子spawnでは設定しない」ことに依存するが、「設定しない」は「継承しない」ではない。
+    # ボットプロセスの環境(systemd の EnvironmentFile・運用者のデバッグ起動・将来の drop-in)にこのフラグが
+    # 一度でも混入すると、全子会話が継承して親承認飛ばし支給・残高上書きが可能になる。ここで明示 pop し、
+    # 「設定しない」を「継承しても無効」にして Python 境界の最後の砦を証明不能な前提から切り離す。
+    child_env.pop("COMPASS_ALLOW_ADMIN_OPS", None)
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdin=asyncio.subprocess.DEVNULL,   # stdin を閉じて3秒待ちを避ける
