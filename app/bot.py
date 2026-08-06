@@ -725,11 +725,15 @@ async def _on_message_impl(message: discord.Message):
     # 別の子に差し替わっているこの越境は防げない。発話者の子本人＝対象児のときだけ通す。
     # find_child_user_by_discord_id（子ディレクトリのみ走査）を使う。find_user_by_discord_id は親優先で
     # 親を先に返すため、純粋な親でも「子として実在」判定になりブロックが不発になる。
-    from app.config import find_child_user_by_discord_id
+    # 本人性の照合は name 文字列でなく discord_user_id(int) で行う。name 比較だと、将来 settings に
+    # 同名の子(異体字・全角半角・前後空白の揺れ含む)が混入したとき別人でも一致して免除されうる。
+    # discord_user_id は各子アカウントの一意な正本なので、id 一致のときだけ「発話者の子本人＝対象児」とみなす。
+    from app.config import find_child_user_by_discord_id, _safe_int
     author_child_conf = find_child_user_by_discord_id(message.author.id)
+    author_child_id = _safe_int((author_child_conf or {}).get("discord_user_id"), -1)
+    target_child_id = _safe_int((user_conf or {}).get("discord_user_id"), -2)
     author_is_this_channel_child = (
-        author_child_conf is not None
-        and str(author_child_conf.get("name", "")) == str((user_conf or {}).get("name", ""))
+        author_child_conf is not None and author_child_id == target_child_id
     )
     if is_parent(message.author.id) and not proxy_name and not author_is_this_channel_child:
         await message.channel.send(
