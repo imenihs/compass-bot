@@ -716,6 +716,40 @@ async def maybe_handle_parent_announce(message: discord.Message, content: str) -
     return True
 
 
+async def maybe_handle_assessment_approve(message: discord.Message, content: str) -> bool:
+    """「査定承認 [名前]」「査定却下 [名前]」で査定支給の提案を承認/却下する（親のみ）。
+
+    AI が子どもの会話で propose_allowance を呼ぶと、支給は payout_requests に pending として積まれ
+    残高は動かない。親がこのコマンドで承認して初めて実支給される（社長方針: 査定支給は親承認必須）。
+    支給額の上限は提案時に4層ガードレールで確定済み。承認はそれをそのまま支給する。
+    """
+    if not _is_parent(message.author.id):
+        return False
+
+    body = (content or "").strip()
+    # メンションを除去してからコマンド判定する
+    mention_body = extract_input_from_mention(body, _client.user)
+    target = (mention_body if mention_body is not None else body).strip()
+
+    # 「査定承認 名前」「査定却下 名前」の形式にマッチする
+    m_approve = re.match(r"^査定承認\s+(.+)$", target)
+    m_reject = re.match(r"^査定却下\s+(.+)$", target)
+    if not m_approve and not m_reject:
+        return False
+
+    from app import mcp_wallet
+    if m_approve:
+        name = m_approve.group(1).strip()
+        # 承認ごとに一意な冪等キー。message id を使い、二重承認で二重支給しない
+        op_key = f"assessment_approve:{name}:{getattr(message, 'id', '')}"
+        result = mcp_wallet.approve_proposal(name, op_key)
+    else:
+        name = m_reject.group(1).strip()
+        result = mcp_wallet.reject_proposal(name)
+    await message.channel.send(result)
+    return True
+
+
 async def maybe_handle_web_approve(message: discord.Message, content: str) -> bool:
     """「web承認 [ユーザー名]」コマンドで Web ダッシュボードアクセス申請を承認する（親のみ）。
     承認すると仮パスワードを発行して Discord 経由で通知する。"""

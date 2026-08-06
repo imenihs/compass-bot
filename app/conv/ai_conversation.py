@@ -74,6 +74,8 @@ ALLOWED_WALLET_TOOLS = [
     "mcp__wallet__record_income",
     "mcp__wallet__get_savings_goals",
     "mcp__wallet__set_savings_goal",
+    # 査定は「提案」まで。残高は動かさず親の承認を待つ。実支給(grant_allowance)は親経路のみ
+    "mcp__wallet__propose_allowance",
 ]
 
 

@@ -57,6 +57,19 @@ def _system_conf() -> dict:
     return config.load_system()
 
 
+def _payout_store():
+    """payout_requests.json を所有する SessionStore を返す（同期利用）。
+
+    査定の支給提案は残高を動かさず payout_requests へ pending として積む。mcp_wallet は
+    別プロセスの同期サーバのため、SessionStore の同期メソッド（_load_doc/_save_doc）を直接使う。
+    書き込みは tmp+replace で原子的。提案は親承認前提の低頻度操作のため、bot 側との read-modify-write
+    競合はまず起きないが、原子的書き込みで少なくとも1件ずつは壊れない。
+    """
+    # 遅延 import で循環を避ける
+    from app.conv.session import SessionStore
+    return SessionStore()
+
+
 class _ChildMismatch(Exception):
     """AI が渡した name が、束縛された発話者（ACTIVE_CHILD）と食い違うことを表す。
 
@@ -193,9 +206,27 @@ def _tool_defs() -> list[dict]:
             },
         },
         {
+            "name": "propose_allowance",
+            "description": (
+                "査定の結果としてお小遣いの支給を『提案』する（残高はまだ動かさない）。おうちの人が承認して"
+                "初めて支給される。fixed（固定の増額）と temporary（臨時支給）を指定する。上限は Python 側で"
+                "強制され、超える分は自動で減る。何でもかんでも増額・追加支給はできない。理由 reason は必須。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "子どもの名前"},
+                    "fixed": {"type": "integer", "description": "固定の増額（円、0以上）。省略時0。"},
+                    "temporary": {"type": "integer", "description": "臨時支給（円、0以上）。省略時0。"},
+                    "reason": {"type": "string", "description": "査定の理由（必須）"},
+                },
+                "required": ["name", "reason"],
+            },
+        },
+        {
             "name": "grant_allowance",
             "description": (
-                "査定の結果としてお小遣いを支給する（残高を増やす）。fixed（固定の増額）と "
+                "査定の結果としてお小遣いを支給する（残高を増やす）。親の承認経路からのみ使う。fixed（固定の増額）と "
                 "temporary（臨時支給）を指定する。金額の上限は Python 側で強制され、超える分は支給されない。"
                 "何でもかんでも増額・追加支給はできない。理由を reason に必ず書くこと。"
             ),
@@ -462,54 +493,20 @@ def _do_grant_allowance(args: dict) -> str:
     # AI が渡した額を安全に整数化する（負数は 0 に丸め、支給をマイナスにしない）
     def _nonneg(v) -> int:
         try:
-            n = int(v)
+            return max(0, int(v))
         except (TypeError, ValueError):
             return 0
-        return max(0, n)
     fixed_req = _nonneg(args.get("fixed"))
     temp_req = _nonneg(args.get("temporary"))
 
-    guard = config.get_assessment_guardrail_setting()
-    notes: list[str] = []
-
-    # ガード1: 固定増額は その子の fixed_increase_cap 以内に頭打ち
-    fixed_cap = _nonneg(conf.get("fixed_increase_cap"))
-    fixed = min(fixed_req, fixed_cap)
-    if fixed < fixed_req:
-        notes.append(f"固定の増額は1回 {fixed_cap}円までなので {fixed}円にしたよ")
-
-    # ガード2: 臨時支給は temporary_max 以内に頭打ち
-    temp_cap = int(guard["temporary_max"])
-    temporary = min(temp_req, temp_cap)
-    if temporary < temp_req:
-        notes.append(f"臨時支給は1回 {temp_cap}円までなので {temporary}円にしたよ")
-
+    # 4層ガードレールを共通ロジックで適用する（propose_allowance と同一の判定）
     now = datetime.now(_JST)
-    month_total, day_count = _grant_month_total_and_day_count(name, now)
-
-    # ガード4: 今日の査定回数が上限に達していたら支給しない
-    if day_count >= int(guard["daily_count_max"]):
-        return (
-            f"今日はもう査定でお小遣いをあげられる回数（{guard['daily_count_max']}回）を使いきったよ。"
-            "また明日にしようね。"
-        )
-
+    fixed, temporary, notes, rejected = _apply_guardrails(conf, fixed_req, temp_req, now)
+    if rejected:
+        return rejected
     grant = fixed + temporary
     if grant <= 0:
         return "今回は増額・臨時支給なしの査定だよ。"
-
-    # ガード3: 今月の累計が上限を超える分は支給しない（残り枠まで頭打ち）
-    monthly_cap = int(guard["monthly_total_max"])
-    remaining = monthly_cap - month_total
-    if remaining <= 0:
-        return (
-            f"今月はもう査定で増やせる上限（{monthly_cap}円）に届いているよ。"
-            "来月またがんばろうね。"
-        )
-    if grant > remaining:
-        # 固定を優先して残り枠に収め、あふれた分は臨時から削る
-        notes.append(f"今月の合計が上限 {monthly_cap}円を超えないよう {remaining}円だけにしたよ")
-        grant = remaining
 
     before = _wallet.get_balance(name)
     after, achieved = _wallet.update_balance(
@@ -529,6 +526,194 @@ def _do_grant_allowance(args: dict) -> str:
     return msg
 
 
+def _apply_guardrails(conf: dict, fixed_req: int, temp_req: int, now: datetime) -> tuple[int, int, list[str], str | None]:
+    """査定額に4層ガードレールを適用し、(許可fixed, 許可temporary, 注記, 拒否理由) を返す。
+
+    grant と propose の両方から使う共通ロジック。拒否理由が返れば支給不可（日次・月次上限）。
+
+    Returns:
+        tuple[int, int, list[str], str | None]: (fixed, temporary, 注記, 拒否理由 or None)。
+    """
+    guard = config.get_assessment_guardrail_setting()
+    notes: list[str] = []
+    name = str(conf.get("name", ""))
+
+    # ガード1: 固定は fixed_increase_cap 以内
+    fixed_cap = max(0, int(conf.get("fixed_increase_cap") or 0))
+    fixed = min(fixed_req, fixed_cap)
+    if fixed < fixed_req:
+        notes.append(f"固定の増額は1回 {fixed_cap}円まで")
+
+    # ガード2: 臨時は temporary_max 以内
+    temp_cap = int(guard["temporary_max"])
+    temporary = min(temp_req, temp_cap)
+    if temporary < temp_req:
+        notes.append(f"臨時支給は1回 {temp_cap}円まで")
+
+    month_total, day_count = _grant_month_total_and_day_count(name, now)
+
+    # ガード4: 今日の回数上限
+    if day_count >= int(guard["daily_count_max"]):
+        return 0, 0, notes, f"今日はもう査定でお小遣いをあげられる回数（{guard['daily_count_max']}回）を使いきったよ。"
+
+    grant = fixed + temporary
+    # ガード3: 月次累計の残り枠まで
+    monthly_cap = int(guard["monthly_total_max"])
+    remaining = monthly_cap - month_total
+    if grant > 0 and remaining <= 0:
+        return 0, 0, notes, f"今月はもう査定で増やせる上限（{monthly_cap}円）に届いているよ。"
+    if grant > remaining:
+        # 固定を優先して残り枠に収め、あふれた分を臨時から削る
+        notes.append(f"今月の合計が上限 {monthly_cap}円を超えないよう残り {remaining}円まで")
+        if fixed > remaining:
+            fixed = remaining
+            temporary = 0
+        else:
+            temporary = remaining - fixed
+    return fixed, temporary, notes, None
+
+
+def _do_propose_allowance(args: dict) -> str:
+    """査定支給を提案する（残高は動かさない）。親の承認を待つ pending として payout_requests へ積む。
+
+    子供の会話から AI が呼ぶ。ここで4層ガードレールを適用した「実際に支給されうる額」を算出して
+    提案に載せる（親が承認時に見る額と一致させる）。残高は承認時に初めて動く。同じ子の未承認提案が
+    あれば上書きして1件に保つ（提案を無限に溜めない）。
+    """
+    conf = _resolve_child(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return "査定の理由が必要だよ。何をがんばったか教えてね。"
+    name = str(conf.get("name", ""))
+
+    def _nonneg(v) -> int:
+        try:
+            return max(0, int(v))
+        except (TypeError, ValueError):
+            return 0
+    fixed_req = _nonneg(args.get("fixed"))
+    temp_req = _nonneg(args.get("temporary"))
+
+    now = datetime.now(_JST)
+    fixed, temporary, notes, rejected = _apply_guardrails(conf, fixed_req, temp_req, now)
+    if rejected:
+        # 日次・月次上限に達しているときは提案自体を作らない
+        return rejected
+    grant = fixed + temporary
+    if grant <= 0:
+        return "今回は増額・臨時支給なしの査定だよ。"
+
+    # payout_requests へ pending として積む。残高はまだ動かさない
+    store = _payout_store()
+    doc = store._load_doc(store.payout_requests_path, "requests")
+    requests = doc["requests"]
+    # 同じ子の未承認提案は1件に保つ（名前をキーにする）
+    requests[name] = {
+        "name": name,
+        "fixed": fixed,
+        "temporary": temporary,
+        "total": grant,
+        "reason": reason,
+        "created": now.isoformat(),
+        "status": "pending",
+    }
+    store._save_doc(store.payout_requests_path, doc, "requests")
+
+    msg = (
+        f"査定の結果をおうちの人にお願いしたよ。\n- 提案: {grant}円（固定{fixed}円＋臨時{temporary}円）\n"
+        f"- 理由: {reason}\nおうちの人が「査定承認 {name}」で OK したら残高に入るよ。"
+    )
+    for note in notes:
+        msg += f"\n（{note}）"
+    return msg
+
+
+def read_pending_proposal(name: str) -> dict | None:
+    """その子の未承認の査定提案を返す（親承認ハンドラが使う。in-process 呼び出し）。
+
+    Args:
+        name: 子ども名。
+
+    Returns:
+        dict | None: pending 提案。無ければ None。
+    """
+    store = _payout_store()
+    doc = store._load_doc(store.payout_requests_path, "requests")
+    req = doc["requests"].get((name or "").strip())
+    if isinstance(req, dict) and req.get("status") == "pending":
+        return req
+    return None
+
+
+def approve_proposal(name: str, operation_key: str) -> str:
+    """未承認の査定提案を承認して実支給する（親承認ハンドラが呼ぶ。in-process）。
+
+    提案時のガードレール済みの額をそのまま支給し、payout_requests から提案を消す。支給は
+    operation_key で冪等。提案が無ければその旨を返す。
+
+    Args:
+        name: 子ども名。
+        operation_key: 支給の冪等キー（承認ごとに一意）。
+
+    Returns:
+        str: 親向けの結果メッセージ。
+    """
+    target = (name or "").strip()
+    conf = config.find_child_user_by_name(target)
+    if conf is None:
+        return f"「{target}」は登録された子どもに見つからなかったよ。"
+    store = _payout_store()
+    doc = store._load_doc(store.payout_requests_path, "requests")
+    req = doc["requests"].get(target)
+    if not isinstance(req, dict) or req.get("status") != "pending":
+        return f"「{target}」の承認待ちの査定は無いよ。"
+
+    op_key = str(operation_key or "").strip()
+    if op_key and _wallet.is_operation_applied(op_key):
+        # 既適用なら二重支給しない。提案だけ消しておく
+        doc["requests"].pop(target, None)
+        store._save_doc(store.payout_requests_path, doc, "requests")
+        return f"この査定はすでに承認済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(target)}円。"
+
+    grant = int(req.get("total", 0))
+    reason = str(req.get("reason", ""))
+    before = _wallet.get_balance(target)
+    after, achieved = _wallet.update_balance(
+        user_conf=conf, system_conf=_system_conf(),
+        delta=grant, action="allowance_grant", note=reason,
+        operation_key=op_key,
+    )
+    # 承認済みの提案は消す
+    doc["requests"].pop(target, None)
+    store._save_doc(store.payout_requests_path, doc, "requests")
+    msg = f"✅ {target} の査定を承認して {grant}円 支給したよ。\n- 理由: {reason}\n残高: {before}円 → {after}円"
+    for goal in achieved:
+        msg += f"\n🎉 目標「{goal.get('title')}」を達成！"
+    return msg
+
+
+def reject_proposal(name: str) -> str:
+    """未承認の査定提案を却下する（残高は動かさない）。親承認ハンドラが呼ぶ。
+
+    Args:
+        name: 子ども名。
+
+    Returns:
+        str: 親向けの結果メッセージ。
+    """
+    target = (name or "").strip()
+    store = _payout_store()
+    doc = store._load_doc(store.payout_requests_path, "requests")
+    req = doc["requests"].get(target)
+    if not isinstance(req, dict) or req.get("status") != "pending":
+        return f"「{target}」の承認待ちの査定は無いよ。"
+    doc["requests"].pop(target, None)
+    store._save_doc(store.payout_requests_path, doc, "requests")
+    return f"{target} の査定を却下したよ。残高は変わっていないよ。"
+
+
 # tool 名から実装への対応表。dispatch はここを引く
 _HANDLERS = {
     "get_balance": _do_get_balance,
@@ -537,6 +722,7 @@ _HANDLERS = {
     "set_initial_balance": _do_set_initial_balance,
     "get_savings_goals": _do_get_savings_goals,
     "set_savings_goal": _do_set_savings_goal,
+    "propose_allowance": _do_propose_allowance,
     "grant_allowance": _do_grant_allowance,
 }
 

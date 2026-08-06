@@ -2084,6 +2084,10 @@ async def _on_message_impl(message: discord.Message):
     if await handlers_parent.maybe_handle_web_approve(message, content):
         return
 
+    # 親による査定支給の承認/却下（「査定承認 [名前]」「査定却下 [名前]」）
+    if await handlers_parent.maybe_handle_assessment_approve(message, content):
+        return
+
     mention_input = bot_mention_input
     if mention_input is None:
         if CHAT_SETTING.get("natural_chat_enabled") and not CHAT_SETTING.get("require_mention"):
