@@ -37,6 +37,11 @@ _wallet = wallet_module.WalletService()
 # 会話の相手は1人に固定されるため、この env が唯一の正当な対象児童になる。
 ACTIVE_CHILD = os.environ.get("COMPASS_ACTIVE_CHILD", "").strip()
 
+# 危険な管理操作（親承認を飛ばす直接支給 grant_allowance、残高を絶対値でセットし自己申告上限を迂回する
+# set_initial_balance）を許可するか。子会話の spawn では設定しないため、会話 claude が --allowedTools を
+# すり抜けても Python 境界で拒否できる。越境防止(ACTIVE_CHILD)と同じく、安全は CLI フラグでなく Python で守る。
+ALLOW_ADMIN_OPS = os.environ.get("COMPASS_ALLOW_ADMIN_OPS", "").strip() == "1"
+
 
 def _send(msg: dict) -> None:
     """JSON-RPC メッセージを1行で標準出力へ書く（stdio トランスポート）。"""
@@ -369,6 +374,10 @@ def _do_record_income(args: dict) -> str:
 
 def _do_set_initial_balance(args: dict) -> str:
     """初期設定。現在残高との差分を記録して指定額へ合わせる。operation_key 必須。"""
+    # set_initial は残高を絶対値でセットし自己申告上限を迂回する管理操作。会話 spawn では
+    # ALLOW_ADMIN_OPS を設定しないため、会話 claude から呼ばれても Python 境界で拒否する。
+    if not ALLOW_ADMIN_OPS:
+        return "残高の初期設定は、おうちの人にお願いしてね。"
     conf = _resolve_child(str(args.get("name", "")))
     if conf is None:
         return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
@@ -563,6 +572,10 @@ def _do_grant_allowance(args: dict) -> str:
       4. 今日の査定支給回数が daily_count_max 以上なら、その日はもう支給しない。
     いずれも AI の判断でなく Python が最終決定する。理由（reason）は必須。
     """
+    # grant は親承認を飛ばす直接支給。会話 spawn では ALLOW_ADMIN_OPS を設定しないため、
+    # 会話 claude から呼ばれても Python 境界で拒否する（--allowedTools 頼みにしない）。
+    if not ALLOW_ADMIN_OPS:
+        return "その操作はできないよ。お小遣いをあげるかどうかは、おうちの人が決めるんだ。"
     conf = _resolve_child(str(args.get("name", "")))
     if conf is None:
         return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"

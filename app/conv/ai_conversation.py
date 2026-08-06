@@ -51,6 +51,12 @@ def _lock_for(user_name: str) -> asyncio.Lock:
 # 会話セッションの種別。SessionStore に張るセッションの kind を統一する
 SESSION_KIND = "ai_chat"
 
+# claude session_id ポインタの寿命（分）。会話の idle 窓（conversation_session の expiry_minutes、既定30分）
+# とは分離する。claude セッション本体は claude 側にディスク永続化されるため、30分無発話で session_id を
+# 捨てると「学校から帰って続きを話しても文脈が切れる」= 現行のクソ対応が残る。7日を寿命にし、それを超えたら
+# 新セッションを張り直す（古すぎる文脈は引きずらない）。
+SESSION_ID_TTL_MINUTES = 7 * 24 * 60  # 7日
+
 # claude CLI の実行ファイル名。PATH 解決に任せる（サーバ導入済み /usr/local/bin/claude）
 # claude CLI の実行ファイル。systemd 配下は PATH が最小限で /usr/local/bin を含まないことがあるため、
 # PATH 解決に頼らず絶対パスを既定にする。環境が違う場合は env COMPASS_CLAUDE_BIN で上書きできる。
@@ -493,7 +499,8 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
     #    セッション保存の失敗で応答を止めない（保存は best-effort、応答は必ず送る）
     if new_session_id:
         try:
-            ttl = int(deps.conversation_session_setting().get("expiry_minutes", 30))
+            # session_id ポインタは長寿命 TTL。会話 idle 窓(expiry_minutes)で切らず、7日は継続する
+            ttl = SESSION_ID_TTL_MINUTES
             await store.open_session(
                 user_name, SESSION_KIND,
                 data={"claude_session_id": new_session_id},
