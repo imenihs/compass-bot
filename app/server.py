@@ -687,10 +687,9 @@ def _normalize_learning_insights(
 
 
 def _user_key_for_storage(user_conf: dict, fallback_name: str) -> str:
-    """ユーザー名をファイル名として安全なキーへ変換する"""
-    raw_key = str(user_conf.get("user_key") or user_conf.get("name") or fallback_name or "").strip()
-    key = quote(raw_key, safe="-_.")
-    return key[:120] if key else "unknown"
+    """ユーザー名をファイル名として安全なキーへ変換する（全経路共有の canonical_user_key に集約）"""
+    from app.user_key import canonical_user_key
+    return canonical_user_key(user_conf, fallback_name=fallback_name)
 
 
 def _read_json_file(path: Path, default: Any) -> Any:

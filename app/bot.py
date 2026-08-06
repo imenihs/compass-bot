@@ -3,7 +3,6 @@ import os
 import json
 import re
 from pathlib import Path
-from urllib.parse import quote
 
 import discord
 import uvicorn
@@ -481,9 +480,8 @@ def _build_learning_context_for_prompt(user_conf: dict, system_conf: dict, audit
 
 def _load_learning_support_state_for_prompt(user_conf: dict) -> dict:
     """Webで保存された会話カード状態をDiscord査定プロンプトにも反映する"""
-    name = str((user_conf or {}).get("name") or "").strip()
-    user_id = str((user_conf or {}).get("discord_user_id") or "").strip()
-    key = quote(name or user_id or "unknown", safe="")
+    from app.user_key import canonical_user_key
+    key = canonical_user_key(user_conf or {})
     path = Path(__file__).resolve().parents[1] / "data" / "learning_support_state" / f"{key}.json"
     try:
         with open(path, "r", encoding="utf-8") as f:

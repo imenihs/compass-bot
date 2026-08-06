@@ -163,18 +163,19 @@ def _build_system_prompt(user_conf: dict) -> str:
 _COACHING_MONEY_WORDS = (
     "お金", "おかね", "おこづかい", "お小遣い", "貯金", "ちょきん", "査定", "入金", "支給",
 )
-# 購買・入金・貯金の動詞。単独では純雑談を拾いやすいので、お金の文脈（お金語 or 金額）との共起を要求する。
-# （「ほしい」「かった」等の部分一致で「パンほしい」「たのしかった」を誤って拾うのを防ぐ）
-_COACHING_ACTION_WORDS = (
-    "買っ", "かいもの", "つかった", "使っ", "もらった", "ためた", "貯め", "ためる",
-    "目標", "もくひょう",
+# 金銭移動が明示された高信頼の動詞。これ単独でお金の話題とみなす（「パンかった」「おかし買った」など
+# 金額語も『円』も無い最頻出の実支出発話を、学習支援の中心なのに取りこぼしていた過剰抑制を直す）。
+# 「たべた」等の食事動詞は入れない（食べ物雑談を拾わないため）。「かった」は「たのしかった」を拾うため
+# 使わず、購買を表す「買っ」（漢字）に限定する。
+_COACHING_STRONG_ACTION_WORDS = (
+    "買っ", "かいもの", "もらった", "ためた", "貯め", "ためる", "目標", "もくひょう",
+)
+# 金銭以外にも使う曖昧な動詞（時間・体力にも「つかった」）。お金の文脈（お金語 or 金額）との共起を要求する。
+_COACHING_WEAK_ACTION_WORDS = (
+    "つかった", "使っ",
 )
 # 単なる残高・履歴の照会。これだけの発話ではコーチングを出さない（お金の話でも問いかけは邪魔）。
 _COACHING_SUPPRESS_ONLY = ("残高", "ざんだか", "いくらある", "履歴", "りれき", "台帳")
-
-# 直近にその子へ注入したコーチング行動（プロセス内メモ）。同じ行動を連続で促すくどさを防ぐ。
-_last_coached_action: dict[str, str] = {}
-
 
 def _has_amount_expr(text: str) -> bool:
     """金額表現（数字＋円）を含むか。個数・時刻の裸の数字は金額とみなさない。
@@ -187,33 +188,37 @@ def _has_amount_expr(text: str) -> bool:
     return bool(_re.search(r"[0-9０-９]+\s*円", text))
 
 
+def _is_money_topic(text: str) -> bool:
+    """発話がお金の話題か。コーチング出し分けの中核判定（誤爆と過剰抑制の両方を避ける）。
+
+    お金の話題とみなす条件（いずれか）:
+      (1) 明確なお金語（お金・貯金・査定・入金・支給等）を含む。
+      (2) 高信頼の金銭移動動詞（買っ・もらった・ためた・目標等）を含む＝金額が無くても実支出/入金/貯金。
+      (3) 金額表現（数字＋円）と曖昧動詞（つかった・使っ）が共起する（例「300円つかった」）。
+    「ポケモンほしい」「すいかたべた」「100円のパンたべたい」は発火しない（願望・食事雑談を拾わない）。
+    """
+    has_money_word = any(w in text for w in _COACHING_MONEY_WORDS)
+    has_strong = any(w in text for w in _COACHING_STRONG_ACTION_WORDS)
+    has_amount = _has_amount_expr(text)
+    has_weak = any(w in text for w in _COACHING_WEAK_ACTION_WORDS)
+    return has_money_word or has_strong or (has_amount and has_weak)
+
+
 def _should_coach(input_text: str) -> bool:
     """この発話でコーチングを付けるべきか判定する。お金・貯金の話題のときだけ True。
 
-    誤爆を避けるため、お金の話題を次のいずれかに限定する:
-      (1) 明確なお金語（お金・貯金・査定・入金・支給等）を含む。
-      (2) 金額表現（数字＋円）と購買/貯金動詞が共起する（例「300円つかった」）。
-    「ほしい」「100円のパン」単独では発火させない（食べ物・遊びの雑談を拾わない）。
-    単なる残高・履歴照会だけのときも出さない（監視的にしない）。
+    _is_money_topic でお金の話題を判定し、単なる残高・履歴照会「だけ」の発話では出さない
+    （お金の話でも問いかけは監視的で邪魔なため）。
     """
     text = input_text or ""
-    has_money_word = any(w in text for w in _COACHING_MONEY_WORDS)
-    has_amount = _has_amount_expr(text)
-    has_action = any(w in text for w in _COACHING_ACTION_WORDS)
-    # 明確なお金語があるか、金額表現＋購買/貯金動詞が共起するときだけお金の話題とみなす。
-    # 金額表現だけ（「100円のパンたべたい」）や動詞だけ（「ポケモンほしい」）では発火しない。
-    is_money_topic = has_money_word or (has_amount and has_action)
-    if not is_money_topic:
+    if not _is_money_topic(text):
         return False
     # 残高・履歴の照会「だけ」ならコーチングを出さない
     stripped = text
     for w in _COACHING_SUPPRESS_ONLY:
         stripped = stripped.replace(w, "")
-    # 照会語を除いた残りに、まだお金の話題性が残っているか（同じ二条件で再判定）
-    still_money = any(w in stripped for w in _COACHING_MONEY_WORDS) or (
-        _has_amount_expr(stripped) and any(w in stripped for w in _COACHING_ACTION_WORDS)
-    )
-    return still_money
+    # 照会語を除いた残りに、まだお金の話題性が残っているか（同じ判定で再確認）
+    return _is_money_topic(stripped)
 
 
 async def _build_coaching_block_async(user_conf: dict, input_text: str) -> str:
@@ -248,12 +253,17 @@ async def _build_coaching_block_async(user_conf: dict, input_text: str) -> str:
     child_action = str(top.get("child_action") or challenge_action).strip()
     if not child_action:
         return ""
-    # 反復抑制: 直近このターンと同じ child_action を促していたら、今回は促さない（くどさ・監視感を避ける）
-    if _last_coached_action.get(user_name) == child_action:
+    # 反復抑制: 直近同じ child_action を会話コーチングで促していたら今回は促さない（くどさ・監視感を避ける）。
+    # プロセス内 dict でなく learning_support_state の last_coaching_at/action（永続・時間ベース）で判定し、
+    # 再起動で抑制が消える／プロセス寿命に抑制期間が依存する両極端を避ける。取得失敗時は抑制なしで出す。
+    try:
+        recent_action = await asyncio.to_thread(deps.recent_coaching_action, user_conf)
+    except Exception:
+        recent_action = ""
+    if recent_action and recent_action == child_action:
         return ""
-    _last_coached_action[user_name] = child_action
-    # learning_support_state へ書き戻し、再起動を跨いだ反復抑制・能動伴走(challenge_stale)・3日dedup を
-    # 会話経路にも効かせる（best-effort、失敗は握る）。card_type は insight_card の type
+    # learning_support_state へ会話専用キーで書き戻し、再起動を跨いだ反復抑制・3日 type dedup を会話経路にも
+    # 効かせる（best-effort、失敗は握る）。challenge_stale の時計は触らない。card_type は insight_card の type
     card_type = str(top.get("type") or "").strip()
     try:
         deps.save_coaching_nudge(user_conf, card_type, child_action)
@@ -267,6 +277,8 @@ async def _build_coaching_block_async(user_conf: dict, input_text: str) -> str:
         "- 「がんばろうね」で終わらせず、①今どうなっているか一言そえて、②5分でできる小さな行動を1つだけ、"
         "押しつけずに提案すること。\n"
         "- 上の分析や親向けメモはそのまま読み上げない。子どもが自分で選べる形（今買う/待つ/別にする 等）にする。\n"
+        "- この小さな行動は、今回の発話内容に自然につながる場合だけそっと触れる。無関係な話題（例: 入金の報告なのに"
+        "支出を減らす話）には無理に絡めず、その時は素直に受け止める方を優先する。\n"
         "- 叱ったり、できていない点を並べたりしない。一度に出す提案は1つだけにする。"
     )
 

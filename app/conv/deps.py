@@ -46,6 +46,18 @@ def _handlers_parent():
     return importlib.import_module("app.handlers_parent")
 
 
+def _user_key_mod():
+    """app.user_key モジュールを遅延取得する。
+
+    learning_support_state のファイル名 user_key を全経路で一意に生成する共有関数
+    canonical_user_key を提供する。遅延 import で循環を避ける。
+
+    Returns:
+        module: app.user_key モジュールオブジェクト。
+    """
+    return importlib.import_module("app.user_key")
+
+
 # ------------------------------------------------------------------
 # サービスオブジェクト（実行時に差し替えられる可能性がある）
 # ------------------------------------------------------------------
@@ -268,11 +280,9 @@ def _load_learning_support_state(user_conf: dict) -> dict:
     """
     import json
     from pathlib import Path
-    from urllib.parse import quote
     # server.py の _user_key_for_storage と同じ規則で user_key を作る（同じ state ファイルを読むため
     # safe="-_." と 120文字制限を厳密に合わせる）。ずれると別ファイルを読み抑制が効かない
-    raw_key = str(user_conf.get("user_key") or user_conf.get("name") or "").strip()
-    key = quote(raw_key, safe="-_.")
+    key = _user_key_mod().canonical_user_key(user_conf)
     key = key[:120] if key else "unknown"
     root = Path(__file__).resolve().parents[2]
     path = root / "data" / "learning_support_state" / f"{key}.json"
@@ -287,12 +297,18 @@ def _load_learning_support_state(user_conf: dict) -> dict:
 
 
 def save_coaching_nudge(user_conf: dict, card_type: str, child_action: str) -> None:
-    """会話でコーチングを注入したターンの last_card_type / last_nudge_at / last_child_action を
-    learning_support_state へ best-effort で書き戻す。
+    """会話でコーチングを注入したターンを、会話専用キー
+    last_coaching_card_type / last_coaching_at / last_coaching_action へ best-effort で書き戻す。
 
-    これにより (a) 再起動を跨いだ反復抑制、(b) reminder の能動伴走(challenge_stale)が会話で出した課題を
-    追える、(c) learning_insights の3日 dedup が会話経路にも効く。server.py / reminder との競合を避けるため
-    payout と同じ flock で直列化し、read→更新→原子的 tmp+replace で書く。失敗は握って会話を止めない。
+    これにより (a) 再起動を跨いだ反復抑制（時間ベース）、(b) learning_insights の3日 type dedup が
+    会話経路にも効く。**重要**: reminder の能動伴走(challenge_stale)が見る last_nudge_at /
+    last_child_action は絶対に触らない。会話コーチングでそれらを更新すると、よく話す子ほど
+    last_nudge_at が現在時刻へ進み challenge_stale が構造的に発火しなくなる／last_child_action が
+    会話コーチングの選択で上書きされ能動ナッジのアクションが化ける、という副作用が起きる。
+    会話コーチングとリマインダ能動伴走で状態を分離するのが本関数の要点。
+
+    server.py / reminder との競合を避けるため payout と同じ flock で直列化し、read→更新→原子的
+    tmp+replace で書く。失敗は握って会話を止めない。
 
     Args:
         user_conf: 対象児童の設定 dict。
@@ -302,10 +318,8 @@ def save_coaching_nudge(user_conf: dict, card_type: str, child_action: str) -> N
     import json
     import os as _os
     from pathlib import Path
-    from urllib.parse import quote
     try:
-        raw_key = str(user_conf.get("user_key") or user_conf.get("name") or "").strip()
-        key = quote(raw_key, safe="-_.")[:120] or "unknown"
+        key = _user_key_mod().canonical_user_key(user_conf)
         root = Path(__file__).resolve().parents[2]
         path = root / "data" / "learning_support_state" / f"{key}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,9 +335,11 @@ def save_coaching_nudge(user_conf: dict, card_type: str, child_action: str) -> N
                 except Exception:
                     state = {}
             storage_mod = importlib.import_module("app.storage")
-            state["last_card_type"] = card_type
-            state["last_child_action"] = child_action
-            state["last_nudge_at"] = storage_mod.now_jst_iso()
+            # 会話専用キーだけ書く。challenge_stale が見る last_nudge_at / last_child_action /
+            # last_card_type は触らない（能動伴走の時計を会話で汚さない）。
+            state["last_coaching_card_type"] = card_type
+            state["last_coaching_action"] = child_action
+            state["last_coaching_at"] = storage_mod.now_jst_iso()
             tmp = path.with_suffix(".json.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -332,6 +348,55 @@ def save_coaching_nudge(user_conf: dict, card_type: str, child_action: str) -> N
     except Exception:
         # 書き戻しの失敗はコーチング・会話を止めない
         pass
+
+
+def recent_coaching_action(user_conf: dict, within_hours: int = 20) -> str:
+    """直近 within_hours 以内に会話コーチングで注入した child_action を返す（無ければ空文字）。
+
+    会話コーチングの反復抑制を、プロセス内 dict でなく learning_support_state の永続キー
+    (last_coaching_action / last_coaching_at) で行うための読み取り口。プロセス内 dict だと
+    (a) 再起動で抑制が消える、(b) 稼働が長いほど「最初のお金ターンで1回出たら以後出ない」など
+    プロセス寿命に抑制期間が依存する両極端になる。時間ベースに一本化してプロセス非依存にする。
+    読めなければ空文字（抑制なし＝通常どおりコーチングを出す）。
+
+    Args:
+        user_conf: 対象児童の設定 dict。
+        within_hours: この時間以内の注入だけを「直近」とみなす。
+
+    Returns:
+        str: 直近に注入した child_action。無ければ空文字。
+    """
+    import json
+    from datetime import datetime, timedelta
+    from pathlib import Path
+    try:
+        key = _user_key_mod().canonical_user_key(user_conf)
+        root = Path(__file__).resolve().parents[2]
+        path = root / "data" / "learning_support_state" / f"{key}.json"
+        if not path.exists():
+            return ""
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            return ""
+        action = str(state.get("last_coaching_action") or "").strip()
+        at_raw = state.get("last_coaching_at")
+        if not action or not at_raw:
+            return ""
+        # last_coaching_at が within_hours 以内なら「直近」とみなす。解釈できなければ抑制しない
+        try:
+            at = datetime.fromisoformat(str(at_raw))
+        except ValueError:
+            return ""
+        # 現在時刻は storage の now_jst_iso() を基準にする（保存側と同じ時計・TZ）
+        now = datetime.fromisoformat(importlib.import_module("app.storage").now_jst_iso())
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=now.tzinfo)
+        if at <= now - timedelta(hours=within_hours):
+            return ""
+        return action
+    except Exception:
+        return ""
 
 
 def save_pending_nudge_bridge(user_conf: dict, nudge_text: str) -> None:
@@ -351,10 +416,8 @@ def save_pending_nudge_bridge(user_conf: dict, nudge_text: str) -> None:
     import json
     import os as _os
     from pathlib import Path
-    from urllib.parse import quote
     try:
-        raw_key = str(user_conf.get("user_key") or user_conf.get("name") or "").strip()
-        key = quote(raw_key, safe="-_.")[:120] or "unknown"
+        key = _user_key_mod().canonical_user_key(user_conf)
         root = Path(__file__).resolve().parents[2]
         path = root / "data" / "learning_support_state" / f"{key}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,10 +463,8 @@ def take_pending_nudge_bridge(user_conf: dict) -> str:
     import json
     import os as _os
     from pathlib import Path
-    from urllib.parse import quote
     try:
-        raw_key = str(user_conf.get("user_key") or user_conf.get("name") or "").strip()
-        key = quote(raw_key, safe="-_.")[:120] or "unknown"
+        key = _user_key_mod().canonical_user_key(user_conf)
         root = Path(__file__).resolve().parents[2]
         path = root / "data" / "learning_support_state" / f"{key}.json"
         if not path.exists():

@@ -7,7 +7,6 @@ from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable
-from urllib.parse import quote
 
 import discord
 
@@ -76,11 +75,13 @@ def _build_proactive_child_nudge_message(user_conf: dict, nudge: dict) -> str:
         plan_action = action or "決めた行動"
         return f"{prefix}{plan_action} の確認日が近いよ。\nできたことを1つだけ教えてね。"
 
+    # Phase N-11 で子どもの入口は AI 自然会話へ一本化された。旧コマンド「支出記録」を教えず、
+    # 「なにをいくらで買ったか教えてね」と自然文で話しかける誘導にする（AI主導との一貫性）。
     if age is not None and age <= 9:
-        return f"{prefix}さいきんのお金の記録、少しあいてるみたい。\n買ったものがあったら「支出記録」って送ってね。"
+        return f"{prefix}さいきんのお金の記録、少しあいてるみたい。\n買ったものがあったら、なにをいくらで買ったか教えてね。"
     if age is not None and age <= 12:
-        return f"{prefix}最近の記録が少し空いてるみたい。\n買ったものがあったら、名前だけでも「支出記録」で残してみよう。"
-    return f"{prefix}最近の支出記録が少し空いています。\n使ったものがあれば「支出記録」で残しておこう。"
+        return f"{prefix}最近の記録が少し空いてるみたい。\n買ったものがあったら、なにをいくらで買ったか話しかけてね。"
+    return f"{prefix}最近の支出記録が少し空いています。\n使ったものがあれば、なにをいくらで買ったか教えてね。"
 
 
 def _age_int(raw_age) -> int | None:
@@ -576,10 +577,9 @@ class ReminderService:
         return dt.astimezone(JST)
 
     def _user_key(self, user_conf: dict) -> str:
-        """状態ファイル用のユーザーキーを返す"""
-        name = str(user_conf.get("name") or "").strip()
-        discord_id = str(user_conf.get("discord_user_id") or "").strip()
-        return quote(name or discord_id or "unknown", safe="")
+        """状態ファイル用のユーザーキーを返す（全経路で共有の canonical_user_key に集約）"""
+        from app.user_key import canonical_user_key
+        return canonical_user_key(user_conf)
 
     def _load_json_file(self, path: Path) -> dict:
         """JSONファイルをdictとして読み込む"""

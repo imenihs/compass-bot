@@ -982,17 +982,27 @@ def _apply_support_state(cards: list[dict], support_state: dict, now: datetime) 
         selected_id = str(latest_feedback.get("card_id") or "")
         selected_type = str(latest_feedback.get("card_type") or "")
 
+    # 3日 type dedup は2つの時計を見る。last_card_type/last_nudge_at は Web(server.py)や能動ナッジ由来の
+    # 「本来のチャレンジ」を出した記録。last_coaching_card_type/last_coaching_at は会話コーチング由来の記録。
+    # 会話コーチングは challenge_stale の時計(last_nudge_at)を進めてはいけないため専用キーに分離しており、
+    # dedup 判定はそのどちらで直近同 type を出していても減点する（会話・Web を跨いだ反復抑制を効かせる）。
     last_type = str(support_state.get("last_card_type") or "")
     last_nudge_at = support_state.get("last_nudge_at")
+    last_coaching_type = str(support_state.get("last_coaching_card_type") or "")
+    last_coaching_at = support_state.get("last_coaching_at")
     adjusted: list[dict] = []
     for card in cards:
         copied = dict(card)
         card_id = str(copied.get("card_id") or "")
         card_type = str(copied.get("type") or "")
         priority = int(copied.get("priority") or 0)
+        recently_shown = (
+            (last_type and card_type == last_type and _is_recent_ts(last_nudge_at, now, days=3))
+            or (last_coaching_type and card_type == last_coaching_type and _is_recent_ts(last_coaching_at, now, days=3))
+        )
         if selected_id and (card_id == selected_id or card_type == selected_type):
             priority += 60
-        elif last_type and card_type == last_type and _is_recent_ts(last_nudge_at, now, days=3):
+        elif recently_shown:
             priority -= 45
             copied["repeat_limited"] = True
         copied["priority"] = priority
