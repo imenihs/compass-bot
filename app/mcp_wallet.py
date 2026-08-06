@@ -310,6 +310,14 @@ def _do_record_income(args: dict) -> str:
     if amount is None:
         return f"金額が正しくないよ（1〜{MAX_AMOUNT}円の正の数で教えてね）。"
     name = str(conf.get("name", ""))
+    # 冪等短絡は上限チェックより前に置く。既適用キーの再試行で、その入金が台帳の累計に含まれた状態のまま
+    # 上限判定が先に走ると「すでに記録済み」に到達する前に偽の上限拒否を返し、子どもに矛盾した文面が出る。
+    # grant/approve と順序を揃える。
+    op_key = str(args.get("operation_key") or "").strip()
+    if not op_key:
+        return "内部エラー: 操作キーが無いため入金を記録できなかったよ。"
+    if _wallet.is_operation_applied(op_key):
+        return f"この入金はすでに記録済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
     income_conf = config.get_child_income_report_setting()
     # 安全弁1: 1回あたりの上限。max_amount が 0 以下（誤設定）なら安全側の既定 5000円へ倒す
     max_income = int(income_conf.get("max_amount", 0))
@@ -341,13 +349,8 @@ def _do_record_income(args: dict) -> str:
             f"今月じぶんで入金できるのは合計 {income_conf['monthly_total_max']}円までで、"
             f"あと {remaining}円だよ。それ以上はおうちの人に相談してね。"
         )
-    op_key = str(args.get("operation_key") or "").strip()
-    if not op_key:
-        return "内部エラー: 操作キーが無いため入金を記録できなかったよ。"
+    # op_key の存在・冪等チェックは上限チェックより前で済ませている（矛盾文面を避けるため）
     note = str(args.get("note") or "").strip()
-    # 既適用キーなら誤った二重報告を避ける
-    if _wallet.is_operation_applied(op_key):
-        return f"この入金はすでに記録済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
     before = _wallet.get_balance(name)
     after, achieved = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
