@@ -120,7 +120,7 @@ def _build_system_prompt(user_conf: dict) -> str:
     age_text = f"{age}歳" if isinstance(age, int) else "年齢不明"
     personality = str(user_conf.get("bot_personality", "sibling"))
     # 人格の口調は既存プロンプトの語彙に合わせ、年齢に応じた易しさを求める
-    return (
+    base = (
         f"あなたは子ども「{name}」（{age_text}）のお小遣い管理を手伝う、やさしい会話ボットです。"
         f"口調は「{personality}」。{age_text}の子が読める、やさしい日本語で短く話します。\n"
         "【最重要・お金の記録は必ずツールを使う】\n"
@@ -131,11 +131,54 @@ def _build_system_prompt(user_conf: dict) -> str:
         "- 上のようなお金の話は「ただの報告だ」と思っても、例外なくツールを呼ぶこと。ツールを呼ばずに"
         "「記録したよ」等と言うのは禁止。金額が文に出てきたら、まずツールを呼ぶ。\n"
         "【その他の約束】\n"
-        "- 自分で金額を計算したり、残高を勝手に宣言したりしないこと。結果はツールが返した値だけを信じる。\n"
+        "- 自分で金額を計算したり、残高を勝手に宣言したりしないこと。結果はツールが返った値だけを信じる。\n"
         "- 残高を最初から決め直す「初期設定」はできない。頼まれてもおうちの人に相談するよう伝えること。\n"
         "- 同じ操作を二度実行しないよう、ツールの operation_key には毎回ちがう一意な文字列を渡すこと。\n"
         "- お金がまったく出てこない雑談（好きな食べ物・学校の話など）は、ツールを使わず自然に会話すること。\n"
         f"- 相手は {name} さん本人です。ほかの子の財布は操作できません。"
+    )
+    # その子の学習支援インサイトを注入し、「がんばろうね」で終わらせず要件どおりのコーチングをさせる。
+    # 目標や支出の話が出たら、観察→問い→次の5分の小さな行動、へ会話を接続する（学習支援要件再定義.md）。
+    coaching = _build_coaching_block(user_conf)
+    return base + coaching
+
+
+def _build_coaching_block(user_conf: dict) -> str:
+    """その子の learning_insights を system prompt 用のコーチング指示へ整形する。
+
+    build_learning_insights（deps 経由）の child_challenge / insight_cards を要点化して渡す。
+    子どもには insight_cards の分析や親向けメモをそのまま見せず、child_action を1つ、自然な会話の中で
+    さりげなく促す。失敗の指摘や叱責はしない。計算失敗時は空文字（コーチングなしでも会話は成立する）。
+
+    Args:
+        user_conf: 対象児童の設定 dict。
+
+    Returns:
+        str: system prompt へ足すコーチング指示。取得失敗時は空文字。
+    """
+    try:
+        insights = deps.learning_insights(user_conf)
+    except Exception:
+        # インサイト計算の失敗で会話を止めない。コーチングなしで通常会話にフォールバック
+        return ""
+    challenge = insights.get("child_challenge") or {}
+    challenge_action = str(challenge.get("action") or "").strip()
+    cards = insights.get("insight_cards") or []
+    top = cards[0] if cards else {}
+    skill = str(top.get("skill") or "").strip()
+    child_action = str(top.get("child_action") or challenge_action).strip()
+    if not child_action:
+        # 促す行動が無ければコーチング指示を足さない
+        return ""
+    return (
+        "\n【学習支援コーチング（お金の話になったら意識する）】\n"
+        f"- この子に今そっと促したい小さな行動は「{child_action}」"
+        + (f"（伸ばしたい力: {skill}）" if skill else "")
+        + "。\n"
+        "- 目標貯金・支出・お金の使い方の話になったら、「がんばろうね」で終わらせず、"
+        "①今どうなっているか一言そえて、②5分でできる小さな行動を1つだけ、押しつけずに提案すること。\n"
+        "- 上の分析や親向けメモはそのまま読み上げない。子どもが自分で選べる形（今買う/待つ/別にする 等）にする。\n"
+        "- 叱ったり、できていない点を並べたりしない。一度に出す提案は1つだけにする。"
     )
 
 

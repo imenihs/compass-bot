@@ -227,6 +227,31 @@ def conversation_log_setting() -> dict:
     return config.get_conversation_log_setting()
 
 
+def learning_insights(user_conf: dict, system_conf: dict | None = None, days: int = 90) -> dict:
+    """その子の学習支援インサイト（会話カード・子ども向けチャレンジ・要点）を返す。
+
+    app/conv/** は app.learning_insights を直接 import しない規約のため、ここで遅延 import する。
+    AI 主導の会話層はこの結果を system prompt へ注入し、「観察→問い→次の小さな行動」という
+    学習支援要件（学習支援要件再定義.md）どおりのコーチングを会話に織り込む。build_learning_insights は
+    既存ログ（pocket_journal / wallet_ledger）を読むだけで残高は動かさない。
+
+    Args:
+        user_conf: 対象児童の設定 dict。
+        system_conf: システム設定。None なら現在値を使う。
+        days: 集計する日数（既定90日）。
+
+    Returns:
+        dict: build_learning_insights の返り値（insight_cards / child_challenge / prompt_points 等）。
+    """
+    li = importlib.import_module("app.learning_insights")
+    # system_conf 未指定時は app.config を直接使う。deps.load_system() は app.bot を引き
+    # GeminiService 初期化を誘発するため、ログ読取だけの学習支援には app.config で足りる。
+    if system_conf is None:
+        config = importlib.import_module("app.config")
+        system_conf = config.load_system()
+    return li.build_learning_insights(user_conf, system_conf, days=days)
+
+
 def conversation_session_setting() -> dict:
     """会話セッションの失効設定（expiry_minutes）を返す。
 
