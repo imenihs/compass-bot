@@ -168,8 +168,9 @@ def _build_system_prompt(user_conf: dict) -> str:
         "- 「わたしは体が無い」「AIだから」「ツールを呼ぶ」「システム」「エラー」等、自分の仕組みや内部事情を"
         "子どもに語らないこと。うまくいかないときも、内部の理由でなく、やさしい言葉で言い直してもらうよう促すこと。"
     )
-    # コーチングは呼び出し側（handle_conversation）で input_text を見て付けるか決め、
-    # coaching_block を渡してくる。ここでは base に連結するだけ（出し分け・抑制は非同期側で行う）。
+    # 本関数は base（人格・約束事）だけを返す。コーチングや能動ナッジ橋渡しの連結は呼び出し側
+    # （handle_conversation）が input_text を見て _build_coaching_block_async / _build_nudge_bridge_block_async
+    # の結果を base へ足す（出し分け・反復抑制・to_thread は非同期側で行う）。本関数は引数を user_conf のみ取る。
     return base
 
 
@@ -650,10 +651,24 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
     # tool が絶対に走っていないと確証できる失敗（tool_never_ran＝claude 起動自体の失敗）だけ再入力を促し、
     # それ以外は残高を確かめるよう促す安全文言に倒す（実残高との不一致・二重課金を避ける）。
     if not ok or not result:
+        # フォールバック文言も年齢相応にする。失敗時ほど子は不安なのに固定文だと 7歳に長く難しい漢語が
+        # 出るため、低学年(≤9歳)はひらがな中心・短文へ出し分ける。安全上の意味(二重課金を促さない)は保つ。
+        age = user_conf.get("age")
+        low_grade = isinstance(age, int) and age <= 9
         if tool_never_ran:
-            result = "ごめんね、いまうまくお返事できなかったよ。もう一度言ってくれる？"
+            # tool 未実行が確実。再入力を促してよい
+            result = (
+                "ごめんね、いま うまく おへんじ できなかったよ。もういちど おしえてくれる？"
+                if low_grade else
+                "ごめんね、いまうまくお返事できなかったよ。もう一度言ってくれる？"
+            )
         else:
-            result = "ちょっとうまくお返事できなかったよ。残高が変わってないか、あとで「ざんだか」って聞いて確かめてね。もう一度言うときは、変わってないのを確かめてからにしてね。"
+            # tool 後に壊れた可能性。言い直しを促さず、残高確認を促す安全文言
+            result = (
+                "ちょっと うまく できなかったよ。おかねが かわってないか、あとで「ざんだか」って きいてね。"
+                if low_grade else
+                "ちょっとうまくお返事できなかったよ。残高が変わってないか、あとで「ざんだか」って聞いて確かめてね。もう一度言うときは、変わってないのを確かめてからにしてね。"
+            )
 
     # 6. 唯一の出口から送信する（会話ログ記録＋分割を集約）
     return await reply.send_reply(channel, result, user_name=user_name, kind=SESSION_KIND)

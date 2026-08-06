@@ -716,13 +716,22 @@ async def _on_message_impl(message: discord.Message):
     # 親の自然文は会話層の手前で一律ブロックし、明示コマンド or `名前の代理 〜` へ誘導する。
     # ただし「親IDが子としても登録されている」兼務アカウント（家族共有端末・親が練習で使う等）では、
     # 本人が子として実在するので締め出さず会話層へ通す（wallet tool は env 束縛でその子だけを操作するため
-    # 実残高は安全）。ブロックは「親であり、かつ子として実在しない」場合に限定する。
-    # 判定は必ず find_child_user_by_discord_id（子ディレクトリのみ走査）を使う。find_user_by_discord_id は
-    # 親→子の順で親を先に返すため、純粋な親でも「子として実在」判定になりブロックが不発になる（親の自然文が
-    # 子残高を動かす越境が復活する）。子ディレクトリだけを見て「子として実在するか」を厳密に判定する。
+    # 実残高は安全）。
+    # 免除は「発話者本人の子アカウントが、いま対象になっている user_conf の子と一致する」ときだけに厳格化する。
+    # 「何らかの子として登録されているか」(bool)だけで免除すると、兼務ID(親A=子テストが同一ID)が別の子
+    # (はな)のチャンネルで自然文を送ったとき、_find_channel_child_user_conf が user_conf をりかへ差し替え、
+    # find_child_user_by_discord_id はテストを返して免除され、COMPASS_ACTIVE_CHILD=りかで record_expense が
+    # 走る＝親の発話でりかの実残高が動く越境になる。env 束縛は「解決した子(はな)」を守るだけで、user_conf 自体が
+    # 別の子に差し替わっているこの越境は防げない。発話者の子本人＝対象児のときだけ通す。
+    # find_child_user_by_discord_id（子ディレクトリのみ走査）を使う。find_user_by_discord_id は親優先で
+    # 親を先に返すため、純粋な親でも「子として実在」判定になりブロックが不発になる。
     from app.config import find_child_user_by_discord_id
-    author_is_registered_child = find_child_user_by_discord_id(message.author.id) is not None
-    if is_parent(message.author.id) and not proxy_name and not author_is_registered_child:
+    author_child_conf = find_child_user_by_discord_id(message.author.id)
+    author_is_this_channel_child = (
+        author_child_conf is not None
+        and str(author_child_conf.get("name", "")) == str((user_conf or {}).get("name", ""))
+    )
+    if is_parent(message.author.id) and not proxy_name and not author_is_this_channel_child:
         await message.channel.send(
             "お子さんのお小遣いを動かすときは、明示コマンドか `お子さんの名前の代理 〜` で話しかけてね。"
             "（このチャンネルの自然文はお子さん本人用だよ）"

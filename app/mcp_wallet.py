@@ -173,9 +173,14 @@ def _natural_dup_keys(child_name: str, action: str, amount: int, item: str) -> l
     Returns:
         list[str]: 現在分・前分の2つの自然キー。
     """
-    now = datetime.now(_JST)
-    # 品目はキーの安定のため前後空白を除くだけにする（表記ゆれは許容。金額+action+分で十分絞れる）
+    # 品目が空のときは自然キー dedup を使わない。空品目だと「金額だけ同じ別の買い物」を2分内に2回
+    # 言ったとき(低年齢児は品目を言わず金額だけ連投しがち)に正当な2件目を誤って弾き、実残高が実支出より
+    # 高く残る乖離が起きる。誤検知リスクの方が実害が大きいため、品目ありの言い直しだけを自然キーで防ぐ。
+    # 言い直しの主要ケース(AI再送・同一発話)は主 operation_key 冪等で引き続き守られる。
     norm_item = (item or "").strip()
+    if not norm_item:
+        return []
+    now = datetime.now(_JST)
     keys = []
     for delta_min in (0, 1):
         stamp = (now - timedelta(minutes=delta_min)).strftime("%Y%m%d%H%M")

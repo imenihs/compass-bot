@@ -497,7 +497,36 @@ def take_pending_nudge_bridge(user_conf: dict, record_response: bool = True) -> 
             text = str(bridge.get("text") or "").strip()
             bridge_reason = str(bridge.get("reason") or "")
             bridge_action = str(bridge.get("challenge_action") or "")
-            # 読んだら必ず消す（同じ問いかけを毎ターン注入しない）
+            # 返事らしくない発話(record_response=False)では bridge を温存し、注入も child_response 記録も
+            # しない。無関係な発話1回(例「おはよう」)で bridge が焼失すると、次に子が本当に「やった/あとで」と
+            # 返したとき文脈が残らず伴走が孤立するため。ただし無限温存を防ぐため、保存から48時間を超えた
+            # bridge は返事が来なくても破棄する(古い問いかけを蒸し返さない)。
+            if not record_response:
+                import datetime as _dt
+                at_raw = str(bridge.get("at") or "")
+                expired = False
+                if at_raw:
+                    try:
+                        at = _dt.datetime.fromisoformat(at_raw)
+                        now = _dt.datetime.fromisoformat(
+                            importlib.import_module("app.storage").now_jst_iso()
+                        )
+                        if at.tzinfo is None:
+                            at = at.replace(tzinfo=now.tzinfo)
+                        expired = at <= now - _dt.timedelta(hours=48)
+                    except ValueError:
+                        expired = False
+                if expired:
+                    # 期限切れは破棄する（温存しない）。ファイルを書き換えて pop を確定させる
+                    state.pop("pending_nudge_bridge", None)
+                    tmp = path.with_suffix(".json.tmp")
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(state, f, ensure_ascii=False, indent=2)
+                        f.write("\n")
+                    _os.replace(tmp, path)
+                # 温存(または破棄)。どちらも今回は注入しない
+                return ""
+            # 返事らしいターン。読んだら必ず消す（同じ問いかけを毎ターン注入しない）
             state.pop("pending_nudge_bridge", None)
             # child_response は「元ナッジが challenge_stale で、かつ今回の発話が返事とみなせる
             # (record_response=True)」ときだけ書く。no_record / growth_plan_review の橋渡しや、無関係な
