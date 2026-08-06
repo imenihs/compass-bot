@@ -172,9 +172,15 @@ class WalletService:
         note: str = "",
         extra: dict | None = None,
         operation_key: str | None = None,
+        aux_operation_keys: list[str] | None = None,
     ) -> tuple[int, list[dict]]:
         # プロセス内(RLock)に加え、プロセス間(flock)でも直列化する。mcp_wallet 子プロセスと
         # bot プロセスが同じ wallet_state.json を read-modify-write するロストアップデートを防ぐ。
+        #
+        # aux_operation_keys: 主 operation_key に加えて冪等判定・記録する補助キー。会話の言い直し
+        # (tool後にタイムアウト/失敗し、子が同じ発話を繰り返すと AI が別の生キーを選び主キー冪等を
+        # すり抜ける)を弾くための自然キー(子:action:金額:品目:時刻窓)を mcp_wallet が渡す。主キーと
+        # 同じ flock 内で登録し、二重適用防止をアトミックにする。
         lock_path = self.wallet_state_path.with_suffix(self.wallet_state_path.suffix + ".lock")
         with self._lock, _interprocess_lock(lock_path):
             user_name = str(user_conf.get("name", "unknown"))
@@ -186,6 +192,11 @@ class WalletService:
             safe_operation_key = str(operation_key or "").strip()
             if safe_operation_key and safe_operation_key in applied_keys:
                 return before, []
+            # 補助キーのいずれかが既適用なら、言い直しによる二重適用とみなしスキップする
+            safe_aux_keys = [str(k or "").strip() for k in (aux_operation_keys or []) if str(k or "").strip()]
+            for aux_key in safe_aux_keys:
+                if aux_key in applied_keys:
+                    return before, []
             after = before + int(delta)
 
             log_dir = get_log_dir(system_conf)
@@ -214,6 +225,17 @@ class WalletService:
                     "action": action,
                     "delta": int(delta),
                     "balance_after": after,
+                }
+            # 補助キー(自然キー)も同じ flock 内で applied 登録する。次の言い直しターンで別の主キーでも
+            # この自然キーが既適用に当たり二重適用を弾ける。値は主キーと同形式で追跡可能にする。
+            for aux_key in safe_aux_keys:
+                applied_keys[aux_key] = {
+                    "ts": ts,
+                    "name": user_name,
+                    "action": action,
+                    "delta": int(delta),
+                    "balance_after": after,
+                    "aux": True,
                 }
             self._save_wallet_state(state)
 

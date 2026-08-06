@@ -133,9 +133,25 @@ def _build_system_prompt(user_conf: dict) -> str:
         "friend": "友だちのように、気さくで楽しい口調",
         "parent": "おうちの人のように、あたたかく見守る口調",
     }.get(personality_key, "年上のきょうだいのように親しみやすい口調")
+    # 年齢相応の長さ・語彙を明示制約にする。散文の「やさしく」だけだと 7歳へ長文・難語が出る回帰を
+    # prompt で保証できないため、年齢帯で具体的な上限を与える（モデル任せにしない）。
+    if isinstance(age, int) and age <= 9:
+        age_style = (
+            "【話し方（低学年・とても大切）】1回の返事は1〜2文までにする。ひらがなを多めにし、"
+            "むずかしい漢字や熟語（例: 管理・記録・目標額）は使わず、やさしい言い方にする。"
+            "一度に伝えることは1つだけにする。長い説明やリストにしない。\n"
+        )
+    elif isinstance(age, int) and age <= 12:
+        age_style = (
+            "【話し方（中学年〜高学年）】1回の返事は2〜3文までにする。むずかしい言葉は避け、"
+            "やさしい日本語で要点を1つにしぼって話す。長い説明やリストにしない。\n"
+        )
+    else:
+        age_style = "【話し方】短く、やさしい日本語で、要点を1つにしぼって話す。長い説明やリストにしない。\n"
     base = (
         f"あなたは子ども「{name}」（{age_text}）のお小遣い管理を手伝う、やさしい会話ボットです。"
         f"{personality_label}で、{age_text}の子が読める、やさしい日本語で短く話します。\n"
+        f"{age_style}"
         "【最重要・お金の記録は必ずツールを使う】\n"
         "- 子どもが「◯円つかった／買った」と言ったら、雑談で流さず 必ず record_expense を呼ぶこと。\n"
         "- 「◯円もらった／お小遣いもらった」と言ったら、必ず record_income を呼ぶこと。\n"
@@ -266,7 +282,10 @@ async def _build_coaching_block_async(user_conf: dict, input_text: str) -> str:
     # 効かせる（best-effort、失敗は握る）。challenge_stale の時計は触らない。card_type は insight_card の type
     card_type = str(top.get("type") or "").strip()
     try:
-        deps.save_coaching_nudge(user_conf, card_type, child_action)
+        # save_coaching_nudge は flock(LOCK_EX ブロッキング)+ファイル RMW を行う。親の Web 保存や
+        # reminder cron が同じ .json.lock を保持中だと、生呼びでは Discord のイベントループ全体
+        # (全児童の会話・考え中表示・heartbeat)がブロックする。同関数内の他3依存と同様 to_thread へ逃がす。
+        await asyncio.to_thread(deps.save_coaching_nudge, user_conf, card_type, child_action)
     except Exception:
         pass
     return (
@@ -283,7 +302,28 @@ async def _build_coaching_block_async(user_conf: dict, input_text: str) -> str:
     )
 
 
-async def _build_nudge_bridge_block_async(user_conf: dict) -> str:
+# 能動ナッジへの返事とみなせる短い反応語。これらか、お金話題のときだけ「チャレンジに返答した」とみなす。
+_NUDGE_REPLY_WORDS = (
+    "やった", "できた", "やってみた", "あとで", "まだ", "これから", "ちがう", "ちがった",
+    "むり", "できなかった", "わすれた", "うん", "はい",
+)
+
+
+def _looks_like_nudge_reply(input_text: str) -> bool:
+    """今回の発話が、直前の能動ナッジ（チャレンジ）への返事とみなせるか。
+
+    反応語（やった/あとで/ちがう/まだ 等）を含むか、お金の話題（_is_money_topic）ならば返事とみなす。
+    無関係な雑談（おはよう・みかん食べた等）では False にし、challenge_stale の誤抑制を防ぐ。
+    """
+    text = (input_text or "").strip()
+    if not text:
+        return False
+    if any(w in text for w in _NUDGE_REPLY_WORDS):
+        return True
+    return _is_money_topic(text)
+
+
+async def _build_nudge_bridge_block_async(user_conf: dict, input_text: str) -> str:
     """未消費の能動伴走ナッジがあれば、system prompt へ「前回きみに聞いたこと」を1回だけ注入する。
 
     reminder が channel.send で直接送った問いかけは claude セッションに載らないため、次に子が
@@ -292,15 +332,22 @@ async def _build_nudge_bridge_block_async(user_conf: dict) -> str:
     直前に自分が投げかけた文脈として claude に持たせる。お金・学習の話題判定（_should_coach）とは
     独立に効かせる（返答『やった』等はお金語を含まないため）。
 
+    child_response（challenge_stale の抑制材料）を書くのは、今回の発話が返事とみなせるとき
+    （_looks_like_nudge_reply）だけに限定する。無関係な雑談1回で別チャレンジの challenge_stale が
+    誤抑制されるのを防ぐ。橋渡し本文の会話注入自体は返事かどうかに関わらず毎回行う（文脈を繋ぐため）。
+
     Args:
         user_conf: 対象児童の設定 dict。
+        input_text: 今回の子どもの発話（返事らしさの判定に使う）。
 
     Returns:
         str: system prompt へ足す橋渡し指示。無ければ空文字。
     """
+    is_reply = _looks_like_nudge_reply(input_text)
     try:
-        # 状態ファイル I/O をスレッドへ逃がしイベントループを止めない
-        bridge_text = await asyncio.to_thread(deps.take_pending_nudge_bridge, user_conf)
+        # 状態ファイル I/O をスレッドへ逃がしイベントループを止めない。返事とみなせるときだけ
+        # child_response を書かせる（record_response=is_reply）。
+        bridge_text = await asyncio.to_thread(deps.take_pending_nudge_bridge, user_conf, is_reply)
     except Exception:
         # 橋渡し取得の失敗で会話を止めない
         return ""
@@ -425,7 +472,7 @@ async def _spawn_claude(prompt: str, session_id: str | None, system_prompt: str,
     )
 
 
-async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, child_name: str) -> tuple[bool, str, str | None]:
+async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, child_name: str) -> tuple[bool, str, str | None, bool, bool]:
     """claude を起動する。resume 対象が死んでいた場合に限り、新規セッションで1回だけやり直す。
 
     再試行は「resume に使った session_id が失効・破損していて、まだ会話が始まっておらず tool が
@@ -573,7 +620,7 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
     system_prompt = _build_system_prompt(user_conf)
     system_prompt += await _build_coaching_block_async(user_conf, input_text)
     # 直前に能動ナッジを送っていれば、その問いかけを1回だけ橋渡しして会話を噛み合わせる
-    system_prompt += await _build_nudge_bridge_block_async(user_conf)
+    system_prompt += await _build_nudge_bridge_block_async(user_conf, input_text)
     try:
         ok, result, new_session_id, timed_out, tool_never_ran = await _run_claude(input_text, session_id, system_prompt, user_name)
     finally:

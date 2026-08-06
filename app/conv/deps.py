@@ -459,7 +459,7 @@ def save_pending_nudge_bridge(
         pass
 
 
-def take_pending_nudge_bridge(user_conf: dict) -> str:
+def take_pending_nudge_bridge(user_conf: dict, record_response: bool = True) -> str:
     """未消費の能動ナッジ橋渡し本文を返し、同時にクリアする（1回だけ注入するため）。
 
     会話ターンの system prompt 構築時に呼ぶ。存在すれば本文を返しクリアし、無ければ空文字。
@@ -467,6 +467,8 @@ def take_pending_nudge_bridge(user_conf: dict) -> str:
 
     Args:
         user_conf: 対象児童の設定 dict。
+        record_response: 今回の発話が返事とみなせるか。False なら challenge_stale の child_response を
+            書かない（無関係な雑談での誤抑制を防ぐ）。橋渡し本文の返却・消費は record_response に関わらず行う。
 
     Returns:
         str: 橋渡しナッジ本文。無ければ空文字。
@@ -497,13 +499,13 @@ def take_pending_nudge_bridge(user_conf: dict) -> str:
             bridge_action = str(bridge.get("challenge_action") or "")
             # 読んだら必ず消す（同じ問いかけを毎ターン注入しない）
             state.pop("pending_nudge_bridge", None)
-            # child_response は「元ナッジが challenge_stale で、その返事とみなせる」ときだけ書く。
-            # no_record / growth_plan_review の橋渡しで書くと、無関係な会話1回で別チャレンジの
-            # challenge_stale が誤って抑制され、要件『未反応の小さなチャレンジに声をかける』が
-            # 構造的に無効化される。かつ challenge_id は当時のナッジ対象アクションに固定し、
-            # _has_recent_child_response 側で last_child_action と照合できるようにする（別チャレンジの
-            # 放置を会話返答で免罪しない）。橋渡し本文の会話注入(text)は reason に関わらず毎回行う。
-            if bridge_reason == "challenge_stale":
+            # child_response は「元ナッジが challenge_stale で、かつ今回の発話が返事とみなせる
+            # (record_response=True)」ときだけ書く。no_record / growth_plan_review の橋渡しや、無関係な
+            # 雑談(record_response=False)で書くと、その1発話で別チャレンジの challenge_stale が誤って抑制され、
+            # 要件『未反応の小さなチャレンジに声をかける』が構造的に無効化される。かつ challenge_id は当時の
+            # ナッジ対象アクションに固定し、_has_recent_child_response 側で last_child_action と照合できるように
+            # する（別チャレンジの放置を会話返答で免罪しない）。橋渡し本文の会話注入(text)は毎回行う。
+            if bridge_reason == "challenge_stale" and record_response:
                 # 照合キーは当時のナッジ対象を優先し、無ければ現在の last_child_action にフォールバック
                 challenge_id = bridge_action or str(state.get("last_child_action") or "")
                 storage_mod = importlib.import_module("app.storage")

@@ -154,6 +154,35 @@ def _scoped_op_key(child_name: str, action: str, ai_op_key: str) -> str:
     return f"{child_name}:{action}:{ai_op_key}"
 
 
+def _natural_dup_keys(child_name: str, action: str, amount: int, item: str) -> list[str]:
+    """言い直しによる二重適用を弾く自然キーを、直近2分ぶん（現在分・前分）返す。
+
+    operation_key は AI がターンごとに生成するため、tool が残高を動かした直後にタイムアウト/失敗し、
+    子が同じ発話（例「300円つかった」）を言い直すと、新ターンで AI は別の生キーを選び operation_key
+    冪等をすり抜けて支出/入金が二重適用される。これを Python 境界で防ぐため、発話内容から決まる
+    自然キー `{child}:{action}:{amount}:{item}:{yyyymmddHHMM}` を補助キーにする。分単位だと分境界を
+    またぐと漏れるため、現在分と1分前の2つを生成し2分窓の言い直しを弾く。本当に別の支出（時間が空く／
+    金額・品目が違う）は別キーになり通す。
+
+    Args:
+        child_name: 対象児童名。
+        action: 操作種別（spending_record / manual_income）。
+        amount: 金額（正の整数）。
+        item: 品目・メモ（空でも可）。
+
+    Returns:
+        list[str]: 現在分・前分の2つの自然キー。
+    """
+    now = datetime.now(_JST)
+    # 品目はキーの安定のため前後空白を除くだけにする（表記ゆれは許容。金額+action+分で十分絞れる）
+    norm_item = (item or "").strip()
+    keys = []
+    for delta_min in (0, 1):
+        stamp = (now - timedelta(minutes=delta_min)).strftime("%Y%m%d%H%M")
+        keys.append(f"{child_name}:{action}:dup:{amount}:{norm_item}:{stamp}")
+    return keys
+
+
 def _parse_amount(raw) -> int | None:
     """金額を安全に整数化する。1〜MAX_AMOUNT の範囲外・非数値は None。
 
@@ -319,15 +348,18 @@ def _do_record_expense(args: dict) -> str:
     item = str(args.get("item") or "").strip()
     # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
     eff_key = _scoped_op_key(name, "spending_record", op_key)
-    # 既適用キーなら update_balance はスキップする。事前に検知して誤った二重報告を避ける
-    if _wallet.is_operation_applied(eff_key):
-        return f"この支出はすでに記録済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
+    # 言い直しによる二重適用を弾く自然キー（直近2分・同一金額/品目）。tool後失敗で子が言い直すと AI が
+    # 別の生キーを選び eff_key 冪等をすり抜けるため、内容ベースの補助キーで防ぐ。
+    dup_keys = _natural_dup_keys(name, "spending_record", amount, item)
+    # 既適用キー（主キー or 自然キー）なら update_balance はスキップ。事前検知で誤った二重報告を避ける
+    if _wallet.is_operation_applied(eff_key) or any(_wallet.is_operation_applied(k) for k in dup_keys):
+        return f"この支出はさっき記録したよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
     before = _wallet.get_balance(name)
-    # delta は負数（支出）。名前空間化した operation_key で二重記録を防ぐ
+    # delta は負数（支出）。主キー＋自然キーで二重記録を防ぐ
     after, _ = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
         delta=-amount, action="spending_record", note=item,
-        operation_key=eff_key,
+        operation_key=eff_key, aux_operation_keys=dup_keys,
     )
     return (
         f"支出を記録したよ。\n- 金額: {amount}円\n- 何に: {item if item else 'なし'}\n"
@@ -352,8 +384,11 @@ def _do_record_income(args: dict) -> str:
         return "内部エラー: 操作キーが無いため入金を記録できなかったよ。"
     # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
     eff_key = _scoped_op_key(name, "manual_income", op_key)
-    if _wallet.is_operation_applied(eff_key):
-        return f"この入金はすでに記録済みだよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
+    # 言い直しによる二重適用を弾く自然キー（直近2分・同一金額/メモ）。tool後失敗の言い直しを内容ベースで防ぐ。
+    note_for_dup = str(args.get("note") or "").strip()
+    dup_keys = _natural_dup_keys(name, "manual_income", amount, note_for_dup)
+    if _wallet.is_operation_applied(eff_key) or any(_wallet.is_operation_applied(k) for k in dup_keys):
+        return f"この入金はさっき記録したよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
     income_conf = config.get_child_income_report_setting()
     # 安全弁1: 1回あたりの上限。max_amount が 0 以下（誤設定）なら安全側の既定 5000円へ倒す
     max_income = int(income_conf.get("max_amount", 0))
@@ -391,7 +426,7 @@ def _do_record_income(args: dict) -> str:
     after, achieved = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
         delta=amount, action="manual_income", note=note,
-        operation_key=eff_key,
+        operation_key=eff_key, aux_operation_keys=dup_keys,
     )
     msg = (
         f"入金を記録したよ。\n- 金額: {amount}円\n- メモ: {note if note else 'なし'}\n"
@@ -972,8 +1007,15 @@ def _handle_tool_call(req_id, params: dict) -> None:
             f"{ACTIVE_CHILD}さん自身の分だけだよ。"
         )
     except Exception as e:
-        # tool 内の想定外例外は AI へエラーとして返し、残高処理の失敗を握りつぶさない
-        text = f"内部エラーで処理できなかったよ（{type(e).__name__}）。"
+        # tool 内の想定外例外。子ども向け文言には例外クラス名等の技術用語・内部事情を出さない
+        # （system prompt の「内部事情を子に語らない」と整合させ、AI が戻り値を会話へ織り込んでも
+        # メタ用語が漏れないようにする）。例外の詳細は stderr の診断にのみ残す。
+        import traceback as _tb
+        print(
+            f"[mcp_wallet_tool_error] tool={tool_name} {type(e).__name__}: {e}\n{_tb.format_exc()}",
+            file=sys.stderr, flush=True,
+        )
+        text = "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     _text_result(req_id, text)
 
 

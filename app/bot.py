@@ -714,7 +714,11 @@ async def _on_message_impl(message: discord.Message):
     # 親の発話で子の実残高が動く／子の会話文脈が汚染される。金額変更系語だけ弾く
     # _parent_natural_management_guide では素の「◯円使った/もらった」を止められないため、
     # 親の自然文は会話層の手前で一律ブロックし、明示コマンド or `名前の代理 〜` へ誘導する。
-    if is_parent(message.author.id) and not proxy_name:
+    # ただし「親IDが子としても登録されている」兼務アカウント（家族共有端末・親が練習で使う等）では、
+    # 本人が子として実在するので締め出さず会話層へ通す（wallet tool は env 束縛でその子だけを操作するため
+    # 実残高は安全）。ブロックは「親であり、かつ子として実在しない」場合に限定する。
+    author_is_registered_child = find_user_by_discord_id(message.author.id) is not None
+    if is_parent(message.author.id) and not proxy_name and not author_is_registered_child:
         await message.channel.send(
             "お子さんのお小遣いを動かすときは、明示コマンドか `お子さんの名前の代理 〜` で話しかけてね。"
             "（このチャンネルの自然文はお子さん本人用だよ）"
