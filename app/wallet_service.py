@@ -149,6 +149,42 @@ class WalletService:
         state = self._load_wallet_state()
         return key in state.get("applied_operation_keys", {})
 
+    def is_recent_dup_applied(self, dup_key: str, window_sec: int) -> bool:
+        """内容キー(自然キー)が window_sec 以内に適用済みかを返す（言い直し二重適用の事前判定）。
+
+        update_balance の窓判定と同じロジックを、wallet tool が「もう反映済み」と正しく伝えるための
+        事前チェックに使う。存在するだけでなく ts が window 以内のときだけ True にすることで、
+        窓を超えた「別の支出」を誤って既適用と報告しない。ts 解釈不能は安全側で True（弾く）。
+
+        Args:
+            dup_key: _natural_dup_key が返す内容キー。
+            window_sec: この秒数以内の適用を「言い直し」とみなす。0 以下なら存在チェックに倒す。
+
+        Returns:
+            bool: window 以内に適用済みなら True。
+        """
+        key = str(dup_key or "").strip()
+        if not key:
+            return False
+        state = self._load_wallet_state()
+        meta = state.get("applied_operation_keys", {}).get(key)
+        if not isinstance(meta, dict):
+            return False
+        if window_sec <= 0:
+            return True  # 窓未指定なら存在で弾く
+        ts_raw = meta.get("ts")
+        if not ts_raw:
+            return True
+        from datetime import datetime as _dt, timedelta as _td
+        try:
+            applied_at = _dt.fromisoformat(str(ts_raw))
+            now_dt = _dt.fromisoformat(now_jst_iso())
+            if applied_at.tzinfo is None:
+                applied_at = applied_at.replace(tzinfo=now_dt.tzinfo)
+            return applied_at > now_dt - _td(seconds=window_sec)
+        except ValueError:
+            return True  # 解釈不能は安全側で弾く
+
     def get_balance(self, user_name: str) -> int:
         state = self._load_wallet_state()
         users = state.get("users", {})
@@ -208,6 +244,7 @@ class WalletService:
         extra: dict | None = None,
         operation_key: str | None = None,
         aux_operation_keys: list[str] | None = None,
+        aux_dedup_window_sec: int = 0,
     ) -> tuple[int, list[dict]]:
         # プロセス内(RLock)に加え、プロセス間(flock)でも直列化する。mcp_wallet 子プロセスと
         # bot プロセスが同じ wallet_state.json を read-modify-write するロストアップデートを防ぐ。
@@ -231,11 +268,33 @@ class WalletService:
             safe_operation_key = str(operation_key or "").strip()
             if safe_operation_key and safe_operation_key in applied_keys:
                 return before, []
-            # 補助キーのいずれかが既適用なら、言い直しによる二重適用とみなしスキップする
+            # 補助キー(内容キー)は経過秒で判定する。同じ内容キーが dedup_window_sec 以内に適用済みなら
+            # 言い直しによる二重適用とみなしスキップする。窓を超えていれば「別の支出」として通し、後で ts を
+            # 更新する。分バケットでなく経過秒にすることで分境界の漏れ(12:00:59 と 12:02:00 が重ならない)を防ぎ、
+            # 品目空も内容キーで弾ける。window は呼び出し側(mcp_wallet)が渡す。
+            from datetime import datetime as _dt, timedelta as _td
             safe_aux_keys = [str(k or "").strip() for k in (aux_operation_keys or []) if str(k or "").strip()]
+            window = int(aux_dedup_window_sec or 0)
             for aux_key in safe_aux_keys:
-                if aux_key in applied_keys:
-                    return before, []
+                meta = applied_keys.get(aux_key)
+                if not isinstance(meta, dict):
+                    continue
+                # ts が window 以内なら二重適用とみなす。ts 解釈不能や window<=0 なら従来どおり存在で弾く
+                ts_raw = meta.get("ts")
+                if window > 0 and ts_raw:
+                    try:
+                        applied_at = _dt.fromisoformat(str(ts_raw))
+                        now_dt = _dt.fromisoformat(now_jst_iso())
+                        if applied_at.tzinfo is None:
+                            applied_at = applied_at.replace(tzinfo=now_dt.tzinfo)
+                        if applied_at > now_dt - _td(seconds=window):
+                            return before, []  # 窓内=言い直し。二重適用しない
+                        # 窓外=別支出。この aux_key は下で新 ts に上書きされる
+                        continue
+                    except ValueError:
+                        return before, []  # ts 解釈不能は安全側で弾く
+                # window 未指定 or ts 無し: 存在するだけで弾く(従来互換)
+                return before, []
             after = before + int(delta)
 
             log_dir = get_log_dir(system_conf)

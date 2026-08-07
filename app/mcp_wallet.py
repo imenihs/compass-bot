@@ -28,6 +28,11 @@ _JST = timezone(timedelta(hours=9))
 # 金額入力の上限。AI 経由でも桁あふれ・異常値を弾く（本文パースの上限と揃える）
 MAX_AMOUNT = MAX_WALLET_INPUT_AMOUNT
 
+# 言い直し二重適用を弾く内容キーの有効窓（秒）。tool後失敗の言い直しは数十秒〜1分程度で起きるため、
+# この窓内の同一内容(金額+品目)を二重適用とみなす。窓を超えたら「別の支出」として通す。分バケット方式の
+# 分境界漏れ(12:00:59 と 12:02:00 が重ならない)を無くすため経過秒で判定する。
+DEDUP_WINDOW_SEC = 120
+
 # 単一の WalletService を共有する。サーバは1プロセス1インスタンスで直列化される
 _wallet = wallet_module.WalletService()
 
@@ -154,38 +159,34 @@ def _scoped_op_key(child_name: str, action: str, ai_op_key: str) -> str:
     return f"{child_name}:{action}:{ai_op_key}"
 
 
-def _natural_dup_keys(child_name: str, action: str, amount: int, item: str) -> list[str]:
-    """言い直しによる二重適用を弾く自然キーを、直近2分ぶん（現在分・前分）返す。
+def _natural_dup_key(child_name: str, action: str, amount: int, item: str) -> str:
+    """言い直しによる二重適用を弾く「内容キー」を1つ返す（時刻は含めない）。
 
     operation_key は AI がターンごとに生成するため、tool が残高を動かした直後にタイムアウト/失敗し、
     子が同じ発話（例「300円つかった」）を言い直すと、新ターンで AI は別の生キーを選び operation_key
     冪等をすり抜けて支出/入金が二重適用される。これを Python 境界で防ぐため、発話内容から決まる
-    自然キー `{child}:{action}:{amount}:{item}:{yyyymmddHHMM}` を補助キーにする。分単位だと分境界を
-    またぐと漏れるため、現在分と1分前の2つを生成し2分窓の言い直しを弾く。本当に別の支出（時間が空く／
-    金額・品目が違う）は別キーになり通す。
+    内容キー `{child}:{action}:dup:{amount}:{item}` を補助キーにする。
+
+    時刻は含めない。旧実装は分バケット（yyyymmddHHMM）だったが、(a)分境界で窓が重ならず（12:00:59 と
+    12:02:00 は共通分を持たず）二重適用が漏れる、(b)品目空を除外していたため空品目の言い直しが素通りする、
+    という穴があった（codex 指摘）。内容キーは時刻を持たず、経過秒の判定は update_balance 側が
+    applied エントリの ts と比較して行う（dedup_window_sec 以内なら言い直し、超なら別支出として通す）。
+    品目正規化は NFKC + 空白畳み込みで、AI が「ジュース」「ジュースを買った」等と揺らしても同一視しやすくする。
 
     Args:
         child_name: 対象児童名。
         action: 操作種別（spending_record / manual_income）。
         amount: 金額（正の整数）。
-        item: 品目・メモ（空でも可）。
+        item: 品目・メモ（空でも可。空でも内容キーは生成し、金額だけの言い直しも弾く）。
 
     Returns:
-        list[str]: 現在分・前分の2つの自然キー。
+        str: 内容キー（時刻を含まない）。
     """
-    # 品目が空のときは自然キー dedup を使わない。空品目だと「金額だけ同じ別の買い物」を2分内に2回
-    # 言ったとき(低年齢児は品目を言わず金額だけ連投しがち)に正当な2件目を誤って弾き、実残高が実支出より
-    # 高く残る乖離が起きる。誤検知リスクの方が実害が大きいため、品目ありの言い直しだけを自然キーで防ぐ。
-    # 言い直しの主要ケース(AI再送・同一発話)は主 operation_key 冪等で引き続き守られる。
-    norm_item = (item or "").strip()
-    if not norm_item:
-        return []
-    now = datetime.now(_JST)
-    keys = []
-    for delta_min in (0, 1):
-        stamp = (now - timedelta(minutes=delta_min)).strftime("%Y%m%d%H%M")
-        keys.append(f"{child_name}:{action}:dup:{amount}:{norm_item}:{stamp}")
-    return keys
+    import unicodedata
+    # NFKC 正規化 + 連続空白を1つに畳む。全角半角・記号の揺れを吸収して言い直しを取りこぼさない
+    norm_item = unicodedata.normalize("NFKC", (item or "")).strip()
+    norm_item = " ".join(norm_item.split())
+    return f"{child_name}:{action}:dup:{amount}:{norm_item}"
 
 
 def _parse_amount(raw) -> int | None:
@@ -353,28 +354,28 @@ def _do_record_expense(args: dict) -> str:
     item = str(args.get("item") or "").strip()
     # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
     eff_key = _scoped_op_key(name, "spending_record", op_key)
-    # 言い直しによる二重適用を弾く自然キー（直近2分・同一金額/品目）。tool後失敗で子が言い直すと AI が
-    # 別の生キーを選び eff_key 冪等をすり抜けるため、内容ベースの補助キーで防ぐ。
-    dup_keys = _natural_dup_keys(name, "spending_record", amount, item)
-    # 既適用キーの扱いを分ける。主キー命中は「同一操作の再送」なので黙って冪等でよい。
-    # 自然キー命中は「同じ金額・品目を2分以内にまた記録」で、言い直しの二重適用の可能性が高いが、
-    # 本当に別の買い物(同額の駄菓子を2つ等)の可能性も残る。黙って落とすと実残高が実支出より高く残り
-    # 静かに狂うため、子が別支出だと明示できる逃げ道(「べつのかいもの」等)を文面で必ず示す。
+    # 言い直しによる二重適用を弾く内容キー（金額+品目、時刻なし）。tool後失敗で子が言い直すと AI が
+    # 別の生キーを選び eff_key 冪等をすり抜けるため、内容ベースの補助キーで防ぐ。判定は経過秒
+    # (DEDUP_WINDOW_SEC)で行い、分境界の漏れ・品目空の素通りを無くす。
+    dup_key = _natural_dup_key(name, "spending_record", amount, item)
+    # 主キー命中は「同一操作の再送」なので黙って冪等でよい。内容キーが窓内命中なら言い直しの二重適用と
+    # みなすが、本当に別の買い物(同額の駄菓子を2つ等)の可能性も残る。黙って落とすと実残高が実支出より
+    # 高く残り静かに狂うため、子が別支出だと明示できる逃げ道を文面で必ず示す。窓を超えた別支出は通す。
     if _wallet.is_operation_applied(eff_key):
         return f"この支出はさっき記録したよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
-    if any(_wallet.is_operation_applied(k) for k in dup_keys):
+    if _wallet.is_recent_dup_applied(dup_key, DEDUP_WINDOW_SEC):
         return (
             f"さっきも同じ「{amount}円{('・' + item) if item else ''}」を記録したよ。"
             "二重にならないよう、今回はまだ記録していないよ（残高は変わっていないよ）。\n"
-            "もしこれが【べつの買いもの】なら、『べつのかいもので◯◯を◯円つかった』のように、"
-            "ちがう言い方でもう一度教えてね。"
+            "もしこれが【べつの買いもの】なら、すこし時間をおいてから、"
+            "『べつのかいもので◯◯を◯円つかった』のように、ちがう言い方でもう一度教えてね。"
         )
     before = _wallet.get_balance(name)
-    # delta は負数（支出）。主キー＋自然キーで二重記録を防ぐ
+    # delta は負数（支出）。主キー＋内容キー(窓付き)で二重記録を防ぐ
     after, _ = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
         delta=-amount, action="spending_record", note=item,
-        operation_key=eff_key, aux_operation_keys=dup_keys,
+        operation_key=eff_key, aux_operation_keys=[dup_key], aux_dedup_window_sec=DEDUP_WINDOW_SEC,
     )
     return (
         f"支出を記録したよ。\n- 金額: {amount}円\n- 何に: {item if item else 'なし'}\n"
@@ -399,17 +400,17 @@ def _do_record_income(args: dict) -> str:
         return "内部エラー: 操作キーが無いため入金を記録できなかったよ。"
     # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
     eff_key = _scoped_op_key(name, "manual_income", op_key)
-    # 言い直しによる二重適用を弾く自然キー（直近2分・同一金額/メモ）。tool後失敗の言い直しを内容ベースで防ぐ。
+    # 言い直しによる二重適用を弾く内容キー（金額+メモ、時刻なし）。判定は経過秒(DEDUP_WINDOW_SEC)で行う。
     note_for_dup = str(args.get("note") or "").strip()
-    dup_keys = _natural_dup_keys(name, "manual_income", amount, note_for_dup)
+    dup_key = _natural_dup_key(name, "manual_income", amount, note_for_dup)
     if _wallet.is_operation_applied(eff_key):
         return f"この入金はさっき記録したよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
-    if any(_wallet.is_operation_applied(k) for k in dup_keys):
-        # 自然キー命中。黙って落とさず、別の入金なら明示できる逃げ道を示す
+    if _wallet.is_recent_dup_applied(dup_key, DEDUP_WINDOW_SEC):
+        # 内容キー窓内命中。黙って落とさず、別の入金なら明示できる逃げ道を示す
         return (
             f"さっきも同じ「{amount}円{('・' + note_for_dup) if note_for_dup else ''}」を記録したよ。"
             "二重にならないよう、今回はまだ記録していないよ（残高は変わっていないよ）。\n"
-            "もしこれが【べつのお金】なら、ちがう言い方でもう一度教えてね。"
+            "もしこれが【べつのお金】なら、すこし時間をおいてから、ちがう言い方でもう一度教えてね。"
         )
     income_conf = config.get_child_income_report_setting()
     # 安全弁1: 1回あたりの上限。max_amount が 0 以下（誤設定）なら安全側の既定 5000円へ倒す
@@ -448,7 +449,7 @@ def _do_record_income(args: dict) -> str:
     after, achieved = _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
         delta=amount, action="manual_income", note=note,
-        operation_key=eff_key, aux_operation_keys=dup_keys,
+        operation_key=eff_key, aux_operation_keys=[dup_key], aux_dedup_window_sec=DEDUP_WINDOW_SEC,
     )
     msg = (
         f"入金を記録したよ。\n- 金額: {amount}円\n- メモ: {note if note else 'なし'}\n"
