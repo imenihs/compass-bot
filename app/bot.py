@@ -648,8 +648,17 @@ async def _on_message_impl(message: discord.Message):
         if channel_child_conf is not None:
             user_conf = channel_child_conf
             selected_user_source = "parent_channel_context"
-        elif user_conf is not None:
-            selected_user_source = "author_discord_id"
+        else:
+            # 親が子チャンネル外（親専用チャンネル等）で自然文を送った → 親AI会話へ流す。
+            # AI が親の意図を判断して親用 tool（支給・調整・承認等）を呼ぶ。金額・対象は AI に推測させず、
+            # 親が明示した値だけを tool に渡す設計（mcp_wallet 側で PARENT_MODE・対象児実在・金額検証・冪等）。
+            # 明示コマンド（maybe_handle_*）は既に上で処理済みなので、ここに来るのはコマンド以外の自然文。
+            from app.conv.ai_conversation import handle_parent_conversation
+            from app.config import load_all_users
+            child_names = [str(u.get("name", "")) for u in load_all_users() if u.get("name")]
+            await handle_parent_conversation(message.channel, message.author.id, input_block, child_names)
+            _mark_thinking_sent(message, True)
+            return
 
     if user_conf is None:
         await message.channel.send("設定にあなたのDiscord IDが登録されてないみたい。親に `settings/users/*.json` を追加してもらってね。")
