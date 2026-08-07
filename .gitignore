@@ -2,11 +2,19 @@ __pycache__/
 *.pyc
 /.venv
 .env
+# 実設定（個人情報）はテンプレートだけ共有し、実データは除外する
 /settings/users/*.json
+/settings/users/parents/*.json
 /settings/setting.json
 /settings/system.json
 /data
 !/settings/*.example.json
 !/settings/users/*.example.json
+!/settings/users/parents/*.example.json
+# 設計書・作業ログ・内部ドキュメント（動作に不要・非公開）
+/docs/
+# 自動テスト（動作に不要・非公開）
+/tests/
 /debug
 .claude
+.codex
