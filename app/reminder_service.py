@@ -60,15 +60,29 @@ def _build_proactive_child_nudge_message(user_conf: dict, nudge: dict) -> str:
     prefix = f"{name}さん、" if name else ""
 
     if reason == "challenge_stale":
-        challenge_action = action.rstrip("。") if action else "前に決めたお金の記録"
+        challenge_action = action.rstrip("。") if action else "お金の記録"
+        child_agreed = bool(nudge.get("child_agreed"))
+        # 子が実際に決めた(child_agreed)ときだけ「前に決めた」と断定する。親のWeb操作由来で子が決めて
+        # いないときは「こんなのはどうかな?」と提案形にして『そんなこと決めてない』と感じさせない(codex ux)。
+        if child_agreed:
+            if age is not None and age <= 9:
+                return (
+                    f"{prefix}前に決めた「{challenge_action}」のことだよ。\n"
+                    "できたら「やった」、まだなら「あとで」、ちがったら「ちがう」って返してね。"
+                )
+            return (
+                f"{prefix}前に決めた「{challenge_action}」の確認だよ。\n"
+                "できたら「やった」、まだなら「あとで」、合わなかったら「ちがう」って返してね。"
+            )
+        # 提案形（子は決めていない）
         if age is not None and age <= 9:
             return (
-                f"{prefix}前に決めた「{challenge_action}」のことだよ。\n"
-                "できたら「やった」、まだなら「あとで」、ちがったら「ちがう」って返してね。"
+                f"{prefix}「{challenge_action}」、ためしてみるのはどうかな？\n"
+                "やってみたら「やった」、いまはいいなら「ちがう」って返してね。"
             )
         return (
-            f"{prefix}前に決めた「{challenge_action}」の確認だよ。\n"
-            "できたら「やった」、まだなら「あとで」、合わなかったら「ちがう」って返してね。"
+            f"{prefix}「{challenge_action}」、ためしてみるのはどう？\n"
+            "やってみたら「やった」、合わなければ「ちがう」って教えてね。"
         )
 
     if reason == "growth_plan_review":
@@ -661,9 +675,16 @@ class ReminderService:
         last_nudge_at = self._parse_datetime(state.get("last_nudge_at"))
         if last_nudge_at and last_nudge_at <= now - timedelta(days=challenge_days):
             if state.get("last_child_action") and not self._has_recent_child_response(state, now, challenge_days):
+                # child_challenge_events が空でなければ、子が実際にチャレンジへ関わった(やった/あとで/ちがうと
+                # 反応した)証拠。空なら last_child_action は親のWeb操作(会話カード採用)由来で、子は決めていない。
+                # 子が決めてもいないのに「前に決めた」と断定すると『そんなこと決めてない』と信頼を落とすため、
+                # 由来を child_agreed で伝え、文言を「決めた」断定と「ためしてみる?」提案に出し分ける(codex ux)。
+                events = state.get("child_challenge_events")
+                child_agreed = isinstance(events, list) and len(events) > 0
                 return {
                     "reason": "challenge_stale",
                     "action": str(state.get("last_child_action") or ""),
+                    "child_agreed": child_agreed,
                 }
 
         plan = self._active_growth_plan_due(
