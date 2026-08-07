@@ -11,6 +11,10 @@ __pycache__/
 !/settings/*.example.json
 !/settings/users/*.example.json
 !/settings/users/parents/*.example.json
+# Claude Code / codex がルートで自動参照する規約ファイル（sudoパス等を含むため非公開）
+# ルートに置いたまま Git だけ除外する（docs/ へ移すと Claude Code が読めなくなる）
+/CLAUDE.md
+/AGENTS.md
 # 設計書・作業ログ・内部ドキュメント（動作に不要・非公開）
 /docs/
 # 自動テスト（動作に不要・非公開）
