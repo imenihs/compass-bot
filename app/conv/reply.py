@@ -117,64 +117,6 @@ def record_incoming(
     _rotate_conversation(path)
 
 
-def read_history_for_prompt(user_name: str, limit: int = 10) -> list[dict]:
-    """会話ログ（{role,text} 行）を build_chat_prompt が食う {user,assistant} ペアへ畳む。
-
-    書き手（record_incoming / send_reply）は 1発話1行の {"role":"child|bot","text":...} 形で
-    {name}_conversation.jsonl へ書く。一方 build_chat_prompt と _recent_conversation_history は
-    1ターン=ペアの {"ts","user","assistant"} 形を読む。この非対称を吸収し、生行を渡すと履歴が
-    丸ごと空になる罠（child/bot が user/assistant に対応付かず全 None）を塞ぐ唯一の変換口とする。
-
-    child 行を user、その直後の bot 行を同じターンの assistant に対応付ける。bot 行の無い child
-    （未応答・記録漏れ）は assistant 空のペアにする。先頭に bot だけが来る場合は user 空のペアにせず捨てる。
-
-    Args:
-        user_name: 対象児童名。
-        limit: プロンプトへ渡す直近ターン数の上限。多すぎる履歴でプロンプトを膨らませない。
-
-    Returns:
-        list[dict]: `{"ts","user","assistant"}` の古い→新しい順リスト。読めなければ空リスト。
-    """
-    path = _conversation_path(user_name)
-    # 会話ログが無い初回は空履歴。差し込むものが無い
-    if not path.exists():
-        return []
-    rows: list[dict] = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    # 壊れた1行は飛ばす。会話全体を落とさない
-                    continue
-                if isinstance(rec, dict):
-                    rows.append(rec)
-    except Exception:
-        # ログが読めない場合は履歴なしで続行する。文脈が無いだけで応答は返せる
-        return []
-
-    # {role,text} 行を {ts,user,assistant} ペアへ畳む。child→user、直後の bot→assistant
-    pairs: list[dict] = []
-    for rec in rows:
-        role = str(rec.get("role") or "")
-        text = str(rec.get("text") or "").strip()
-        if not text:
-            continue
-        if role == ROLE_CHILD:
-            # 子の発話は新しいターンの user。直前ターンが未完でも新規ターンを開く
-            pairs.append({"ts": rec.get("ts"), "user": text, "assistant": ""})
-        elif role == ROLE_BOT:
-            # ボット応答は直前ターンの assistant。対応する user が無い先頭 bot は捨てる
-            if pairs and not pairs[-1]["assistant"]:
-                pairs[-1]["assistant"] = text
-    # 直近 limit ターンだけ渡す。古すぎる文脈でプロンプトを膨らませない
-    return pairs[-limit:] if limit and limit > 0 else pairs
-
-
 async def send_reply(
     channel: Any,
     content: str,

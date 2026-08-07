@@ -70,7 +70,6 @@ from app.message_parser import (
     parse_usage_report_flexible,
     parse_proxy_request,
 )
-from app.prompts import build_chat_prompt, build_prompt
 from app.reflection_context import build_reflection_context
 try:
     from app.learning_insights import build_learning_insights
