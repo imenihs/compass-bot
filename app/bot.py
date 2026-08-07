@@ -553,6 +553,22 @@ async def _on_message_impl(message: discord.Message):
     content = (message.content or "").strip()
     bot_mention_input = extract_input_from_mention(content, client.user)
     if bot_mention_input is None and contains_any_mention(content):
+        # @メンション不応答バグの原因特定用。bot 宛てと認識できず無視する直前に、実機の生 content と
+        # client.user.id、Discord が解決したメンション集合を残す。<@bot_id> 形式か・ID が一致するかを見る。
+        try:
+            # system_conf はこの時点で未定義のため None を渡す（_log_runtime_event 内で load_system にフォールバック）
+            _log_runtime_event(
+                None, message, None, content,
+                "mention_not_recognized_as_bot",
+                {
+                    "raw_content": content[:200],
+                    "bot_user_id": getattr(getattr(client, "user", None), "id", None),
+                    "mentioned_ids": [getattr(u, "id", None) for u in getattr(message, "mentions", [])],
+                    "channel_id": getattr(getattr(message, "channel", None), "id", None),
+                },
+            )
+        except Exception:
+            pass
         return
 
     # 「使い方の説明と初期設定」は全チャンネルへの一斉通知のため最優先で処理する
