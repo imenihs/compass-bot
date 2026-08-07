@@ -534,30 +534,37 @@ class ReminderService:
         self._save_reminder_state(state)
 
     def _has_recent_journal_entry(self, user_name: str, log_dir: Path, days: int = 7) -> bool:
-        """過去N日間に支出記録（pocket_journal）があるかチェックする。
-        記録が1件でもあれば True を返し、リマインドは送信しない。"""
-        path = log_dir / f"{user_name}_pocket_journal.jsonl"
-        rows = self._load_jsonl(path)
-        # 基準日時（now - days）より新しいエントリがあれば記録済みとみなす
+        """過去N日間に「お金の活動」があるかチェックする。1件でもあれば True でリマインド抑制。
+
+        pocket_journal だけでなく wallet_ledger の支出/入金も含めて判定する（AI主導会話の記録は
+        wallet_ledger に書かれ pocket_journal は空のことがあるため。codex 指摘の不整合を防ぐ）。
+        判定は _latest_journal_entry_at（両ログの新しい方）を cutoff と比べる形に統一する。
+        """
+        latest = self._latest_journal_entry_at(user_name, log_dir)
+        if latest is None:
+            return False
         cutoff = datetime.now(JST) - timedelta(days=days)
-        for r in rows:
-            ts_str = r.get("ts")
-            if not ts_str:
-                continue
-            try:
-                dt = datetime.fromisoformat(str(ts_str))
-                if dt >= cutoff:
-                    return True
-            except Exception:
-                continue
-        return False
+        return latest >= cutoff
 
     def _latest_journal_entry_at(self, user_name: str, log_dir: Path) -> datetime | None:
-        """最後の支出記録日時を返す。記録がなければ None を返す。"""
-        path = log_dir / f"{user_name}_pocket_journal.jsonl"
-        rows = self._load_jsonl(path)
+        """最後の「お金の活動」日時を返す。記録がなければ None を返す。
+
+        pocket_journal.jsonl（支出感想ログ）だけでなく、wallet_ledger.jsonl の支出/入金
+        （spending_record / manual_income）も見て新しい方を返す。AI 主導会話では record_expense/
+        record_income が wallet_ledger にだけ書き pocket_journal は空のことがあり、pocket_journal だけを
+        見ると「449円のおかし買った」とAIに記録したのに後日『記録があいてるみたい』と誤通知される
+        （codex 指摘。子には「ちゃんと言ったのに信じてもらえてない」と映る）。両方の新しい方で判定する。
+        """
         latest: datetime | None = None
-        for row in rows:
+        # pocket_journal（支出感想）
+        for row in self._load_jsonl(log_dir / f"{user_name}_pocket_journal.jsonl"):
+            dt = self._parse_datetime(row.get("ts"))
+            if dt is not None and (latest is None or dt > latest):
+                latest = dt
+        # wallet_ledger の支出/入金（AI主導会話の record_expense/record_income はここに書く）
+        for row in self._load_jsonl(log_dir / f"{user_name}_wallet_ledger.jsonl"):
+            if str(row.get("action")) not in ("spending_record", "manual_income"):
+                continue
             dt = self._parse_datetime(row.get("ts"))
             if dt is not None and (latest is None or dt > latest):
                 latest = dt
