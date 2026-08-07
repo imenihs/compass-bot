@@ -441,11 +441,11 @@ def _do_record_expense(args: dict) -> str:
         return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
     amount = _parse_amount(args.get("amount"))
     if amount is None:
-        return f"金額が正しくないよ（1〜{MAX_AMOUNT}円の正の数で教えてね）。"
+        return f"きんがくがうまく読めなかったよ。1円から{MAX_AMOUNT}円までの数字で教えてね。"
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
         # 冪等キーが無ければ二重適用を防げないため実行しない
-        return "内部エラー: 操作キーが無いため支出を記録できなかったよ。"
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     name = str(conf.get("name", ""))
     item = str(args.get("item") or "").strip()
     # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
@@ -486,14 +486,14 @@ def _do_record_income(args: dict) -> str:
         return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
     amount = _parse_amount(args.get("amount"))
     if amount is None:
-        return f"金額が正しくないよ（1〜{MAX_AMOUNT}円の正の数で教えてね）。"
+        return f"きんがくがうまく読めなかったよ。1円から{MAX_AMOUNT}円までの数字で教えてね。"
     name = str(conf.get("name", ""))
     # 冪等短絡は上限チェックより前に置く。既適用キーの再試行で、その入金が台帳の累計に含まれた状態のまま
     # 上限判定が先に走ると「すでに記録済み」に到達する前に偽の上限拒否を返し、子どもに矛盾した文面が出る。
     # grant/approve と順序を揃える。
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
-        return "内部エラー: 操作キーが無いため入金を記録できなかったよ。"
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
     eff_key = _scoped_op_key(name, "manual_income", op_key)
     # 言い直しによる二重適用を弾く内容キー（金額+メモ、時刻なし）。判定は経過秒(DEDUP_WINDOW_SEC)で行う。
@@ -575,7 +575,7 @@ def _do_set_initial_balance(args: dict) -> str:
         return f"金額が正しくないよ（0〜{MAX_AMOUNT}円で教えてね）。"
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
-        return "内部エラー: 操作キーが無いため初期設定できなかったよ。"
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     name = str(conf.get("name", ""))
     # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
     eff_key = _scoped_op_key(name, "initial_setup", op_key)
@@ -771,7 +771,7 @@ def _do_grant_allowance(args: dict) -> str:
         return "査定の理由が必要だよ。何をがんばったか教えてね。"
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
-        return "内部エラー: 操作キーが無いため支給できなかったよ。"
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     name = str(conf.get("name", ""))
     # AI の生キーを子ども・操作種別で名前空間化する（クロス児童・クロス操作の冪等衝突を構造的に防ぐ）
     eff_key = _scoped_op_key(name, "allowance_grant", op_key)
@@ -1115,7 +1115,7 @@ def _do_parent_grant(args: dict) -> str:
         return f"金額が正しくないよ（1〜{MAX_AMOUNT}円で、はっきりした金額を教えてね）。"
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
-        return "内部エラー: 操作キーが無いため支給できなかったよ。"
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     name = str(conf.get("name", ""))
     eff_key = _scoped_op_key(name, "allowance_manual_grant", op_key)
     if _wallet.is_operation_applied(eff_key):
@@ -1147,7 +1147,7 @@ def _do_parent_adjust_balance(args: dict) -> str:
         return f"一度に調整できるのは {MAX_AMOUNT}円までだよ。"
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
-        return "内部エラー: 操作キーが無いため調整できなかったよ。"
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     name = str(conf.get("name", ""))
     eff_key = _scoped_op_key(name, "balance_adjustment", op_key)
     if _wallet.is_operation_applied(eff_key):
@@ -1171,7 +1171,7 @@ def _do_parent_approve_assessment(args: dict) -> str:
         return f"「{args.get('name')}」という子どもは見つからなかったよ。"
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
-        return "内部エラー: 操作キーが無いため承認できなかったよ。"
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     # 既存の親承認ロジック（4層ガード再適用・flock・冪等）をそのまま使う
     return approve_proposal(str(conf.get("name", "")), op_key)
 
