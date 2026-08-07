@@ -398,6 +398,16 @@ def _parse_output(stdout_text: str) -> tuple[bool, str, str | None]:
     return True, result, session_id
 
 
+class _ProcessNeverStarted(Exception):
+    """claude プロセスの起動(create_subprocess_exec)自体に失敗したことを表す専用例外。
+
+    この例外に限り「tool は1つも実行されていない」と確証できるため、呼び出し側は再入力を促してよい。
+    プロセスが立った後の通信例外・タイムアウトは tool 実行済みの可能性があるため、この例外にはしない
+    （その場合は二重課金を避けるため再入力を促さない）。codex 指摘: 起動と通信を1関数で扱い全例外を
+    「tool未実行」と誤分類すると、communicate 後の例外や resume 再試行のタイムアウトで二重課金する。
+    """
+
+
 async def _spawn_claude(prompt: str, session_id: str | None, system_prompt: str, child_name: str):
     """claude CLI を subprocess 起動して (returncode, stdout, stderr) を返す。失敗時は例外。
 
@@ -447,14 +457,21 @@ async def _spawn_claude(prompt: str, session_id: str | None, system_prompt: str,
     # 一度でも混入すると、全子会話が継承して親承認飛ばし支給・残高上書きが可能になる。ここで明示 pop し、
     # 「設定しない」を「継承しても無効」にして Python 境界の最後の砦を証明不能な前提から切り離す。
     child_env.pop("COMPASS_ALLOW_ADMIN_OPS", None)
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdin=asyncio.subprocess.DEVNULL,   # stdin を閉じて3秒待ちを避ける
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=child_env,
-        start_new_session=True,             # 新プロセスグループ。タイムアウト時にグループごと落とす
-    )
+    # 起動フェーズ: ここで失敗したらプロセスは立っておらず tool は絶対に実行されていない。
+    # 専用例外 _ProcessNeverStarted に変換し、呼び出し側が「再入力を促してよい」と確証できるようにする。
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,   # stdin を閉じて3秒待ちを避ける
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=child_env,
+            start_new_session=True,             # 新プロセスグループ。タイムアウト時にグループごと落とす
+        )
+    except Exception as start_error:
+        raise _ProcessNeverStarted(str(start_error)) from start_error
+    # ここから先(通信フェーズ)の例外・タイムアウトは、プロセスが立っており tool が実行済みの可能性が
+    # あるため _ProcessNeverStarted にしない。TimeoutError はそのまま伝播、その他の通信例外も伝播する。
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLI_TIMEOUT_SEC)
     except asyncio.TimeoutError:
@@ -503,16 +520,21 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
     stderr = ""
     try:
         returncode, stdout, stderr = await _spawn_claude(prompt, session_id, system_prompt, child_name)
+    except _ProcessNeverStarted as e:
+        # プロセス起動自体の失敗。tool は絶対に走っていないので再入力を促してよい
+        spawn_failed = True
+        returncode, stdout = 1, ""
+        _diag("ai_conversation_spawn_error", {"child": child_name, "error": f"{type(e).__name__}: {e}"})
     except asyncio.TimeoutError:
         # タイムアウトは tool 実行後かもしれない。再試行せず終端扱いにする（二重課金防止）
         timed_out = True
         returncode, stdout = 1, ""
         _diag("ai_conversation_timeout", {"child": child_name, "had_session": bool(session_id)})
     except Exception as e:
-        # 起動例外は tool 実行前。プロセスが立っていないので再入力を促してよい
-        spawn_failed = True
+        # プロセスは立った後の通信例外。tool 実行済みの可能性があるため tool_never_ran にしない
+        # (spawn_failed=False のまま)。再入力を促さず、残高確認を促す安全側へ倒す。
         returncode, stdout = 1, ""
-        _diag("ai_conversation_spawn_error", {"child": child_name, "error": f"{type(e).__name__}: {e}"})
+        _diag("ai_conversation_comm_error", {"child": child_name, "error": f"{type(e).__name__}: {e}"})
 
     ok, result, new_sid = _parse_output(stdout)
     # 正常な JSON 応答(is_error 偽・result 有)なら returncode に関わらず成功として扱う。
@@ -530,10 +552,19 @@ async def _run_claude(prompt: str, session_id: str | None, system_prompt: str, c
         _diag("ai_conversation_resume_failed", {"child": child_name, "dead_session": session_id})
         try:
             returncode2, stdout2, stderr2 = await _spawn_claude(prompt, None, system_prompt, child_name)
-        except Exception as e:
-            # 新規再試行の起動失敗も tool 実行前。プロセスが立たず tool は走っていない
+        except _ProcessNeverStarted as e:
+            # 新規再試行の起動失敗も tool 実行前。プロセスが立たず tool は走っていないので再入力を促してよい
             _diag("ai_conversation_spawn_error", {"child": child_name, "error": f"{type(e).__name__}: {e}", "retry": True})
             return False, "", None, False, True
+        except asyncio.TimeoutError:
+            # 新規再試行のタイムアウトは tool 実行後の可能性がある。tool_never_ran=False で再入力を促さない
+            # (codex 指摘: ここを一律 tool_never_ran=True にすると再試行タイムアウトで二重課金する)
+            _diag("ai_conversation_timeout", {"child": child_name, "retry": True})
+            return False, "", session_id, True, False
+        except Exception as e:
+            # 新規再試行の通信例外も tool 実行済みの可能性。tool_never_ran=False
+            _diag("ai_conversation_comm_error", {"child": child_name, "error": f"{type(e).__name__}: {e}", "retry": True})
+            return False, "", session_id, False, False
         ok2, result2, new_sid2 = _parse_output(stdout2)
         # 再試行も returncode でなく ok（正常な JSON 応答）で判定する
         if ok2:
