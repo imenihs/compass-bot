@@ -403,6 +403,13 @@ _NUDGE_REPLY_WORDS = (
 )
 
 
+# チャレンジを「合わない・やめたい」と断る返事語。これが来たらそのチャレンジは終了扱いにし、
+# 数日後に蒸し返さない（codex ux: 「ちがう」と返したチャレンジをまた聞かれる問題）。
+_NUDGE_DECLINE_WORDS = (
+    "ちがう", "ちがった", "むり", "やらない", "やりたくない", "いや", "しない", "やめる", "やめたい",
+)
+
+
 def _looks_like_nudge_reply(input_text: str) -> bool:
     """今回の発話が、直前の能動ナッジ（チャレンジ）への返事とみなせるか。
 
@@ -415,6 +422,21 @@ def _looks_like_nudge_reply(input_text: str) -> bool:
     if any(w in text for w in _NUDGE_REPLY_WORDS):
         return True
     return _is_money_topic(text)
+
+
+def _looks_like_decline(input_text: str) -> bool:
+    """今回の返事が「そのチャレンジは合わない・やめたい」と断る内容か。
+
+    これが True の返事でチャレンジに応じたときは、そのチャレンジを終了扱い（feedback=declined）にして
+    数日後の蒸し返しを止める。肯定語（やった/できた）が同時にあれば断りとみなさない（前向きを優先）。
+    """
+    text = (input_text or "").strip()
+    if not text:
+        return False
+    # 前向きな完了語があれば断りにしない
+    if any(w in text for w in ("やった", "できた", "やってみた", "おわった", "終わった")):
+        return False
+    return any(w in text for w in _NUDGE_DECLINE_WORDS)
 
 
 async def _build_nudge_bridge_block_async(user_conf: dict, input_text: str) -> str:
@@ -438,10 +460,12 @@ async def _build_nudge_bridge_block_async(user_conf: dict, input_text: str) -> s
         str: system prompt へ足す橋渡し指示。無ければ空文字。
     """
     is_reply = _looks_like_nudge_reply(input_text)
+    # 「ちがう/やめたい」等の断りなら declined として記録し、そのチャレンジを終了扱いにする(蒸し返し防止)
+    declined = is_reply and _looks_like_decline(input_text)
     try:
         # 状態ファイル I/O をスレッドへ逃がしイベントループを止めない。返事とみなせるときだけ
-        # child_response を書かせる（record_response=is_reply）。
-        bridge_text = await asyncio.to_thread(deps.take_pending_nudge_bridge, user_conf, is_reply)
+        # child_response を書かせる（record_response=is_reply）。declined なら feedback を declined に。
+        bridge_text = await asyncio.to_thread(deps.take_pending_nudge_bridge, user_conf, is_reply, declined)
     except Exception:
         # 橋渡し取得の失敗で会話を止めない
         return ""

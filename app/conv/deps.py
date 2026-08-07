@@ -436,7 +436,7 @@ def save_pending_nudge_bridge(
         pass
 
 
-def take_pending_nudge_bridge(user_conf: dict, record_response: bool = True) -> str:
+def take_pending_nudge_bridge(user_conf: dict, record_response: bool = True, declined: bool = False) -> str:
     """未消費の能動ナッジ橋渡し本文を返し、同時にクリアする（1回だけ注入するため）。
 
     会話ターンの system prompt 構築時に呼ぶ。存在すれば本文を返しクリアし、無ければ空文字。
@@ -515,9 +515,11 @@ def take_pending_nudge_bridge(user_conf: dict, record_response: bool = True) -> 
                 # 照合キーは当時のナッジ対象を優先し、無ければ現在の last_child_action にフォールバック
                 challenge_id = bridge_action or str(state.get("last_child_action") or "")
                 storage_mod = importlib.import_module("app.storage")
+                # declined(「ちがう/やめたい」)なら feedback=declined にし、reminder 側でそのチャレンジを
+                # 終了扱いにして蒸し返さない。それ以外は conversation_reply。
                 state["child_response"] = {
                     "challenge_id": challenge_id,
-                    "feedback": "conversation_reply",
+                    "feedback": "declined" if declined else "conversation_reply",
                     "responded_at": storage_mod.now_jst_iso(),
                 }
             tmp = path.with_suffix(".json.tmp")

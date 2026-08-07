@@ -650,14 +650,20 @@ class ReminderService:
         response = state.get("child_response")
         if not isinstance(response, dict):
             return False
+        response_cid = str(response.get("challenge_id") or "").strip()
+        current_action = str(state.get("last_child_action") or "").strip()
+        # declined(「ちがう/やめたい」と断った)チャレンジは終了扱い。同じ challenge_id なら期間に関係なく
+        # 抑制し、数日後に蒸し返さない(codex ux: 「ちがう」と返したのにまた聞かれる問題)。
+        if str(response.get("feedback")) == "declined":
+            if response_cid:
+                return response_cid == current_action
+            return True
         responded_at = self._parse_datetime(response.get("responded_at"))
         if responded_at is None:
             return False
         if responded_at < now - timedelta(days=days):
             return False
         # challenge_id を現在の対象アクション(last_child_action)と照合する。両方空でない一致のみ有効。
-        response_cid = str(response.get("challenge_id") or "").strip()
-        current_action = str(state.get("last_child_action") or "").strip()
         # challenge_id が記録されている場合は一致必須。空(旧データ)なら後方互換で時刻のみ判定に倒す。
         if response_cid:
             return response_cid == current_action
