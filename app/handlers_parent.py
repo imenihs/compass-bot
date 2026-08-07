@@ -18,6 +18,7 @@ from app.bot_utils import (
 )
 from app.config import (
     find_user_by_name,
+    find_child_user_by_name,
     get_allow_channel_ids,
     get_parent_ids,
     load_all_users,
@@ -443,18 +444,20 @@ async def maybe_handle_manual_grant(message: discord.Message, content: str) -> b
     # 親以外は無視する
     if not _is_parent(message.author.id):
         return False
-    # 先頭に「支給」を含む形式にマッチさせる（ユーザー名と金額が必須）
-    m = re.search(r"支給\s+(\S+)\s+(\d[\d,]*)\s*円", (content or "").strip())
+    # コマンド全体が厳密にこの形式のときだけ発火させる（re.fullmatch）。re.search（部分一致）だと
+    # 「昨日 支給 はな 300円 ってやった?」のような引用・疑問・説明の文中コマンドにマッチし、親の自然文で
+    # 実残高が動く越境になる（codex 指摘の blocker）。前後に余計な文字が無い明示コマンドだけを実行する。
+    m = re.fullmatch(r"支給\s+(\S+)\s+(\d[\d,]*)\s*円", (content or "").strip())
     if not m:
         return False
 
     target_name = m.group(1)
     amount = int(m.group(2).replace(",", ""))
 
-    # 対象ユーザーを名前で検索する
-    target_conf = find_user_by_name(target_name)
+    # 対象は子ども限定で検索する（find_user_by_name だと親名でも解決し、親の残高を動かす経路になりうる）
+    target_conf = find_child_user_by_name(target_name)
     if target_conf is None:
-        await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
+        await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
         return True
 
     system_conf = load_system()
@@ -487,8 +490,9 @@ async def maybe_handle_balance_adjustment(message: discord.Message, content: str
     # 親以外は無視する
     if not _is_parent(message.author.id):
         return False
-    # 「残高調整」＋ユーザー名＋符号あり/なし金額の形式にマッチさせる
-    m = re.search(r"残高調整\s+(\S+)\s+([+-]?\d[\d,]*)\s*円", (content or "").strip())
+    # コマンド全体が厳密にこの形式のときだけ発火（re.fullmatch）。re.search だと「残高調整 たろう -500円
+    # ってどういう意味?」の文中コマンドにマッチし親の自然文で実残高が動く（codex 指摘の blocker）。
+    m = re.fullmatch(r"残高調整\s+(\S+)\s+([+-]?\d[\d,]*)\s*円", (content or "").strip())
     if not m:
         return False
 
@@ -496,9 +500,10 @@ async def maybe_handle_balance_adjustment(message: discord.Message, content: str
     # 符号なしの場合は加算（正）として扱う
     delta = int(m.group(2).replace(",", ""))
 
-    target_conf = find_user_by_name(target_name)
+    # 対象は子ども限定（親名で親残高を動かす経路を塞ぐ）
+    target_conf = find_child_user_by_name(target_name)
     if target_conf is None:
-        await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
+        await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
         return True
 
     system_conf = load_system()
@@ -531,8 +536,9 @@ async def maybe_handle_user_setting_change(message: discord.Message, content: st
     # 親以外は無視する
     if not _is_parent(message.author.id):
         return False
-    # 「設定変更 ユーザー名 固定/臨時 金額円」の形式にマッチさせる
-    m = re.search(r"設定変更\s+(\S+)\s+(固定|臨時)\s+(\d[\d,]*)\s*円", (content or "").strip())
+    # コマンド全体が厳密にこの形式のときだけ発火（re.fullmatch）。re.search だと文中コマンドにマッチし
+    # 親の自然文で設定（上限）が変わる。実残高は動かないが親統制の一貫性のため厳密一致に揃える。
+    m = re.fullmatch(r"設定変更\s+(\S+)\s+(固定|臨時)\s+(\d[\d,]*)\s*円", (content or "").strip())
     if not m:
         return False
 
@@ -540,10 +546,10 @@ async def maybe_handle_user_setting_change(message: discord.Message, content: st
     setting_type = m.group(2)  # "固定" または "臨時"
     amount = int(m.group(3).replace(",", ""))
 
-    # 対象ユーザーを名前で検索する
-    target_conf = find_user_by_name(target_name)
+    # 対象は子ども限定で検索する
+    target_conf = find_child_user_by_name(target_name)
     if target_conf is None:
-        await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
+        await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
         return True
 
     # 変更対象フィールドと表示ラベルを決定する
