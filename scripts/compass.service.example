@@ -1,0 +1,25 @@
+# Compass Bot systemd unit サンプル。
+# /etc/systemd/system/compass.service にコピーし、User / WorkingDirectory / パスを
+# 自分の環境へ書き換えてから使う。
+#   sudo cp scripts/compass.service.example /etc/systemd/system/compass.service
+#   sudo nano /etc/systemd/system/compass.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now compass.service
+
+[Unit]
+Description=Compass Discord Bot
+After=network.target
+
+[Service]
+# Bot を実行する OS ユーザー（claude CLI にログイン済みのユーザーにする）
+User=your-user
+# リポジトリを clone した場所の絶対パス
+WorkingDirectory=/path/to/compass-bot
+# .env（DISCORD_BOT_TOKEN 等）を読み込む
+EnvironmentFile=/path/to/compass-bot/.env
+# venv の python でモジュールとして起動する
+ExecStart=/path/to/compass-bot/.venv/bin/python -m app.bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -29,7 +29,7 @@ Compass Bot は、子どもが自分のお小遣いを自主的に管理し、�
 - 親が子ども別のAIフォロー方針、会話カード反応、成長行動プランを管理できる
 - 毎月リマインド（支給前通知）と残高監査を行う
 - 親向けダッシュボード・低残高アラート・月次サマリー・傾向分析・目標貯金に対応
-- ブラウザから閲覧できる Webダッシュボード（`example.com`）を搭載
+- ブラウザから閲覧できる Webダッシュボード（`compass.example.com`）を搭載
 
 ## 主な機能
 
@@ -74,7 +74,7 @@ Compass Bot は、子どもが自分のお小遣いを自主的に管理し、�
 - 「目標削除」で目標をリセット
 
 10. Webダッシュボード（ブラウザ閲覧）
-- `example.com` からログインして残高・支出・目標貯金を確認できる
+- `compass.example.com` からログインして残高・支出・目標貯金を確認できる
 - **親・子供の両方**が利用可能（表示内容はユーザー種別で自動切替）
 - 親: 全員の残高・月額お小遣い・支出・報告状況・今週の会話カードを一覧管理、一覧の並び順保存、一覧の設定ボタンからモーダルで子ども/親の設定項目を編集、支給・残高調整・AIフォロー方針・成長行動プラン・承認待ち申請を操作
 - 子供: 自分の残高・支出記録・貯金目標の進捗・次の小さなチャレンジを閲覧し、`やった` / `あとで` / `ちがう` を残せる
@@ -102,7 +102,7 @@ Compass Bot は、子どもが自分のお小遣いを自主的に管理し、�
 
 13. 異常処理・運用診断
 - Discordメッセージ処理は、想定外エラー時も内部原因を出さず短い失敗応答を返し、待てばよい一時障害か管理者確認が必要な異常かをユーザーが判断できる文面にする
-- Geminiのtimeout/429/503系は再試行案内にし、認証・設定・未捕捉例外系は管理者連絡案内にする。詳細は `runtime_diagnostics.jsonl` にだけ残す
+- claude CLI の起動失敗・タイムアウトは、お金の話題なら残高確認へ、それ以外なら「もう一度話しかけてね」へ安全に倒し、内部エラーを子どもに見せない。詳細は `runtime_diagnostics.jsonl` にだけ残す
 - Web/APIの未捕捉例外は共通ハンドラで500応答にし、内部原因はレスポンスに出さず、管理者連絡案内と診断ログを残す
 - 設定JSON・認証JSON・ウォレット状態の読み書きは、破損や保存途中失敗を想定して診断ログ・原子的保存・fail-closedを使う
 - 固定お小遣い自動支給は操作キーで二重実行を防ぐ
@@ -117,11 +117,10 @@ Compass Bot は、子どもが自分のお小遣いを自主的に管理し、�
 - `app/handlers_parent.py`: 親専用コマンドハンドラ群（支給・残高調整・ダッシュボード・査定承認等）
 - `app/handlers_child.py`: 子供向けコマンドハンドラ群（一部は AI 主導層へ移行済み）
 - `app/bot_utils.py`: グローバル状態不使用の純粋ユーティリティ関数群
-- `app/gemini_service.py`: 旧 Gemini API 呼び出し（N-11 で会話の主役は claude CLI へ移行。一部の補助処理でのみ使用）
+- `app/conv/deps.py`: 会話層の依存解決（学習インサイト・コーチング状態など）
 - `app/message_parser.py`: メッセージ解析（メンション除去・入力パース）
-- `app/reminder_service.py`: 月次リマインド・残高監査・月次サマリーの定期処理ループ
+- `app/reminder_service.py`: 月次リマインド・残高監査・月次サマリー・能動ナッジの定期処理ループ
 - `app/wallet_service.py`: 残高管理・台帳・監査状態・目標貯金（wallet_state.json）
-- `app/prompts.py`: プロンプトのビルド関数
 - `app/learning_insights.py`: 支出ログから親子会話カード、チャレンジ、プロンプト要点を生成する分析エンジン
 - `app/config.py`: 設定ファイル読み込み（users / setting / system）
 - `app/storage.py`: JSONL 追記・JST タイムスタンプなど共通I/Oユーティリティ
@@ -137,58 +136,174 @@ Compass Bot は、子どもが自分のお小遣いを自主的に管理し、�
 ## 必要環境
 
 - Python 3.11+
-- Discord Bot Token
-- Gemini API Key
+- Discord Bot Token（Discord Developer Portal で作成）
+- **claude CLI**（会話の主役。ローカルにインストールし、ログイン済みであること）
+
+会話は claude CLI が主導します。金額を動かす処理だけを Python の MCP wallet tool（`app/mcp_wallet.py`）が担当します。外部の生成AI APIキー（Gemini 等）は不要です。
 
 依存関係（`requirements.txt`）:
 - `discord.py`
-- `google-genai`
-- `fastapi`
-- `uvicorn`
+- `fastapi` / `uvicorn`（Webダッシュボード）
 - `python-dotenv`
 - `httpx`
-- `jinja2`（Webダッシュボード用テンプレートエンジン）
+- `jinja2`（テンプレートエンジン）
 - `python-multipart`（フォーム送信の受け取り）
 
 ## セットアップ
 
-1. 依存インストール
+### 0. claude CLI を用意する
+
+会話処理には claude CLI が必要です。インストールしてログインし、コマンドラインから会話できる状態にします。
+
 ```bash
+# claude CLI をインストール（公式の手順に従う）
+which claude          # 例: /usr/local/bin/claude にあることを確認
+claude --version      # 動作確認
+```
+
+Bot は既定で `/usr/local/bin/claude` を使います。別の場所にある場合は `.env` の `COMPASS_CLAUDE_BIN` で指定します。systemd 配下では PATH が最小限になりがちなので、絶対パス指定を推奨します。
+
+### 1. 依存インストール
+
+```bash
+git clone <このリポジトリ>
+cd compass-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. 環境変数設定（`.env`）
+### 2. 環境変数設定（`.env`）
+
+`.env.example` をコピーして値を入れます。
+
+```bash
+cp .env.example .env
+```
 ```env
 DISCORD_BOT_TOKEN=xxxxxxxx
-GEMINI_API_KEY=xxxxxxxx
+# COMPASS_CLAUDE_BIN=/usr/local/bin/claude   # claude CLI が別の場所にあるときだけ設定
 ```
 
-3. 設定ファイル確認
-- `settings/setting.json`
-- `settings/users/*.json`
+Discord Bot Token は [Discord Developer Portal](https://discord.com/developers/applications) で Bot を作成し、`MESSAGE CONTENT INTENT` を有効にして取得します。作成した Bot を対象サーバーへ招待してください。
 
-初回はテンプレートからコピーして作成:
+### 3. MCP wallet 設定（`config/wallet_mcp.json`）
+
+claude CLI が財布操作ツールを呼べるよう、MCP サーバのパスを実環境へ合わせます。**リポジトリのパス（`cwd`）と venv の python パスを自分の環境に書き換えてください**。
+
+```json
+{
+  "mcpServers": {
+    "wallet": {
+      "command": "/path/to/compass-bot/.venv/bin/python",
+      "args": ["-m", "app.mcp_wallet"],
+      "cwd": "/path/to/compass-bot"
+    }
+  }
+}
+```
+
+### 4. 設定ファイルを作る
+
+テンプレート（`*.example.json`）をコピーして実設定を作ります。実設定は個人情報を含むため `.gitignore` 済みで、リポジトリには入りません。
+
 ```bash
 cp settings/setting.example.json settings/setting.json
-cp settings/users/user.example.json settings/users/<your_user_key>.json
+# 子どもユーザーを追加（下記「ユーザーの追加」を参照）
+cp settings/users/user.example.json settings/users/<子どもの名前>.json
+# 親ユーザーを追加
+cp settings/users/parents/parent.example.json settings/users/parents/<親の名前>.json
 ```
+
+その後、[ユーザーの追加](#ユーザーの追加) の手順で中身を編集します。
 
 ## 起動
 
-### Discord Bot
+### 手動起動（開発時）
 ```bash
-python3 app/bot.py
+source .venv/bin/activate
+python3 -m app.bot
+```
+Web ダッシュボードは Bot と同一プロセスで自動起動します（既定 port 8765）。
+
+### systemd で常駐（本番）
+
+`scripts/compass.service.example` をコピーし、パス・ユーザー名を自分の環境へ書き換えて `/etc/systemd/system/compass.service` に置きます。
+
+```bash
+sudo cp scripts/compass.service.example /etc/systemd/system/compass.service
+sudo nano /etc/systemd/system/compass.service   # WorkingDirectory / ExecStart / User を実環境へ
+sudo systemctl daemon-reload
+sudo systemctl enable --now compass.service
+sudo systemctl status compass.service
 ```
 
-### Webダッシュボード
-Discord Botと同一プロセスで自動起動します。
+> **重要**: コード変更を本番へ反映するには、コミットだけでなく `sudo systemctl restart compass.service` が必要です（実行中プロセスは古いコードのまま動き続けます）。
+
+## ユーザーの追加
+
+Compass Bot は「子ども（一般ユーザー）」と「親（管理者）」の2種類のユーザーを扱います。ユーザーごとに JSON ファイルを1つ作ります。
+
+### 子どもを追加する
+
+`settings/users/<名前>.json` を作ります（ファイル名は任意。`name` フィールドが実際のキーになります）。
 
 ```bash
-# Bot を起動すれば Web ダッシュボードも同時に起動する（port 8765）
-sudo systemctl start compass
+cp settings/users/user.example.json settings/users/たろう.json
 ```
+
+```json
+{
+  "name": "たろう",
+  "discord_user_id": 111111111111111111,
+  "age": 12,
+  "gender": "male",
+  "bot_personality": "sibling",
+  "fixed_allowance": 700,
+  "temporary_max": 3000,
+  "fixed_increase_cap": 100,
+  "penalty_cap": 100,
+  "keywords": {
+    "investment": ["検定", "英語", "参考書"],
+    "fun": ["漫画", "ゲーム"],
+    "danger": ["高額ガチャ", "課金"]
+  }
+}
+```
+
+- `name`: 子どもの名前。Discord の会話・残高・ログのキーになる。**他のユーザーと重複させない**。
+- `discord_user_id`: その子の Discord ユーザーID（17〜19桁の数値）。Discord で開発者モードを有効にし、ユーザーを右クリック →「IDをコピー」で取得。
+- `age`: 年齢。会話の言葉づかい（漢字の量・文の長さ）を年齢に合わせる。
+- `gender`: `male` / `female` / `unspecified`。
+- `bot_personality`: 会話の口調。`sibling`（年上のきょうだい・既定）/ `friend` / `teacher` / `parent`。
+- `fixed_allowance`: 毎月の固定お小遣い（円）。
+- `temporary_max`: 1回の臨時査定で提案できる上限（円）。
+- `fixed_increase_cap` / `penalty_cap`: 固定増額の上限 / 記録漏れ時の調整上限（円）。
+- `keywords`: 査定時に用途を判断するための語。投資的/娯楽/危険の3分類。
+
+### 親を追加する
+
+`settings/users/parents/<名前>.json` を作ります。親はシンプルな2フィールドだけです。
+
+```bash
+cp settings/users/parents/parent.example.json settings/users/parents/おとうさん.json
+```
+
+```json
+{
+  "name": "おとうさん",
+  "discord_user_id": 222222222222222222
+}
+```
+
+- `parents/` ディレクトリに置くだけで管理者（親）として扱われます（`setting.json` の `parent_ids` への追加は不要）。
+- 親は支給・残高調整・査定承認・ダッシュボードなどの管理操作ができます。
+
+> **反映に再起動が必要**: 親ユーザー（`is_parent` の判定）は Bot 起動時に一度だけ読み込みます。親を追加・変更・削除したら `sudo systemctl restart compass.service` してください。子どもユーザーは毎回読み直すため再起動は不要です。
+
+### 重要な前提: 親IDと子IDは重複させない
+
+同じ Discord ユーザーIDを親と子の両方に登録しないでください。Bot は Discord ID で本人を判定するため、重複するとルーティングが壊れます（親の発話が弾かれる等）。動作確認用に自分を子として試したい場合は、テスト専用の別ユーザーを用意してください。
 
 ## 設定
 
@@ -235,9 +350,8 @@ sudo systemctl start compass
 Discord ID は桁落ちを避けるため画面では文字列入力として扱い、保存時にサーバー側で整数へ変換します。`name` を変更した場合は、ウォレット状態、監査状態、Webユーザー名、学習支援状態など名前キーのデータを可能な範囲で移行します。
 
 ### `settings/setting.json`
-- `web_base_url`: WebダッシュボードのベースURL（例: `https://example.com`）
+- `web_base_url`: WebダッシュボードのベースURL（例: `https://compass.example.com`）
 - `allow_channel_ids`: Botが反応するチャンネルID配列
-- `gemini_model`: 利用モデル
 - `assess_keyword`: 査定抽出判定キーワード
 - `force_assess_test_keyword`: 動作確認用キーワード
 - `chat`: 会話モード
@@ -489,13 +603,13 @@ web承認 たろう
 
 ## Webダッシュボード
 
-ブラウザから `https://example.com` にアクセスしてお小遣いの状況を確認できます。
+ブラウザから `https://compass.example.com` にアクセスしてお小遣いの状況を確認できます。
 **親・子供の両方が利用可能**です。ログイン後の表示内容はユーザー種別で自動的に切り替わります。
 
 ### 登録フロー（初回のみ）
 
 1. **アクセス申請**
-   - `https://example.com/compass-bot/register` を開く
+   - `https://compass.example.com/compass-bot/register` を開く
    - ユーザー名を入力して申請
      - **親の場合**: `settings/users/*.json` の `name` フィールドと一致するユーザー名を入力
      - **子供の場合**: 同上（`name` フィールドと一致させること）
@@ -506,11 +620,11 @@ web承認 たろう
    - Discord に仮パスワードが通知される
 
 3. **本パスワード設定**
-   - `https://example.com/compass-bot/set_password` を開く
+   - `https://compass.example.com/compass-bot/set_password` を開く
    - 仮パスワードを入力 → 本パスワード（8文字以上）を設定
 
 4. **ログイン**
-   - `https://example.com/compass-bot/login` またはトップページからログイン
+   - `https://compass.example.com/compass-bot/login` またはトップページからログイン
 
 ### 表示内容
 
@@ -536,48 +650,24 @@ web承認 たろう
 - `{name}_allowance_amounts.jsonl`: 査定金額ログ（`fixed`, `temporary`, `total`）
 - `{name}_wallet_ledger.jsonl`: 残高の増減台帳
 - `{name}_pocket_journal.jsonl`: お小遣い帳（支出記録）— `amount` フィールドは任意（省略可）
-- `runtime_diagnostics.jsonl`: 実運用診断ログ（対象ユーザー補正、Gemini分類結果、処理ハンドラ、違和感タグ）
+- `runtime_diagnostics.jsonl`: 実運用診断ログ（対象ユーザー補正、会話処理の分岐、違和感タグ）
+- `conversation_sessions.json`: 子ども/親ごとの claude セッションID（`--resume` 用）
 - `data/wallet_state.json`: 現在の帳簿残高
 - `data/wallet_audit_state.json`: 監査依頼・初期設定/支出記録の待機状態
 - `data/reminder_state.json`: 月次リマインド送信状態
 
-`runtime_diagnostics.jsonl` の主な `issue_tags`:
-- `gemini_low_confidence`: Gemini分類が低信頼で確認質問に入った
-- `money_related_but_intent_none`: お金系の入力なのに雑談扱いになった可能性
-- `reply_asks_clarification`: 返答が追加説明を求めており、会話が噛み合っていない可能性
-- `parent_message_used_author_context`: 親発言を発言者本人の文脈で処理した
-- `parent_message_used_child_channel_context`: 親発言を子どもチャンネル文脈で補正した
+## 環境変数（任意調整）
 
-## 自動テスト
+| 変数 | 既定 | 用途 |
+|---|---|---|
+| `COMPASS_CLAUDE_BIN` | `/usr/local/bin/claude` | claude CLI 実行ファイルのパス |
 
-疑似Discordメッセージを `app.bot.on_message` に投入する統合テストを用意しています。
-
-```bash
-python3 tests/fake_discord_flow_tests.py --markdown テスト実施結果.md
-```
-
-親子ID重複、親の子どもチャンネル文脈、査定履歴、入出金履歴、振り返り、親ダッシュボード/分析、実運用診断ログ、親明示コマンド、金額入力の `円` 必須、pending優先順位、低信頼度確認、親専用情報の非表示を自動判定し、入力・応答・判定理由・追加対応要否を `テスト実施結果.md` に記録します。
-
-実Geminiを呼び出して、Discord操作を再現するE2Eテストも用意しています。実Discordには送信せず、`.env` の `GEMINI_API_KEY` で Gemini を呼び、FakeChannel に返った応答を判定します。
-
-```bash
-.venv/bin/python tests/gemini_discord_replay_tests.py --markdown テスト実施結果.md
-```
-
-残高確認の表記揺れ、親/子の権限境界、入金、支出、財布チェック、初期設定、貯金目標、査定履歴、雑談、査定相談、巨大金額、プロンプト注入を含むケースを検証します。追加質問後の `わからない`、裸数字、曖昧金額、`円/えん/万円`、誤字表記も対象です。
-
-Geminiの待ち時間は環境変数で調整できます。デフォルトではHTTP要求15秒、分類系8秒、通常返答/査定の総待ち40秒で打ち切り、Discordには再送案内を返します。
-
-- `GEMINI_TIMEOUT_MS`
-- `GEMINI_RETRY_ATTEMPTS`
-- `GEMINI_SILENT_TIMEOUT_SEC`
-- `GEMINI_PROGRESS_INTERVAL_SEC`
-- `GEMINI_MAX_WAIT_SEC`
+金額の安全弁（自己申告入金の回数/日次/月次上限、査定の各上限）は環境変数ではなく `settings/setting.json` と各ユーザー設定で管理します。
 
 ## 注意点
 
 - `chat.require_mention=true` の場合はメンション必須です。
 - `chat.require_mention=false` の自然会話モードでも、他ユーザー宛てメンションを含む発言には反応しません。
 - `allow_channel_ids` を設定している場合、対象チャンネル以外では反応しません。
-- Bot文面や査定ルールは `app/prompts.py` で調整できます。
-- 個人情報を含む実設定（`settings/*.json`, `settings/users/*.json`）は `.gitignore` で除外し、テンプレート（`*.example.json`）のみ共有する運用を推奨します。
+- 会話の口調・査定の方針・金融リテラシー教育の姿勢は `app/conv/ai_conversation.py` のシステムプロンプト生成（`_build_system_prompt`）で調整します。
+- 個人情報を含む実設定（`settings/setting.json`, `settings/users/*.json`, `settings/users/parents/*.json`）は `.gitignore` で除外し、テンプレート（`*.example.json`）のみ共有します。
