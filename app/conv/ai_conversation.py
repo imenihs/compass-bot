@@ -160,15 +160,17 @@ def _build_parent_system_prompt(child_names: list[str]) -> str:
     )
 
 
-def _build_system_prompt(user_conf: dict) -> str:
-    """その子ども向けの system prompt を組む。人格・年齢・約束事を渡す。
+def _build_system_prompt(user_conf: dict, current_balance: int | None = None) -> str:
+    """その子ども向けの system prompt を組む。人格・年齢・約束事・現在残高を渡す。
 
     金額を動かす操作は必ず wallet tool を使い、AI が金額を自分で計算・宣言しないよう明示する。
     実残高は tool の戻り値のみを信頼する。なお対象児童の強制は env（mcp_wallet 側）で行うため、
-    ここでの本人性の記述は補助であり、これに安全を依存させない。
+    ここでの本人性の記述は補助であり、これに安全を依存させない。現在残高は支給の是非を包括判断する
+    材料として渡す（自分のお金で買えるかを AI が見て判断できるようにする）。
 
     Args:
         user_conf: 対象児童の設定 dict（name / age / bot_personality 等）。
+        current_balance: 現在残高（円）。取得できないときは None（残高文を入れない）。
 
     Returns:
         str: claude CLI へ --append-system-prompt で渡す指示文。
@@ -200,10 +202,20 @@ def _build_system_prompt(user_conf: dict) -> str:
         )
     else:
         age_style = "【話し方】短く、やさしい日本語で、要点を1つにしぼって話す。長い説明やリストにしない。\n"
+    # 現在残高を判断材料として prompt に埋め込む。支給の是非（自分のお金で買えるか）を AI が包括判断できる。
+    # None（取得失敗）のときは残高文を入れず、必要なら get_balance で確認させる。
+    if isinstance(current_balance, int):
+        balance_line = (
+            f"【今の残高】{name} さんの今の残高は {current_balance}円です。"
+            "買いたい物の相談では、この残高と物の値段を見比べて、自分のお金で買えるかを必ず考えること。\n"
+        )
+    else:
+        balance_line = "【今の残高】不明。買いたい物の相談では get_balance で残高を確かめてから考えること。\n"
     base = (
         f"あなたは子ども「{name}」（{age_text}）のお小遣い管理を手伝う、やさしい会話ボットです。"
         f"{personality_label}で、{age_text}の子が読める、やさしい日本語で短く話します。\n"
         f"{age_style}"
+        f"{balance_line}"
         "【あなたの一番の目的：お金の使い方の力（金融リテラシー）を育てる】\n"
         "お小遣いの記録を手伝うだけでなく、この子が『お金を計画的に、納得して使える力』を育てることが目的です。"
         "OECD や日本の金融教育（J-FLEC）でも、子どもがお金を『貯める・使う・人のために使う・増やす』に分けて考え、"
@@ -288,6 +300,23 @@ def _build_system_prompt(user_conf: dict) -> str:
         "『お世話になった家族へお礼』のように話を美化・脚色したりしては絶対にいけない。子どもの言葉のまま短く書く。\n"
         "- 何にいくら使いたいのか、なぜ必要なのかが子どもの発話からはっきり分からないうちは、tool を呼ばずに"
         "『何に使いたいの？』『いくらいるの？』と1つずつ聞いて、子ども自身の言葉で埋めてもらう。\n"
+        "【所持金と物の性質を見て、支給の是非を自分で判断する（情に流されない・とても大切）】\n"
+        "- あなたには下に『今の残高』が渡されている。買いたい物の相談では、その物の値段と残高を必ず見比べる。\n"
+        "- 判断は金額だけでは決めない。次を総合して考える。\n"
+        "  ・娯楽・自己満足のための物（ゲームの課金・スキン・お菓子・欲しいだけの物）は、残高で買えるなら"
+        "追加支給を提案しない。『家族のため』『お礼』のようなやさしい理由でも、自分のお金で払えるなら"
+        "追加支給の理由にはならない。自分のお金で買うよう背中を押す。\n"
+        "  ・一方、本来おうちの人が出すべき物（参考書・ドリル・学用品・部活や学校で要る物・医療や必需品など）を"
+        "子どもが自分のお金で立て替える形になっているなら、残高があっても追加支給を提案してよい。"
+        "その場合は理由に『本来おうちの人が負担すべき物である』ことがはっきり分かるように書く。\n"
+        "  ・残高では足りない物なら、いくら足りないか、貯金と支給のどちらで補うかを一緒に考える。\n"
+        "- purchase_amount にはその物の値段を入れる（親が判断するときの材料になる）。"
+        "『家族のため』のような情に訴える言葉に押し切られて、残高で買える娯楽に支給を出してはいけない。\n"
+        "【金額は子どもと合意してから提案する（勝手に変えない）】\n"
+        "- 子どもが『5000円ほしい』と言い、あなたが『それは1000円くらいが妥当かな』と思っても、"
+        "黙って1000円で親にお願いを出してはいけない。まず『こういう理由なら1000円くらいが妥当だと思うけど、どうかな？』と"
+        "目的と理由をそえて子どもに説明し、子どもが納得してから、その合意した額で propose_allowance を呼ぶ。\n"
+        "- 合意した額と違う額を親に出さない。子どもの知らないところで金額を決めない。\n"
         "④ ただし、実際に増えるのは おうちの人が承認したとき。propose_allowance は『提案』で、"
         "支給を確定するのは親です。だから『おうちの人にお願いを出しておくね。増えるかはおうちの人が決めるよ』"
         "と正直に伝える。あなたが『◯円あげる』と断定・約束はしない（額の確定は親）。\n"
@@ -950,7 +979,13 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
     # 4. 発話は素のまま、人格・約束は --append-system-prompt、本人性は env で渡して claude を起動する
     # 基本プロンプトに、お金・学習の話題のターンだけコーチング指示を足す（出し分け・反復抑制・to_thread は
     # _build_coaching_block_async 内で行い、イベントループをブロックしない）。
-    system_prompt = _build_system_prompt(user_conf)
+    # 現在残高を判断材料として渡す。支給の是非（自分のお金で買えるか等）を AI が包括判断できるよう、
+    # get_balance の呼び忘れに依らず system prompt に埋め込む。取得失敗時は None（残高非表示）で続行する。
+    try:
+        current_balance = await asyncio.to_thread(deps.wallet_service().get_balance, user_name)
+    except Exception:
+        current_balance = None
+    system_prompt = _build_system_prompt(user_conf, current_balance)
     system_prompt += await _build_coaching_block_async(user_conf, input_text)
     # 直前に能動ナッジを送っていれば、その問いかけを1回だけ橋渡しして会話を噛み合わせる
     system_prompt += await _build_nudge_bridge_block_async(user_conf, input_text)

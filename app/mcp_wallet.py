@@ -315,6 +315,8 @@ def _tool_defs() -> list[dict]:
                 "査定の結果としてお小遣いの支給を『提案』する（残高はまだ動かさない）。おうちの人が承認して"
                 "初めて支給される。fixed（固定の増額）と temporary（臨時支給）を指定する。上限は Python 側で"
                 "強制され、超える分は自動で減る。何でもかんでも増額・追加支給はできない。理由 reason は必須。"
+                "買いたい物がある相談なら purchase_amount（その物の値段）を必ず渡すこと。"
+                "所持金だけでその物が買えるときは、Python 側が提案を拒否する（自分のお金で買えるものに追加支給はしない）。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -322,7 +324,14 @@ def _tool_defs() -> list[dict]:
                     "name": {"type": "string", "description": "子どもの名前"},
                     "fixed": {"type": "integer", "description": "固定の増額（円、0以上）。省略時0。"},
                     "temporary": {"type": "integer", "description": "臨時支給（円、0以上）。省略時0。"},
-                    "reason": {"type": "string", "description": "査定の理由（必須）"},
+                    "reason": {"type": "string", "description": "査定の理由（必須）。子どもが実際に話した内容だけを書く。推測・美化しない。"},
+                    "purchase_amount": {
+                        "type": "integer",
+                        "description": (
+                            "買いたい物がある相談のときの、その物の値段（円）。子どもがはっきり言った額だけを入れる。"
+                            "所持金でその値段を払えるなら提案は拒否される。買い物と無関係の相談なら省略可。"
+                        ),
+                    },
                 },
                 "required": ["name", "reason"],
             },
@@ -886,6 +895,12 @@ def _do_propose_allowance(args: dict) -> str:
     fixed_req = _nonneg(args.get("fixed"))
     temp_req = _nonneg(args.get("temporary"))
 
+    # 支給の適否（娯楽か必需品か、所持金で足りるか、本来親が負担すべきか、金額は妥当か）は、金額の機械比較
+    # では正しく捌けない文脈判断のため Python では一律拒否しない。AI に所持金を含む材料を渡し、AI が包括的に
+    # 判断する（判断基準は system prompt に記載）。Python 境界は「上限」と「本人性」だけを守り、支給の是非は
+    # AI 判断＋親承認の二段で確定する。purchase_amount は残っていれば提案文へ添えて親の判断材料にする。
+    purchase_amount = _nonneg(args.get("purchase_amount"))
+
     now = datetime.now(_JST)
     fixed, temporary, notes, rejected = _apply_guardrails(conf, fixed_req, temp_req, now)
     if rejected:
@@ -908,6 +923,8 @@ def _do_propose_allowance(args: dict) -> str:
             "temporary": temporary,
             "total": grant,
             "reason": reason,
+            # 買いたい物の値段（分かる場合）。親が「所持金で買えるのに追加支給か？」を判断する材料。
+            "purchase_amount": purchase_amount if purchase_amount > 0 else None,
             "created": now.isoformat(),
             "status": "pending",
             # 親へ通知したか。bot 側が未通知の pending を検知して親へ知らせ、通知済みにする。
