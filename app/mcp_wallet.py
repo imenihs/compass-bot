@@ -47,6 +47,12 @@ ACTIVE_CHILD = os.environ.get("COMPASS_ACTIVE_CHILD", "").strip()
 # すり抜けても Python 境界で拒否できる。越境防止(ACTIVE_CHILD)と同じく、安全は CLI フラグでなく Python で守る。
 ALLOW_ADMIN_OPS = os.environ.get("COMPASS_ALLOW_ADMIN_OPS", "").strip() == "1"
 
+# 親モード。親会話の spawn で 1 を設定する。親モードでは ACTIVE_CHILD 束縛でなく、親が対象児を
+# tool 引数で明示する（親は全児童を操作できる保護者のため）。ただし対象児は必ず子ディレクトリに実在する
+# 子に限定し（_resolve_parent_target）、AI が金額・対象を推測せず親が明示した値だけを渡す前提で設計する。
+# 親モードは COMPASS_ALLOW_ADMIN_OPS=1 と併せて設定され、grant/adjust 等の管理操作を許可する。
+PARENT_MODE = os.environ.get("COMPASS_PARENT_MODE", "").strip() == "1"
+
 
 def _send(msg: dict) -> None:
     """JSON-RPC メッセージを1行で標準出力へ書く（stdio トランスポート）。"""
@@ -132,6 +138,24 @@ def _resolve_child(name: str) -> dict | None:
     return conf
 
 
+def _resolve_parent_target(name: str) -> dict | None:
+    """親モードで、親が明示した対象児を引く。子ディレクトリに実在する子のみ（親・未登録は None）。
+
+    親は全児童の保護者なので、子経路の ACTIVE_CHILD 束縛は使わない。代わりに親が tool 引数で明示した
+    name を子ディレクトリだけで解決する。AI に対象を推測させず、親が「たろうに」と明示した値をそのまま
+    渡す前提で、find_child_user_by_name（子ディレクトリのみ）で厳密に引く。親名・未登録名は None を返し、
+    親の残高や存在しない子を操作する経路を塞ぐ。PARENT_MODE 前提で呼ぶ。
+
+    Args:
+        name: 親が明示した対象児名。
+
+    Returns:
+        dict | None: 対象児の設定。子に実在しなければ None。
+    """
+    conf = config.find_child_user_by_name((name or "").strip())
+    return conf if isinstance(conf, dict) else None
+
+
 def _scoped_op_key(child_name: str, action: str, ai_op_key: str) -> str:
     """AI が渡す operation_key を、子ども・操作種別でサーバ側名前空間化した実効キーにする。
 
@@ -212,7 +236,7 @@ def _tool_defs() -> list[dict]:
     """公開する tool の一覧を返す。金額 tool は operation_key を required に含める。"""
     # operation_key: 同一操作の二重適用を防ぐ冪等キー。AI は1操作につき一意な値を1回だけ渡す
     op_key = {"type": "string", "description": "この操作の冪等キー。同じ操作を二度実行しないための一意な文字列。"}
-    return [
+    base_defs = [
         {
             "name": "get_balance",
             "description": "指定した子どもの現在の所持金（円）を返す。残高を変えない。",
@@ -323,6 +347,78 @@ def _tool_defs() -> list[dict]:
             },
         },
     ]
+    # 親モードでは親用 tool を追加する。子会話（PARENT_MODE 未設定）では公開しないため、子から親用
+    # 操作は tool 一覧にも現れない（--allowedTools と二重に絞る）。AI に金額・対象を推測させない前提で、
+    # description に「親が明示した金額・対象のみ。曖昧なら実行せず聞き返す」ことを明記する。
+    if PARENT_MODE:
+        parent_defs = [
+            {
+                "name": "parent_grant",
+                "description": (
+                    "親が指定した子どもへお小遣いを支給する（残高を増やす）。親が『たろうに500円』のように"
+                    "対象と金額をはっきり言ったときだけ呼ぶ。金額や対象があいまいなら呼ばず『誰にいくら？』と"
+                    "聞き返すこと。金額を推測して決めてはいけない。"
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "対象の子どもの名前（親が明示した値）"},
+                        "amount": {"type": "integer", "description": "支給額（円。親が明示した値。推測しない）"},
+                        "operation_key": op_key,
+                    },
+                    "required": ["name", "amount", "operation_key"],
+                },
+            },
+            {
+                "name": "parent_adjust_balance",
+                "description": (
+                    "親が指定した子どもの残高を増やす/減らす調整をする。親が『たろうの残高を+500』『りかを-300』"
+                    "のように対象と増減額をはっきり言ったときだけ呼ぶ。あいまいなら呼ばず聞き返すこと。"
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "対象の子どもの名前（親が明示した値）"},
+                        "delta": {"type": "integer", "description": "増減額（円。+で増やす、-で減らす。親が明示した値）"},
+                        "operation_key": op_key,
+                    },
+                    "required": ["name", "delta", "operation_key"],
+                },
+            },
+            {
+                "name": "parent_approve_assessment",
+                "description": "親が指定した子どもの承認待ちの査定を承認して支給する。対象があいまいなら聞き返す。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "対象の子どもの名前"},
+                        "operation_key": op_key,
+                    },
+                    "required": ["name", "operation_key"],
+                },
+            },
+            {
+                "name": "parent_reject_assessment",
+                "description": "親が指定した子どもの承認待ちの査定を却下する（残高は変わらない）。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string", "description": "対象の子どもの名前"}},
+                    "required": ["name"],
+                },
+            },
+            {
+                "name": "parent_list_balances",
+                "description": "全員の子どもの残高一覧を返す（残高は変えない）。親が『みんなの残高』等と聞いたら呼ぶ。",
+                "inputSchema": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "parent_get_pending",
+                "description": "承認待ちの査定提案の一覧を返す（残高は変えない）。親が『承認待ちは？』等と聞いたら呼ぶ。",
+                "inputSchema": {"type": "object", "properties": {}, "required": []},
+            },
+        ]
+        return base_defs + parent_defs
+    return base_defs
 
 
 # ------------------------------------------------------------------
@@ -1000,6 +1096,123 @@ def reject_proposal(name: str) -> str:
     return f"{target} の査定を却下したよ。残高は変わっていないよ。"
 
 
+# ------------------------------------------------------------------
+# 親モード専用 tool（親会話の AI 主導化。PARENT_MODE + ALLOW_ADMIN_OPS 前提）
+# ------------------------------------------------------------------
+# 設計原則: AI に金額・対象を推測させない。親が明示した対象児名・金額だけを引数で受け、tool 内 Python で
+# 厳密に検証する。曖昧な指示（対象や額が不明）では AI は tool を呼ばず聞き返す想定。対象児は必ず
+# _resolve_parent_target（子ディレクトリ実在のみ）で引き、親名・未登録名は弾く。
+
+def _do_parent_grant(args: dict) -> str:
+    """親が対象児へお小遣いを支給する（親モード専用・管理操作）。金額は親が明示した値のみ。"""
+    if not (PARENT_MODE and ALLOW_ADMIN_OPS):
+        return "この操作は親のチャンネルからのみできるよ。"
+    conf = _resolve_parent_target(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」という子どもは見つからなかったよ。名前を確認してね。"
+    amount = _parse_amount(args.get("amount"))
+    if amount is None:
+        return f"金額が正しくないよ（1〜{MAX_AMOUNT}円で、はっきりした金額を教えてね）。"
+    op_key = str(args.get("operation_key") or "").strip()
+    if not op_key:
+        return "内部エラー: 操作キーが無いため支給できなかったよ。"
+    name = str(conf.get("name", ""))
+    eff_key = _scoped_op_key(name, "allowance_manual_grant", op_key)
+    if _wallet.is_operation_applied(eff_key):
+        return f"その支給はすでに反映済みだよ。今の残高は {_wallet.get_balance(name)}円。"
+    before = _wallet.get_balance(name)
+    after, _ = _wallet.update_balance(
+        user_conf=conf, system_conf=_system_conf(),
+        delta=amount, action="allowance_manual_grant", note="parent_grant_via_ai",
+        operation_key=eff_key,
+    )
+    return f"{name} に {amount}円 支給したよ。\n残高: {before}円 → {after}円"
+
+
+def _do_parent_adjust_balance(args: dict) -> str:
+    """親が対象児の残高を増減調整する（親モード専用・管理操作）。金額は親が明示した符号付き値のみ。"""
+    if not (PARENT_MODE and ALLOW_ADMIN_OPS):
+        return "この操作は親のチャンネルからのみできるよ。"
+    conf = _resolve_parent_target(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」という子どもは見つからなかったよ。名前を確認してね。"
+    # delta は符号付き。AI に推測させず、親が明示した増減額のみを整数化する
+    try:
+        delta = int(args.get("delta"))
+    except (TypeError, ValueError):
+        return "増やす/減らす金額が正しくないよ（例: +500 や -300 のように教えてね）。"
+    if delta == 0:
+        return "0円だと残高は変わらないよ。"
+    if abs(delta) > MAX_AMOUNT:
+        return f"一度に調整できるのは {MAX_AMOUNT}円までだよ。"
+    op_key = str(args.get("operation_key") or "").strip()
+    if not op_key:
+        return "内部エラー: 操作キーが無いため調整できなかったよ。"
+    name = str(conf.get("name", ""))
+    eff_key = _scoped_op_key(name, "balance_adjustment", op_key)
+    if _wallet.is_operation_applied(eff_key):
+        return f"その調整はすでに反映済みだよ。今の残高は {_wallet.get_balance(name)}円。"
+    before = _wallet.get_balance(name)
+    after, _ = _wallet.update_balance(
+        user_conf=conf, system_conf=_system_conf(),
+        delta=delta, action="balance_adjustment", note="parent_adjust_via_ai",
+        operation_key=eff_key,
+    )
+    direction = "増やした" if delta > 0 else "減らした"
+    return f"{name} の残高を {abs(delta)}円 {direction}よ。\n残高: {before}円 → {after}円"
+
+
+def _do_parent_approve_assessment(args: dict) -> str:
+    """親が対象児の承認待ち査定を承認して支給する（親モード専用）。"""
+    if not (PARENT_MODE and ALLOW_ADMIN_OPS):
+        return "この操作は親のチャンネルからのみできるよ。"
+    conf = _resolve_parent_target(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」という子どもは見つからなかったよ。"
+    op_key = str(args.get("operation_key") or "").strip()
+    if not op_key:
+        return "内部エラー: 操作キーが無いため承認できなかったよ。"
+    # 既存の親承認ロジック（4層ガード再適用・flock・冪等）をそのまま使う
+    return approve_proposal(str(conf.get("name", "")), op_key)
+
+
+def _do_parent_reject_assessment(args: dict) -> str:
+    """親が対象児の承認待ち査定を却下する（親モード専用・残高は動かさない）。"""
+    if not PARENT_MODE:
+        return "この操作は親のチャンネルからのみできるよ。"
+    conf = _resolve_parent_target(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」という子どもは見つからなかったよ。"
+    return reject_proposal(str(conf.get("name", "")))
+
+
+def _do_parent_list_balances(args: dict) -> str:
+    """親が全児童の残高一覧を見る（親モード専用・残高は動かさない）。"""
+    if not PARENT_MODE:
+        return "この操作は親のチャンネルからのみできるよ。"
+    users = config.load_all_users()
+    if not users:
+        return "登録された子どもがいないみたい。"
+    lines = ["みんなの残高だよ。"]
+    for u in sorted(users, key=lambda x: str(x.get("name", ""))):
+        n = str(u.get("name", ""))
+        lines.append(f"- {n}: {_wallet.get_balance(n)}円")
+    return "\n".join(lines)
+
+
+def _do_parent_get_pending(args: dict) -> str:
+    """親が承認待ちの査定提案一覧を見る（親モード専用・残高は動かさない）。"""
+    if not PARENT_MODE:
+        return "この操作は親のチャンネルからのみできるよ。"
+    pending = read_all_pending_proposals()
+    if not pending:
+        return "いま承認待ちの査定はないよ。"
+    lines = ["承認待ちの査定だよ。"]
+    for p in pending:
+        lines.append(f"- {p.get('name','')}: {int(p.get('total',0))}円（理由: {p.get('reason','')}）")
+    return "\n".join(lines)
+
+
 # tool 名から実装への対応表。dispatch はここを引く
 _HANDLERS = {
     "get_balance": _do_get_balance,
@@ -1010,6 +1223,13 @@ _HANDLERS = {
     "set_savings_goal": _do_set_savings_goal,
     "propose_allowance": _do_propose_allowance,
     "grant_allowance": _do_grant_allowance,
+    # 親モード専用
+    "parent_grant": _do_parent_grant,
+    "parent_adjust_balance": _do_parent_adjust_balance,
+    "parent_approve_assessment": _do_parent_approve_assessment,
+    "parent_reject_assessment": _do_parent_reject_assessment,
+    "parent_list_balances": _do_parent_list_balances,
+    "parent_get_pending": _do_parent_get_pending,
 }
 
 
