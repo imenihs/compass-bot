@@ -526,7 +526,37 @@ def _parse_output(stdout_text: str) -> tuple[bool, str, str | None]:
     result = str(data.get("result") or "")
     if not result:
         return False, "", session_id
+    # claude が判断の思考（英語のつぶやき）を応答冒頭に出すことがある（例「thPersistent. Don't propose...」）。
+    # prompt で抑制しているが完全でないため、出力側でも冒頭の英語思考ブロックを除去し、子に見せない多層防御。
+    result = _strip_thinking_prefix(result)
+    if not result.strip():
+        # 思考だけで日本語本文が無い異常。応答に使わない
+        return False, "", session_id
     return True, result, session_id
+
+
+def _strip_thinking_prefix(text: str) -> str:
+    """応答冒頭に紛れた英語の思考ブロックを除去する（子に判断過程を見せないため）。
+
+    claude が「thPersistent. But there might be...Don't propose without reason.パソコンほしい…」のように、
+    思考(英語主体)の直後に日本語本文をつなげて出すことがある。最初の日本語文字(ひらがな/カタカナ/漢字)より
+    前が、英語・記号主体の思考なら、その前置きを削って日本語本文から返す。日本語が先頭にある正常な応答は
+    そのまま返す（誤除去しない）。
+    """
+    import re as _re
+    s = text.lstrip()
+    # 最初の日本語文字の位置
+    m = _re.search(r"[ぁ-んァ-ヶ一-龠]", s)
+    if not m:
+        return text  # 日本語が無い（英語のみ等）はそのまま（別処理に委ねる）
+    idx = m.start()
+    if idx == 0:
+        return text  # 先頭から日本語＝正常。触らない
+    prefix = s[:idx]
+    # 前置きが英語・記号主体（日本語が無く、英字が一定数ある）なら思考とみなして除去
+    if not _re.search(r"[ぁ-んァ-ヶ一-龠]", prefix) and len(_re.findall(r"[A-Za-z]", prefix)) >= 5:
+        return s[idx:].lstrip()
+    return text
 
 
 class _ProcessNeverStarted(Exception):
