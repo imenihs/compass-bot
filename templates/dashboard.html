@@ -150,6 +150,8 @@
   <input id="user-order-input" type="hidden" name="user_order" value="{{ dashboard_user_order_json|default('[]')|e }}">
   <div class="user-order-toolbar">
     <button type="submit" class="btn btn-primary user-order-save" data-user-order-save disabled>並び順を保存</button>
+    <button type="button" class="btn btn-secondary" data-settings-open="user-create-child-modal">＋ 子どもを追加</button>
+    <button type="button" class="btn btn-secondary" data-settings-open="user-create-parent-modal">＋ 親を追加</button>
   </div>
   <div class="dashboard-table-wrap">
   <table class="dashboard-user-table">
@@ -356,6 +358,114 @@
       </div>
     </div>
   {% endfor %}
+
+  <!-- 新規: 子どもを追加するモーダル（空フォーム・data-settings-form は付けない＝移行確認を出さない） -->
+  <div id="user-create-child-modal" class="settings-modal" role="dialog" aria-modal="true"
+       aria-labelledby="user-create-child-title" hidden data-settings-modal>
+    <div class="settings-modal__panel" role="document">
+      <form method="post" action="/compass-bot/op/user_create">
+        <input type="hidden" name="user_type" value="child">
+        <div class="settings-modal__header">
+          <h3 id="user-create-child-title">子どもを追加</h3>
+        </div>
+        <div class="settings-modal__body">
+          <div class="settings-note">名前とDiscord IDは必須です。ほかの項目は後からこの画面で変更できます。</div>
+          <div class="settings-grid">
+            <div class="settings-field">
+              <label for="create-child-name">名前</label>
+              <input id="create-child-name" type="text" name="name" required maxlength="60" placeholder="たろう">
+            </div>
+            <div class="settings-field">
+              <label for="create-child-discord-id">Discord ID</label>
+              <input id="create-child-discord-id" type="text" inputmode="numeric" pattern="[0-9]{5,25}"
+                     name="discord_user_id" required placeholder="111111111111111111">
+            </div>
+            <div class="settings-field">
+              <label for="create-child-age">年齢</label>
+              <input id="create-child-age" type="number" name="age" min="0" max="120" value="10" required>
+            </div>
+            <div class="settings-field">
+              <label for="create-child-gender">性別</label>
+              <select id="create-child-gender" name="gender">
+                {% for choice in user_gender_choices|default([]) %}
+                  <option value="{{ choice.value }}" {% if choice.value == 'unspecified' %}selected{% endif %}>{{ choice.label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="settings-field">
+              <label for="create-child-personality">話し方</label>
+              <select id="create-child-personality" name="bot_personality">
+                {% for choice in bot_personality_choices|default([]) %}
+                  <option value="{{ choice.value }}">{{ choice.label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+          </div>
+          <div class="settings-grid">
+            <div class="settings-field">
+              <label for="create-child-fixed-allowance">月額お小遣い</label>
+              <input id="create-child-fixed-allowance" type="number" name="fixed_allowance" min="0" value="0" required>
+            </div>
+            <div class="settings-field">
+              <label for="create-child-temporary-max">臨時上限</label>
+              <input id="create-child-temporary-max" type="number" name="temporary_max" min="0" value="3000" required>
+            </div>
+            <div class="settings-field">
+              <label for="create-child-fixed-increase-cap">固定増額上限</label>
+              <input id="create-child-fixed-increase-cap" type="number" name="fixed_increase_cap" min="0" value="100" required>
+            </div>
+            <div class="settings-field">
+              <label for="create-child-penalty-cap">残高確認差額上限</label>
+              <input id="create-child-penalty-cap" type="number" name="penalty_cap" min="0" value="100">
+            </div>
+          </div>
+          <div class="settings-grid settings-grid--keywords">
+            {% for bucket in user_keyword_buckets|default([]) %}
+              <div class="settings-field">
+                <label for="create-child-keywords-{{ bucket.key }}">{{ bucket.label }}キーワード</label>
+                <textarea id="create-child-keywords-{{ bucket.key }}" name="keywords_{{ bucket.key }}" rows="3"></textarea>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="settings-modal__footer">
+          <button type="button" class="btn btn-secondary" data-settings-cancel>キャンセル</button>
+          <button type="submit" class="btn btn-primary">子どもを追加</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 新規: 親を追加するモーダル（name + Discord ID のみ） -->
+  <div id="user-create-parent-modal" class="settings-modal" role="dialog" aria-modal="true"
+       aria-labelledby="user-create-parent-title" hidden data-settings-modal>
+    <div class="settings-modal__panel" role="document">
+      <form method="post" action="/compass-bot/op/user_create">
+        <input type="hidden" name="user_type" value="parent">
+        <div class="settings-modal__header">
+          <h3 id="user-create-parent-title">親を追加</h3>
+        </div>
+        <div class="settings-modal__body">
+          <div class="settings-note">親を追加したら、反映のため Bot の再起動が必要です。親IDと子IDは重複させないでください。</div>
+          <div class="settings-grid">
+            <div class="settings-field">
+              <label for="create-parent-name">名前</label>
+              <input id="create-parent-name" type="text" name="name" required maxlength="60" placeholder="おとうさん">
+            </div>
+            <div class="settings-field">
+              <label for="create-parent-discord-id">Discord ID</label>
+              <input id="create-parent-discord-id" type="text" inputmode="numeric" pattern="[0-9]{5,25}"
+                     name="discord_user_id" required placeholder="222222222222222222">
+            </div>
+          </div>
+        </div>
+        <div class="settings-modal__footer">
+          <button type="button" class="btn btn-secondary" data-settings-cancel>キャンセル</button>
+          <button type="submit" class="btn btn-primary">親を追加</button>
+        </div>
+      </form>
+    </div>
+  </div>
   {% else %}
     <div style="color:#aaa; text-align:center; padding:20px;">ユーザーデータがありません</div>
   {% endif %}

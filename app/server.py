@@ -21,6 +21,7 @@ from fastapi.templating import Jinja2Templates
 from app import web_auth
 from app.config import (
     PARENTS_DIR,
+    USERS_DIR,
     SETTING_PATH,
     get_allow_channel_ids,
     get_allowance_reminder_setting,
@@ -2001,6 +2002,132 @@ async def op_user_settings(
         moved.append("web_dashboard_order")
     suffix = f"（移行: {', '.join(moved)}）" if moved else ""
     return _op_redirect(msg=f"{new_name}のユーザー設定を保存しました。{suffix}")
+
+
+def _new_settings_path_for_scope(user_type: str, name: str) -> Path | None:
+    """新規ユーザーの設定ファイルのパスを組み立てる。既に同名ファイルがあれば None を返す。
+
+    子どもは `settings/users/<name>.json`、親は `settings/users/parents/<name>.json` に作る。
+    ファイル名は name をそのまま使う（既存の編集フローが name で JSON を探すため対称にする）。
+    既存ファイルとの衝突は呼び出し側で None を受けて弾く。
+
+    Args:
+        user_type: "child" または "parent"。
+        name: 新規ユーザー名（不正文字チェック済みであること）。
+
+    Returns:
+        Path | None: 作成先パス。同名ファイルが既にあれば None。
+    """
+    base_dir = PARENTS_DIR if user_type == "parent" else USERS_DIR
+    path = base_dir / f"{name}.json"
+    # 既存ファイルへの上書きを防ぐ。名前重複は別途 _name_exists_elsewhere でも弾くが、
+    # ファイル名衝突（別名だが同一ファイル名になるケース）はここで最終的に止める
+    if path.exists():
+        return None
+    return path
+
+
+@app.post("/compass-bot/op/user_create")
+async def op_user_create(
+    session_token: Optional[str] = Cookie(default=None),
+    user_type: str = Form(default="child"),
+    name: str = Form(...),
+    discord_user_id: str = Form(...),
+    age: str = Form(default=""),
+    gender: str = Form(default="unspecified"),
+    bot_personality: str = Form(default=""),
+    fixed_allowance: str = Form(default=""),
+    temporary_max: str = Form(default=""),
+    fixed_increase_cap: str = Form(default=""),
+    penalty_cap: str = Form(default=""),
+    keywords_investment: str = Form(default=""),
+    keywords_fun: str = Form(default=""),
+    keywords_danger: str = Form(default=""),
+):
+    """管理者がブラウザから子ども・親ユーザーを新規追加する。
+
+    既存の編集フロー（op_user_settings）と同じバリデーションを使い、対象を新規ファイルにする。
+    手作業での JSON 作成を不要にし、最初の1人以外はブラウザだけでユーザーを増やせるようにする。
+    親を新規追加した場合は is_parent の凍結解除のため Bot 再起動が必要（画面にも案内する）。
+    """
+    current_user = await _get_current_user(session_token)
+    # 管理者のみ。未認証・非管理者はログインへ戻す
+    if not current_user or not _is_admin(current_user):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    scope = str(user_type or "child").strip()
+    if scope not in {"child", "parent"}:
+        return _op_redirect(error="ユーザー種別が正しくありません。")
+
+    new_name = str(name or "").strip()
+    if not new_name:
+        return _op_redirect(error="名前を入力してください。")
+    # ファイル名・パスに使えない文字を弾く（パストラバーサル・NUL 対策）
+    if len(new_name) > 60 or any(ch in new_name for ch in ('/', '\\', '\0', '.')):
+        return _op_redirect(error="名前に使えない文字（/ \\ . など）が含まれています。")
+    # 新規なので、子・親のどちらかに同名がいれば必ず重複エラー（original_name は空で照合）
+    if _name_exists_elsewhere(new_name, "", scope) or find_user_by_name(new_name):
+        return _op_redirect(error=f"「{new_name}」は既に使われています。別の名前にしてください。")
+
+    discord_id, id_error = _parse_discord_user_id(discord_user_id)
+    if id_error:
+        return _op_redirect(error=id_error)
+    if discord_id is None:
+        return _op_redirect(error="Discord IDを入力してください。")
+    # 同種内の Discord ID 重複を弾く（original_name は空）。親IDと子IDの重複は運用注意事項として別掲
+    if _same_scope_discord_id_exists(scope, discord_id, ""):
+        return _op_redirect(error="同じ種類のユーザー内でDiscord IDが重複しています。")
+
+    path = _new_settings_path_for_scope(scope, new_name)
+    if path is None:
+        return _op_redirect(error=f"「{new_name}」の設定ファイルが既に存在します。")
+
+    new_data: dict = {"name": new_name, "discord_user_id": discord_id}
+
+    # 親はシンプルに name + discord_user_id だけ保存する
+    if scope == "parent":
+        _save_settings_json(path, new_data)
+        return _op_redirect(
+            msg=f"{new_name}の親ユーザーを追加しました。反映には Bot の再起動が必要です。"
+        )
+
+    # 子どもは年齢・性別・お小遣い等をまとめて検証してから保存する
+    age_value, age_error = _parse_settings_int("年齢", age, minimum=0, maximum=120)
+    if age_error:
+        return _op_redirect(error=age_error)
+
+    gender_value = str(gender or "unspecified").strip()
+    if gender_value not in USER_GENDER_VALUES:
+        return _op_redirect(error="性別の指定が正しくありません。")
+
+    personality_value = str(bot_personality or "").strip()
+    if personality_value and personality_value not in BOT_PERSONALITY_VALUES:
+        return _op_redirect(error="話し方の指定が正しくありません。")
+
+    fixed_value, fixed_error = _parse_settings_int("月額お小遣い", fixed_allowance)
+    temporary_value, temporary_error = _parse_settings_int("臨時上限", temporary_max)
+    fixed_cap_value, fixed_cap_error = _parse_settings_int("固定増額上限", fixed_increase_cap)
+    penalty_value, penalty_error = _parse_optional_settings_int("残高確認差額上限", penalty_cap)
+    for error in (fixed_error, temporary_error, fixed_cap_error, penalty_error):
+        if error:
+            return _op_redirect(error=error)
+
+    new_data["age"] = age_value
+    new_data["gender"] = gender_value
+    new_data["fixed_allowance"] = fixed_value
+    new_data["temporary_max"] = temporary_value
+    new_data["fixed_increase_cap"] = fixed_cap_value
+    new_data["penalty_cap"] = penalty_value
+    if personality_value:
+        new_data["bot_personality"] = personality_value
+    new_data["keywords"] = {
+        "investment": _parse_keyword_list(keywords_investment),
+        "fun": _parse_keyword_list(keywords_fun),
+        "danger": _parse_keyword_list(keywords_danger),
+    }
+    _save_settings_json(path, new_data)
+    # 子ユーザーは毎回 fresh 読込のため再起動不要
+    return _op_redirect(msg=f"{new_name}のユーザーを追加しました。")
 
 
 @app.post("/compass-bot/op/followup_policy")
