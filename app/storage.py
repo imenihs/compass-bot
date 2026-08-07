@@ -14,6 +14,49 @@ def now_jst_iso() -> str:
     return datetime.now(JST).isoformat()
 
 
+def _read_jsonl(path: Path) -> list[dict]:
+    """JSONL ファイルを dict のリストとして読む。無ければ空。壊れた行はスキップ。"""
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                if isinstance(rec, dict):
+                    rows.append(rec)
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def count_recent_allowance_requests(log_dir: Path, user_name: str, days: int = 30) -> int:
+    """直近 days 日で査定(assessed)された回数を数える。Gemini とは無関係のログ集計。
+
+    元は gemini_service.py にあったが、Gemini 完全削除に伴い storage へ移設。events ログの
+    assessed フラグ付きレコードを日数窓で数えるだけで、AI 呼び出しは一切しない。
+    """
+    path = log_dir / f"{user_name}_events.jsonl"
+    rows = _read_jsonl(path)
+    now = datetime.now(JST)
+    count = 0
+    for r in rows:
+        ts = r.get("ts")
+        assessed = r.get("assessed")
+        if not ts or not assessed:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(ts))
+        except ValueError:
+            continue
+        if (now - dt).days <= days:
+            count += 1
+    return count
+
+
 # ----------------------------------------------------------------------
 # 会話ログ（{name}_conversation.jsonl）
 # events.jsonl とは別系統。全ターンで書かれる最頻の追記経路であり、

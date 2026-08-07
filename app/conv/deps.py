@@ -73,18 +73,6 @@ def wallet_service() -> Any:
     return _bot().wallet_service
 
 
-def gemini_service() -> Any:
-    """現在の GeminiService（またはテストダブル）を返す。
-
-    テストは bot.gemini_service を StubGeminiService 系へ差し替える。
-    対話層が呼んでよいのは call_silent / call_with_progress / extract_assessed_amounts の3つのみ。
-
-    Returns:
-        GeminiService: Gemini 呼び出しサービス。
-    """
-    return _bot().gemini_service
-
-
 def client() -> Any:
     """現在の discord.Client（またはテストの FakeClient）を返す。
 
@@ -94,17 +82,6 @@ def client() -> Any:
     return _bot().client
 
 
-def intent_normalizer() -> Any:
-    """intent 正規化モジュールを返す。
-
-    モジュールごと返すのが要点。テストは bot.intent_normalizer.normalize_intent
-    という属性単位で差し替えるため、モジュール参照を返せば差し替えが効く。
-    個別関数を束縛して返すと差し替え前の関数を掴んでしまう。
-
-    Returns:
-        module: intent_normalizer モジュール（normalize_intent / is_no_reply 等を持つ）。
-    """
-    return _bot().intent_normalizer
 
 
 # ------------------------------------------------------------------

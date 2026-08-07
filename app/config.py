@@ -193,13 +193,6 @@ def get_allow_channel_ids() -> set[int] | None:
 
     return {value for value in (_safe_int(x.strip()) for x in raw.split(",") if x.strip()) if value is not None}
 
-def get_gemini_model() -> str:
-    setting = load_setting()
-    model_name = (setting.get("gemini_model") or "").strip()
-    if model_name:
-        return model_name
-    return os.environ.get("GEMINI_MODEL", "models/gemini-2.5-flash")
-
 def get_allowance_reminder_setting() -> dict:
     """
     reminderの設定を返す。未設定時は安全なデフォルト。

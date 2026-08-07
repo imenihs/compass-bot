@@ -44,7 +44,6 @@ from app.config import (
     get_chat_setting,
     get_child_income_report_setting,
     get_force_assess_test_keyword,
-    get_gemini_model,
     get_log_dir,
     get_low_balance_alert_setting,
     get_monthly_summary_setting,
@@ -62,7 +61,7 @@ from app.error_messages import (
     operation_failure_message,
     processing_failure_message,
 )
-from app.gemini_service import GeminiService, count_recent_allowance_requests
+from app.storage import count_recent_allowance_requests
 from app.message_parser import (
     contains_any_mention,
     extract_input_from_mention,
@@ -87,7 +86,6 @@ from app.wallet_service import WalletService
 from app import handlers_parent, handlers_child
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 PARENT_IDS = get_parent_ids()
 ALLOW_CHANNEL_IDS = get_allow_channel_ids()
@@ -130,11 +128,6 @@ MAX_GOAL_INPUT_AMOUNT = 10_000_000
 _thinking_sent_message_keys: set[tuple[str, int]] = set()
 
 
-gemini_service = GeminiService(
-    api_key=GEMINI_API_KEY,
-    model_name=get_gemini_model(),
-    assess_keyword=ASSESS_KEYWORD,
-)
 wallet_service = WalletService()
 
 intents = discord.Intents.default()
@@ -832,6 +825,6 @@ async def _main():
 
 
 if __name__ == "__main__":
-    if not DISCORD_BOT_TOKEN or not GEMINI_API_KEY:
-        raise RuntimeError("DISCORD_BOT_TOKEN / GEMINI_API_KEY が未設定")
+    if not DISCORD_BOT_TOKEN:
+        raise RuntimeError("DISCORD_BOT_TOKEN が未設定")
     asyncio.run(_main())
