@@ -43,6 +43,7 @@ from app.config import (
     get_allowance_reminder_setting,
     get_chat_setting,
     get_child_income_report_setting,
+    get_safety_alert_setting,
     get_force_assess_test_keyword,
     get_log_dir,
     get_low_balance_alert_setting,
@@ -89,6 +90,9 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 PARENT_IDS = get_parent_ids()
 ALLOW_CHANNEL_IDS = get_allow_channel_ids()
 ALLOWANCE_REMINDER = get_allowance_reminder_setting()
+# 危険信号の通知先（N-11.16）。査定通知に相乗りさせず専用キーで持つ。
+# 未設定なら親チャンネル（allowance_reminder）へフォールバックし、安全通知を落とさない
+SAFETY_ALERT = get_safety_alert_setting()
 WALLET_AUDIT = get_wallet_audit_setting()
 CHAT_SETTING = get_chat_setting()
 ASSESS_KEYWORD = get_assess_keyword()
@@ -136,6 +140,109 @@ def _safe_get_balance(name: str):
         return wallet_service.get_balance(str(name or "").strip())
     except Exception:
         return None
+
+
+async def _handle_safety_signal(system_conf, message, user_conf, input_block, judgment: dict) -> None:
+    """危険信号を検知したときの送信を担う（N-11.16）。
+
+    経路はカテゴリで分ける。
+      ・虐待の疑い → **親チャンネルへ送らない**。子へ直接、公的窓口を渡す。
+        加害者は同居の実親であることが多く、親へ流すと加害者への情報還流になるため。
+      ・それ以外   → 親チャンネルへ通知する（要約→背景→原文の構成）。
+
+    AI が高い確信で否定した誤検知（suppressed_by_ai）は送信せず診断だけ残す。
+    送信の失敗は silent drop しない。必ず診断へ残し、後から追えるようにする。
+
+    Args:
+        system_conf: システム設定。
+        message: 元の Discord メッセージ。
+        user_conf: 対象児童の設定。
+        input_block: 子の発話原文。
+        judgment: safety.merge_judgments の結果。
+    """
+    from app import safety
+
+    child_name = str(user_conf.get("name", ""))
+    category = str(judgment.get("category", ""))
+    # AI が高い確信で否定した誤検知は送らない。記録だけ残して後から検証できるようにする
+    if judgment.get("suppressed_by_ai"):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_signal_suppressed",
+            {"category": category, "confidence": judgment.get("confidence"),
+             "ai_reason": str(judgment.get("ai_reason", ""))[:200]},
+        )
+        return
+
+    # 虐待の疑いは親へ送らず、子へ外部窓口を渡す（本モジュール最重要の分岐）
+    if not judgment.get("notify_parent"):
+        try:
+            if category == "abuse":
+                await message.channel.send(safety.build_child_hotline_message(judgment))
+        except Exception as e:
+            _log_runtime_event(
+                system_conf, message, user_conf, input_block,
+                "safety_child_hotline_send_failed", {"error": f"{type(e).__name__}: {e}"},
+            )
+        # 親へ送らない判断も必ず記録する。運用者が後から確認できる状態を保つ
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_signal_not_notified_to_parent",
+            {"category": category, "urgency": judgment.get("urgency"),
+             "perpetrator": judgment.get("perpetrator"),
+             "uncertain": judgment.get("uncertain"),
+             "ai_reason": str(judgment.get("ai_reason", ""))[:200]},
+        )
+        return
+
+    # ここから親チャンネルへの通知。宛先は安全専用設定（査定に相乗りさせない）
+    conf = SAFETY_ALERT or {}
+    if not conf.get("enabled", True):
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_alert_disabled", {"category": category},
+        )
+        return
+    channel_id = conf.get("channel_id") or (ALLOWANCE_REMINDER or {}).get("channel_id")
+    parent_channel = None
+    try:
+        if channel_id:
+            parent_channel = client.get_channel(int(channel_id))
+            if parent_channel is None:
+                parent_channel = await client.fetch_channel(int(channel_id))
+    except Exception as e:
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_alert_channel_error", {"error": f"{type(e).__name__}: {e}"},
+        )
+    if parent_channel is None:
+        # 送信先が無いことを絶対に握り潰さない。安全通知の silent drop は最も避けるべき失敗
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_alert_channel_unset",
+            {"category": category, "urgency": judgment.get("urgency")},
+        )
+        return
+
+    # 子の同意はこの時点では取れていない（会話の中で確認するのは AI 側の役割）。
+    # 返事を待たずに送るのが原則であり、確認できていない旨を通知に明記する。
+    body = safety.build_parent_notification(
+        child_name, judgment, input_block, child_consent="unknown",
+    )
+    mention = " ".join(f"<@{pid}>" for pid in sorted(get_parent_ids())) or ""
+    try:
+        await parent_channel.send(f"{mention}\n{body}" if mention else body)
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_alert_sent",
+            {"category": category, "urgency": judgment.get("urgency"),
+             "confidence": judgment.get("confidence")},
+        )
+    except Exception as e:
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_alert_send_failed", {"error": f"{type(e).__name__}: {e}", "category": category},
+        )
 
 
 intents = discord.Intents.default()
@@ -794,8 +901,27 @@ async def _on_message_impl(message: discord.Message):
         _mark_thinking_sent(message, True)
         return
 
-    from app.conv.ai_conversation import handle_conversation
-    await handle_conversation(message.channel, user_conf, input_block)
+    # 安全判定は会話と**並行**して走らせる（N-11.16）。会話がタイムアウト・失敗しても
+    # 安全判定は必ず行う（安全を会話の成否に依存させない）。また子が返事をせず離脱しても、
+    # 検知した時点で通知が確定するため「怖くて逃げた子ほど通知されない」逆相関を防ぐ。
+    from app.conv.ai_conversation import handle_conversation, judge_safety
+    safety_task = asyncio.create_task(judge_safety(user_conf, input_block))
+    try:
+        await handle_conversation(message.channel, user_conf, input_block)
+    finally:
+        # 会話が例外で落ちても安全通知は必ず処理する
+        try:
+            judgment = await safety_task
+        except Exception as e:
+            judgment = None
+            _log_runtime_event(
+                system_conf, message, user_conf, input_block,
+                "safety_judge_failed", {"error": f"{type(e).__name__}: {e}"},
+            )
+        if judgment:
+            await _handle_safety_signal(
+                system_conf, message, user_conf, input_block, judgment,
+            )
     _mark_thinking_sent(message, True)
 
     # 査定提案が出ていたら「親チャンネルのみ」へ通知する（是正設計①・N-11.14）。
