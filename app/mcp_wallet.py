@@ -555,33 +555,48 @@ def _do_record_income(args: dict) -> str:
         )
     # 安全弁2〜4: 自己申告入金の連打で残高を無制限に膨らませられないよう、回数・日次累計・月次累計を強制。
     # 査定支給と同じく Python 側で最終判定する（AI・operation_key ではすり抜けを止められないため）。
-    now = datetime.now(_JST)
-    day_count, day_total, month_total = _income_day_month_totals(name, now)
-    if day_count >= int(income_conf["daily_count_max"]):
-        return (
-            f"今日はもう自分で入金できる回数（{income_conf['daily_count_max']}回）を使いきったよ。"
-            "また明日にしようね。大きいお金はおうちの人に相談してね。"
-        )
-    if day_total + amount > int(income_conf["daily_total_max"]):
-        remaining = max(0, int(income_conf["daily_total_max"]) - day_total)
-        return (
-            f"今日じぶんで入金できるのは合計 {income_conf['daily_total_max']}円までで、"
-            f"あと {remaining}円だよ。それ以上はおうちの人に相談してね。"
-        )
-    if month_total + amount > int(income_conf["monthly_total_max"]):
-        remaining = max(0, int(income_conf["monthly_total_max"]) - month_total)
-        return (
-            f"今月じぶんで入金できるのは合計 {income_conf['monthly_total_max']}円までで、"
-            f"あと {remaining}円だよ。それ以上はおうちの人に相談してね。"
-        )
+    #
+    # 判定は **update_balance の flock 内**で行う（TOCTOU の根本対処・2026/08/09）。
+    # 以前はここで集計・判定してから update_balance を呼んでおり、その間にロックが無かった。
+    # 親の支給と子の入金、複数の claude subprocess が同時に走ると、全員が「まだ余裕あり」を
+    # 読んでから順に書けてしまう。実測で日次上限5000円に対し10000円の入金が通った。
+    def _check_income_limits() -> str:
+        """ロックを保持したまま台帳を再集計し、上限超過なら拒否理由を返す。"""
+        now_in_lock = datetime.now(_JST)
+        d_count, d_total, m_total = _income_day_month_totals(name, now_in_lock)
+        if d_count >= int(income_conf["daily_count_max"]):
+            return (
+                f"今日はもう自分で入金できる回数（{income_conf['daily_count_max']}回）を使いきったよ。"
+                "また明日にしようね。大きいお金はおうちの人に相談してね。"
+            )
+        if d_total + amount > int(income_conf["daily_total_max"]):
+            remaining = max(0, int(income_conf["daily_total_max"]) - d_total)
+            return (
+                f"今日じぶんで入金できるのは合計 {income_conf['daily_total_max']}円までで、"
+                f"あと {remaining}円だよ。それ以上はおうちの人に相談してね。"
+            )
+        if m_total + amount > int(income_conf["monthly_total_max"]):
+            remaining = max(0, int(income_conf["monthly_total_max"]) - m_total)
+            return (
+                f"今月じぶんで入金できるのは合計 {income_conf['monthly_total_max']}円までで、"
+                f"あと {remaining}円だよ。それ以上はおうちの人に相談してね。"
+            )
+        return ""
+
     # op_key の存在・冪等チェックは上限チェックより前で済ませている（矛盾文面を避けるため）
     note = str(args.get("note") or "").strip()
     before = _wallet.get_balance(name)
-    after, achieved = _wallet.update_balance(
-        user_conf=conf, system_conf=_system_conf(),
-        delta=amount, action="manual_income", note=note,
-        operation_key=eff_key, aux_operation_keys=[dup_key], aux_dedup_window_sec=DEDUP_WINDOW_SEC,
-    )
+    from app.wallet_service import _PrecheckRejected
+    try:
+        after, achieved = _wallet.update_balance(
+            user_conf=conf, system_conf=_system_conf(),
+            delta=amount, action="manual_income", note=note,
+            operation_key=eff_key, aux_operation_keys=[dup_key],
+            aux_dedup_window_sec=DEDUP_WINDOW_SEC, precheck=_check_income_limits,
+        )
+    except _PrecheckRejected as e:
+        # 上限超過。残高は動いていない
+        return str(e)
     msg = (
         f"入金を記録したよ。\n- 金額: {amount}円\n- メモ: {note if note else 'なし'}\n"
         f"残高: {before}円 → {after}円"
@@ -834,11 +849,28 @@ def _do_grant_allowance(args: dict) -> str:
         return "今回は増額・臨時支給なしの査定だよ。"
 
     before = _wallet.get_balance(name)
-    after, achieved = _wallet.update_balance(
-        user_conf=conf, system_conf=_system_conf(),
-        delta=grant, action="allowance_grant", note=reason,
-        operation_key=eff_key,
-    )
+    # ガードレールを **flock 内で再判定**する（TOCTOU の根本対処・2026/08/09）。
+    # 上の _apply_guardrails はロック外なので、複数プロセスが同時に「まだ枠がある」と読んでから
+    # 順に書ける。実測で月次上限3000円に対し4000円・日次回数3回に対し4回の支給が通った。
+    # ロックを保持したまま台帳を再集計し、超過していれば書き込まない。
+    def _recheck_guardrails() -> str:
+        _f, _t, _n, rej = _apply_guardrails(conf, fixed_req, temp_req, datetime.now(_JST))
+        if rej:
+            return rej
+        # ロック内の再判定で許可額が減っていたら、その差は次回へ回す（過剰支給を防ぐ側へ倒す）
+        if (_f + _t) < grant:
+            return "いま支給できる枠が足りなかったよ。時間をおいてもう一度お願いしてね。"
+        return ""
+
+    from app.wallet_service import _PrecheckRejected
+    try:
+        after, achieved = _wallet.update_balance(
+            user_conf=conf, system_conf=_system_conf(),
+            delta=grant, action="allowance_grant", note=reason,
+            operation_key=eff_key, precheck=_recheck_guardrails,
+        )
+    except _PrecheckRejected as e:
+        return str(e)
     msg = (
         f"査定でお小遣いを {grant}円 あげたよ。\n- 理由: {reason}\n"
         f"残高: {before}円 → {after}円"
@@ -1142,11 +1174,29 @@ def approve_proposal(name: str, operation_key: str = "", expected_proposal_id: s
             store._save_doc(store.payout_requests_path, doc, "requests")
             return f"いま支給できる枠が無いため {target} の査定は見送ったよ（残高は変わっていないよ）。"
         before = _wallet.get_balance(target)
-        after, achieved = _wallet.update_balance(
-            user_conf=conf, system_conf=_system_conf(),
-            delta=grant, action="allowance_grant", note=reason,
-            operation_key=eff_key,
-        )
+        # ガードレールを **flock 内で再判定**する（TOCTOU の根本対処・2026/08/09）。
+        # 上の判定は payout ロック内だが wallet ロックの外であり、同時刻に子の record_income や
+        # grant_allowance が走ると月次累計が食い違う。ロックを保持したまま再集計して超過を防ぐ。
+        def _recheck_on_approve() -> str:
+            _f, _t, _n, rej = _apply_guardrails(
+                conf, int(req.get("fixed", 0)), int(req.get("temporary", 0)), datetime.now(_JST)
+            )
+            if rej:
+                return f"いま {target} は上限に達しているため支給できないよ。（{rej}）"
+            if (_f + _t) < grant:
+                return f"いま {target} に支給できる枠が足りなかったよ。時間をおいてもう一度承認してね。"
+            return ""
+
+        from app.wallet_service import _PrecheckRejected
+        try:
+            after, achieved = _wallet.update_balance(
+                user_conf=conf, system_conf=_system_conf(),
+                delta=grant, action="allowance_grant", note=reason,
+                operation_key=eff_key, precheck=_recheck_on_approve,
+            )
+        except _PrecheckRejected as e:
+            # 上限超過。提案は残す（親が翌日以降に再承認できる）。残高は動いていない
+            return str(e)
         # 子への F/B（opener）生成入力を積む。承認は前向きに「なぜ OK か」の入口を子へ届ける材料。
         _enqueue_feedback(store, doc, {
             "name": target, "proposal_id": cur_pid, "kind": "approve",

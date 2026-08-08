@@ -38,6 +38,15 @@ def _interprocess_lock(lock_path: Path):
 MAX_SAVINGS_GOALS = 5
 
 
+class _PrecheckRejected(Exception):
+    """update_balance のロック内 precheck が書き込みを拒否したことを表す。
+
+    上限超過などで「書いてはいけない」と判定した場合に送出する。呼び出し側はこれを捕まえて
+    子ども向けの文面へ変換する。ロックを保持したまま判定するため、判定と書き込みの間に
+    他プロセスが割り込む余地が無い（TOCTOU の解消）。
+    """
+
+
 class WalletService:
     def __init__(self):
         root = Path(__file__).resolve().parents[1]
@@ -245,6 +254,7 @@ class WalletService:
         operation_key: str | None = None,
         aux_operation_keys: list[str] | None = None,
         aux_dedup_window_sec: int = 0,
+        precheck=None,
     ) -> tuple[int, list[dict]]:
         # プロセス内(RLock)に加え、プロセス間(flock)でも直列化する。mcp_wallet 子プロセスと
         # bot プロセスが同じ wallet_state.json を read-modify-write するロストアップデートを防ぐ。
@@ -295,6 +305,17 @@ class WalletService:
                         return before, []  # ts 解釈不能は安全側で弾く
                 # window 未指定 or ts 無し: 存在するだけで弾く(従来互換)
                 return before, []
+            # 上限チェックをこの flock の内側で行う（TOCTOU の根本対処・2026/08/09）。
+            # 以前は呼び出し側が「台帳を集計 → 上限判定 → update_balance」と別々に行っており、
+            # 集計と書き込みの間にロックが無かった。複数プロセス（親の支給と子の入金、複数の
+            # claude subprocess）が同時に走ると全員が「まだ余裕あり」を読んでから順に書けてしまい、
+            # 実測で日次上限5000円に対し10000円の入金、月次上限3000円に対し4000円の支給が通った。
+            # precheck はロックを保持したまま台帳を再集計して判定する。拒否理由を返せば書き込まない。
+            if precheck is not None:
+                reason = precheck()
+                if reason:
+                    # 拒否は「適用0件」で返す。呼び出し側は reason を見て文面を出す
+                    raise _PrecheckRejected(str(reason))
             after = before + int(delta)
 
             log_dir = get_log_dir(system_conf)
