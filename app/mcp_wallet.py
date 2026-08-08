@@ -17,6 +17,7 @@ wallet_state.json など実データは wallet_service を通じてのみ触る�
 import json
 import os
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from app import config, wallet_service as wallet_module
@@ -912,6 +913,9 @@ def _do_propose_allowance(args: dict) -> str:
 
     # payout_requests へ pending として積む。残高はまだ動かさない。
     # プロセス間 flock で read-modify-write を直列化し、bot プロセスの承認処理との競合を防ぐ
+    # 提案ごとに一意な proposal_id を採番する。承認支給の冪等キー（二重支給防止）と F/B の dedup に使う。
+    # 名前キーで pending を上書きしても、古い通知から古い id で承認されたら「別提案」と分かるようにするため。
+    proposal_id = uuid.uuid4().hex
     store = _payout_store()
     with _payout_locked():
         doc = store._load_doc(store.payout_requests_path, "requests")
@@ -919,6 +923,7 @@ def _do_propose_allowance(args: dict) -> str:
         # 同じ子の未承認提案は1件に保つ（名前をキーにする）
         requests[name] = {
             "name": name,
+            "proposal_id": proposal_id,
             "fixed": fixed,
             "temporary": temporary,
             "total": grant,
@@ -1027,15 +1032,18 @@ def read_pending_proposal(name: str) -> dict | None:
     return None
 
 
-def approve_proposal(name: str, operation_key: str) -> str:
+def approve_proposal(name: str, operation_key: str = "", expected_proposal_id: str = "",
+                     approve_parent_intent: str = "", approve_note: str = "") -> str:
     """未承認の査定提案を承認して実支給する（親承認ハンドラが呼ぶ。in-process）。
 
     提案時のガードレール済みの額をそのまま支給し、payout_requests から提案を消す。支給は
-    operation_key で冪等。提案が無ければその旨を返す。
+    proposal_id 由来の operation_key で冪等。expected_proposal_id が渡された場合は、現在の pending の
+    proposal_id と一致するときだけ支給する（古い親通知から古い提案を承認して二重支給する事故を防ぐ）。
 
     Args:
         name: 子ども名。
-        operation_key: 支給の冪等キー（承認ごとに一意）。
+        operation_key: 後方互換用の冪等キー（省略可）。proposal_id があればそちらから固定生成する。
+        expected_proposal_id: 親通知に載っていた提案の proposal_id。現在の pending と食い違えば支給しない。
 
     Returns:
         str: 親向けの結果メッセージ。
@@ -1052,9 +1060,18 @@ def approve_proposal(name: str, operation_key: str) -> str:
         if not isinstance(req, dict) or req.get("status") != "pending":
             return f"「{target}」の承認待ちの査定は無いよ。"
 
-        op_key = str(operation_key or "").strip()
+        # 二重支給防止: 承認しようとした提案 id と、現在の pending の id が食い違うなら、
+        # その提案は新しい提案に置き換わっている。古い額を支給しない（親には置き換わった旨を伝える）。
+        cur_pid = str(req.get("proposal_id", "")).strip()
+        exp_pid = str(expected_proposal_id or "").strip()
+        if exp_pid and cur_pid and exp_pid != cur_pid:
+            return f"{target} の査定はそのあと新しい内容に変わったよ。最新の内容を確認してから承認してね。"
+
+        # 支給の冪等キーは proposal_id から固定生成する（AI の自由キーに依存しない）。propose 前の
+        # 古いデータで proposal_id が無い場合だけ、後方互換で渡された operation_key を使う。
+        base_key = cur_pid or str(operation_key or "").strip()
         # 他 tool と冪等空間を共有するため、承認支給も子ども・操作種別で名前空間化する
-        eff_key = _scoped_op_key(target, "allowance_grant", op_key) if op_key else ""
+        eff_key = _scoped_op_key(target, "allowance_grant", base_key) if base_key else ""
         if eff_key and _wallet.is_operation_applied(eff_key):
             # 既適用なら二重支給しない。提案だけ消しておく
             doc["requests"].pop(target, None)
@@ -1082,6 +1099,14 @@ def approve_proposal(name: str, operation_key: str) -> str:
             delta=grant, action="allowance_grant", note=reason,
             operation_key=eff_key,
         )
+        # 子への F/B（opener）生成入力を積む。承認は前向きに「なぜ OK か」の入口を子へ届ける材料。
+        _enqueue_feedback(store, doc, {
+            "name": target, "proposal_id": cur_pid, "kind": "approve",
+            "grant": grant, "before": before, "after": after,
+            "achieved": [str(g.get("title", "")) for g in achieved],
+            "parent_intent": str(approve_parent_intent or "").strip(),
+            "raw_note": str(approve_note or "").strip(),
+        })
         # 承認済みの提案は消す
         doc["requests"].pop(target, None)
         store._save_doc(store.payout_requests_path, doc, "requests")
@@ -1091,11 +1116,66 @@ def approve_proposal(name: str, operation_key: str) -> str:
     return msg
 
 
-def reject_proposal(name: str) -> str:
+def _enqueue_feedback(store, doc: dict, entry: dict) -> None:
+    """子への F/B（opener）生成入力を payout store の feedback_pending キューへ積む。
+
+    承認/却下の core が `_payout_locked()` 内で呼ぶ。bot プロセスが take_pending_feedback で取り出し
+    opener を子 session 上で生成する。同じ子に複数積まれても、取り出し側が最新 proposal_id の1件だけ送る。
+    entry には name / proposal_id / kind / 金額系 / parent_intent / raw_note を入れる。
+
+    Args:
+        store: payout store。
+        doc: _load_doc で読んだ現ドキュメント（requests を含む・呼び出し側が同一 lock 内で save する）。
+        entry: 追記する F/B 生成入力。
+    """
+    # requests と同じドキュメントに feedback_pending リストを同居させる（同一 flock で原子的に保存される）
+    fb = doc.get("feedback_pending")
+    if not isinstance(fb, list):
+        fb = []
+    entry = dict(entry)
+    entry["created"] = datetime.now(_JST).isoformat()
+    fb.append(entry)
+    doc["feedback_pending"] = fb
+
+
+def take_pending_feedback() -> list[dict]:
+    """未処理の子 F/B 生成入力を取り出してキューを空にする（bot プロセスが呼ぶ・in-process）。
+
+    同じ子に複数滞留していたら（再提案→承認/却下が連続した等）、その子は**最新 proposal_id の1件だけ**を返す
+    （古い結果の opener を出さない）。取り出したものは全てキューから消す（送信失敗は log-and-drop・再enqueueしない）。
+
+    Returns:
+        list[dict]: 子ごとに最新1件の F/B 生成入力。無ければ空。
+    """
+    store = _payout_store()
+    with _payout_locked():
+        doc = store._load_doc(store.payout_requests_path, "requests")
+        fb = doc.get("feedback_pending")
+        if not isinstance(fb, list) or not fb:
+            return []
+        # 子ごとに最後（最新）のエントリだけ残す。created 昇順で来る前提で、後勝ちで畳む
+        latest_by_child: dict[str, dict] = {}
+        for e in fb:
+            if isinstance(e, dict) and e.get("name"):
+                latest_by_child[str(e["name"])] = e
+        # キューは全消し（取りこぼしの再送はしない＝重複 opener 防止）
+        doc["feedback_pending"] = []
+        store._save_doc(store.payout_requests_path, doc, "requests")
+        return list(latest_by_child.values())
+
+
+def reject_proposal(name: str, note: str = "", parent_intent: str = "", expected_proposal_id: str = "") -> str:
     """未承認の査定提案を却下する（残高は動かさない）。親承認ハンドラが呼ぶ。
+
+    却下時、子への opener 生成に必要な入力を feedback_pending へ積む。note（親の生一言）は
+    子出力へそのまま出さないため、翻訳済み parent_intent があればそれを、無ければ note を後段（bot 側）で
+    翻訳する材料として渡す。expected_proposal_id が現 pending と食い違えば「新しい提案に変わった」と返す。
 
     Args:
         name: 子ども名。
+        note: 親が却下時に添えた一言（生・text 経路）。子出力へは出さない。
+        parent_intent: 親会話 claude が翻訳済みの意図（AI 経路）。あれば feedback へこちらを使う。
+        expected_proposal_id: 親通知に載っていた提案 id。現 pending と食い違えば却下しない。
 
     Returns:
         str: 親向けの結果メッセージ。
@@ -1108,9 +1188,21 @@ def reject_proposal(name: str) -> str:
         req = doc["requests"].get(target)
         if not isinstance(req, dict) or req.get("status") != "pending":
             return f"「{target}」の承認待ちの査定は無いよ。"
+        cur_pid = str(req.get("proposal_id", "")).strip()
+        exp_pid = str(expected_proposal_id or "").strip()
+        if exp_pid and cur_pid and exp_pid != cur_pid:
+            return f"{target} の査定はそのあと新しい内容に変わったよ。最新の内容を確認してから見送りを決めてね。"
+        total = int(req.get("total", 0))
         doc["requests"].pop(target, None)
+        # 子への F/B（opener）生成入力を積む。生 note は raw_note として持たせ、opener 生成入力には
+        # parent_intent だけを使う（bot 側で翻訳・出力レベル invariant で守る）。
+        _enqueue_feedback(store, doc, {
+            "name": target, "proposal_id": cur_pid, "kind": "reject",
+            "total": total, "parent_intent": str(parent_intent or "").strip(),
+            "raw_note": str(note or "").strip(),
+        })
         store._save_doc(store.payout_requests_path, doc, "requests")
-    return f"{target} の査定を却下したよ。残高は変わっていないよ。"
+    return f"{target} の査定を見送ったよ。残高は変わっていないよ。"
 
 
 # ------------------------------------------------------------------
