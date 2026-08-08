@@ -722,6 +722,80 @@ async def maybe_handle_parent_announce(message: discord.Message, content: str) -
     return True
 
 
+def _split_child_name(rest: str) -> tuple[str, str]:
+    """『名前 ID <一言>』の先頭から、登録済み児童名を最長前方一致で切り出す。
+
+    子名にスペースが含まれ得るため（例「山田 太郎」）、単純な `\\S+` 分割だと名前を壊す。登録名の中から
+    rest の先頭に一致する最も長いものを名前として採り、残りを tail（ID＋一言）として返す（codex #5）。
+
+    Args:
+        rest: コマンドの『査定承認/却下 』以降の文字列。
+
+    Returns:
+        tuple[str, str]: (登録名, 残り)。名前が特定できなければ ("", rest)。
+    """
+    from app.config import load_all_users
+    names = sorted(
+        (str(u.get("name", "")).strip() for u in load_all_users()),
+        key=len, reverse=True,  # 長い名前を先に試す（最長一致）
+    )
+    r = rest.strip()
+    for nm in names:
+        if not nm:
+            continue
+        if r == nm:
+            return nm, ""
+        if r.startswith(nm) and len(r) > len(nm) and r[len(nm)] in (" ", "　"):
+            return nm, r[len(nm):].strip()
+    # 登録名に一致しなければ、先頭トークンを名前とみなすフォールバック
+    parts = r.split(maxsplit=1)
+    if parts:
+        return parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
+    return "", r
+
+
+async def _drive_assessment_feedback() -> None:
+    """承認/却下で積まれた子 F/B（opener）を取り出し、各子のチャンネルへ opener を生成・送信する。
+
+    mcp_wallet が feedback_pending に積んだ入力を bot 側で取り出し（子ごと最新1件）、子チャンネルを
+    reminder の既存機構で解決して generate_assessment_feedback を呼ぶ。子チャンネルが特定できなければ
+    送らず診断ログに残す（誤送信防止）。テキストコマンド・親 AI 会話の両入口から同じ本関数を呼ぶ。
+    """
+    from app import mcp_wallet
+    from app.config import find_child_user_by_name
+    from app.conv.ai_conversation import generate_assessment_feedback
+    try:
+        feedbacks = mcp_wallet.take_pending_feedback()
+    except Exception:
+        feedbacks = []
+    if not feedbacks:
+        return
+    # 子チャンネルを既存機構で解決（メンバー照合→チャンネル名一意一致・複数候補は送らない）
+    try:
+        channels = await _reminder_service._child_channels()
+    except Exception:
+        channels = {}
+    for fb in feedbacks:
+        child = str(fb.get("name", "")).strip()
+        conf = find_child_user_by_name(child)
+        channel = channels.get(child)
+        if conf is None or channel is None:
+            # 子チャンネルが特定できないときは送らない（別の子へ誤送信しない）。診断へ残す
+            try:
+                _reminder_service._write_runtime_diagnostic({
+                    "event": "assessment_feedback_no_child_channel",
+                    "severity": "warn", "child": child,
+                })
+            except Exception:
+                pass
+            continue
+        try:
+            await generate_assessment_feedback(channel, conf, fb)
+        except Exception:
+            # 1件の失敗で後続を止めない（再enqueueはしない＝重複opener防止）
+            pass
+
+
 async def maybe_handle_assessment_approve(message: discord.Message, content: str) -> bool:
     """「査定承認 [名前]」「査定却下 [名前]」で査定支給の提案を承認/却下する（親のみ）。
 
@@ -737,22 +811,32 @@ async def maybe_handle_assessment_approve(message: discord.Message, content: str
     mention_body = extract_input_from_mention(body, _client.user)
     target = (mention_body if mention_body is not None else body).strip()
 
-    # 「査定承認 名前」「査定却下 名前」の形式にマッチする
+    # 「査定承認 …」「査定却下 …」の形式。以降は名前・proposal_id・一言に分解する（登録名最長前方一致）
     m_approve = re.match(r"^査定承認\s+(.+)$", target)
     m_reject = re.match(r"^査定却下\s+(.+)$", target)
     if not m_approve and not m_reject:
         return False
 
     from app import mcp_wallet
+    rest = (m_approve or m_reject).group(1).strip()
+    # 子名にスペースが含まれ得るため、登録済み児童名の最長前方一致で名前を切り出す（codex #5）
+    name, tail = _split_child_name(rest)
+    if not name:
+        await message.channel.send("どのお子さんの査定か分からなかったよ。`査定承認 名前 ID` の形で送ってね。")
+        return True
+    # 残りを proposal_id と一言に分ける。1つ目のトークンが proposal_id、以降が一言（却下時のみ意味を持つ）
+    parts = tail.split(maxsplit=1)
+    expected_pid = parts[0].strip() if parts else ""
+    note = parts[1].strip() if len(parts) > 1 else ""
+
     if m_approve:
-        name = m_approve.group(1).strip()
-        # 承認ごとに一意な冪等キー。message id を使い、二重承認で二重支給しない
-        op_key = f"assessment_approve:{name}:{getattr(message, 'id', '')}"
-        result = mcp_wallet.approve_proposal(name, op_key)
+        # operation_key は proposal_id 側で固定生成するため空でよい。expected_proposal_id で二重支給を防ぐ
+        result = mcp_wallet.approve_proposal(name, expected_proposal_id=expected_pid)
     else:
-        name = m_reject.group(1).strip()
-        result = mcp_wallet.reject_proposal(name)
+        result = mcp_wallet.reject_proposal(name, note=note, expected_proposal_id=expected_pid)
     await message.channel.send(result)
+    # 承認/却下の結果を、子へ opener として届ける（生きた会話へ委ねる口火・N-11.14 是正設計②）
+    await _drive_assessment_feedback()
     return True
 
 

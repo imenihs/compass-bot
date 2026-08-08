@@ -682,6 +682,15 @@ async def _on_message_impl(message: discord.Message):
             child_names = [str(u.get("name", "")) for u in load_all_users() if u.get("name")]
             await handle_parent_conversation(message.channel, message.author.id, input_block, child_names)
             _mark_thinking_sent(message, True)
+            # 親 AI 会話で承認/却下された場合、mcp_wallet が feedback_pending へ積む。bot 側で取り出して
+            # 子へ opener を届ける（入口差を作らない・テキストコマンドと同じ driver）。
+            try:
+                await handlers_parent._drive_assessment_feedback()
+            except Exception as e:
+                _log_runtime_event(
+                    system_conf, message, None, input_block,
+                    "assessment_feedback_drive_error", {"error": f"{type(e).__name__}: {e}"},
+                )
             return
 
     if user_conf is None:

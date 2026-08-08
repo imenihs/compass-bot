@@ -397,22 +397,36 @@ def _tool_defs() -> list[dict]:
             },
             {
                 "name": "parent_approve_assessment",
-                "description": "親が指定した子どもの承認待ちの査定を承認して支給する。対象があいまいなら聞き返す。",
+                "description": (
+                    "親が指定した子どもの承認待ちの査定を承認して支給する。対象があいまいなら聞き返す。"
+                    "parent_intent には親の意図を第三者視点で短く翻訳して入れる（子への伝え方の材料。親の生の言葉のコピーにしない）。"
+                    "expected_proposal_id には親通知に載っていた提案の ID を入れる（古い提案の二重支給を防ぐ）。"
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "description": "対象の子どもの名前"},
                         "operation_key": op_key,
+                        "parent_intent": {"type": "string", "description": "親の意図（第三者視点の翻訳・任意）"},
+                        "expected_proposal_id": {"type": "string", "description": "親通知の提案ID（任意・二重支給防止）"},
                     },
                     "required": ["name", "operation_key"],
                 },
             },
             {
                 "name": "parent_reject_assessment",
-                "description": "親が指定した子どもの承認待ちの査定を却下する（残高は変わらない）。",
+                "description": (
+                    "親が指定した子どもの承認待ちの査定を却下する（残高は変わらない）。"
+                    "parent_intent には親がなぜ見送ったかを第三者視点で短く翻訳して入れる（子への伝え方の材料。親の生の言葉のコピーにしない）。"
+                    "expected_proposal_id には親通知に載っていた提案の ID を入れる。"
+                ),
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"name": {"type": "string", "description": "対象の子どもの名前"}},
+                    "properties": {
+                        "name": {"type": "string", "description": "対象の子どもの名前"},
+                        "parent_intent": {"type": "string", "description": "親の意図（第三者視点の翻訳・任意）"},
+                        "expected_proposal_id": {"type": "string", "description": "親通知の提案ID（任意）"},
+                    },
                     "required": ["name"],
                 },
             },
@@ -1300,8 +1314,13 @@ def _do_parent_approve_assessment(args: dict) -> str:
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
         return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
-    # 既存の親承認ロジック（4層ガード再適用・flock・冪等）をそのまま使う
-    return approve_proposal(str(conf.get("name", "")), op_key)
+    # 親 AI は自然文から意図を汲んで parent_intent（第三者視点の翻訳）を渡す。子 F/B の材料になる。
+    # 二重支給防止のため expected_proposal_id も受ける（親通知に載っていた id）。
+    return approve_proposal(
+        str(conf.get("name", "")), op_key,
+        expected_proposal_id=str(args.get("expected_proposal_id") or "").strip(),
+        approve_parent_intent=str(args.get("parent_intent") or "").strip(),
+    )
 
 
 def _do_parent_reject_assessment(args: dict) -> str:
@@ -1311,7 +1330,12 @@ def _do_parent_reject_assessment(args: dict) -> str:
     conf = _resolve_parent_target(str(args.get("name", "")))
     if conf is None:
         return f"「{args.get('name')}」という子どもは見つからなかったよ。"
-    return reject_proposal(str(conf.get("name", "")))
+    # 親 AI が翻訳した parent_intent を渡す（子出力へは翻訳済みだけが届く・生 note は入れない）。
+    return reject_proposal(
+        str(conf.get("name", "")),
+        parent_intent=str(args.get("parent_intent") or "").strip(),
+        expected_proposal_id=str(args.get("expected_proposal_id") or "").strip(),
+    )
 
 
 def _do_parent_list_balances(args: dict) -> str:
