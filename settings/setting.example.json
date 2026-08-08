@@ -1,9 +1,9 @@
 {
-  "web_base_url": "https://example.com",
+  "web_base_url": "https://compass.example.com",
+  "_comment_allow_channel_ids": "Botが反応するチャンネルID配列。運用前提: チャンネルには親が必要最小限しか登録せず、子ども用チャンネルは基本その子専用にする。査定結果の子への通知(opener)は子ども用チャンネルへ送り親が見守れるようにするため、1チャンネルに複数の子がいる共有チャンネルには送らない(他の子に見えるのを防ぐ)。",
   "allow_channel_ids": [
     222222222222222222
   ],
-  "gemini_model": "models/gemini-2.5-flash",
   "bot_personality": "sibling",
   "assess_keyword": "査定し金額を変更します。",
   "force_assess_test_keyword": "FORCE_ASSESS_TEST-REPLACE_ME",

@@ -770,27 +770,33 @@ async def _resolve_child_channels_strict() -> tuple[dict, dict]:
         rs = _reminder_service
         users = rs.load_all_users()
         user_by_discord_id = {int(u["discord_user_id"]): u for u in users if u.get("discord_user_id")}
+        # 運用前提：チャンネルには親が必要最小限しか登録しない＝子チャンネルは基本その子専用（社長方針）。
+        # よって opener は子チャンネルへ送る（親が見守れる。DM は親が把握できず不可）。子の特定は既存の
+        # _channel_users（メンバー実体→取れなければチャンネル名一意一致）を使う。ただし保険として、
+        # メンバー実体で「明確に複数の子」が検出できたチャンネルは共有とみなし送らない（誤登録事故の防止）。
         for channel_id in rs.allow_channel_ids:
             channel = rs.client.get_channel(channel_id)
             if channel is None:
                 channel = await rs.client.fetch_channel(channel_id)
-            # opener の送信先は「実メンバーで専用と確認できたチャンネル」に限る（codex 最終指摘）。
-            # _channel_users はメンバーキャッシュが空のときチャンネル名一致で補完するが、名前一致は
-            # 「そのチャンネルに他の子がいない」を保証しない（共有チャンネルへ誤送信し得る）。よって
-            # ここではメンバーキャッシュから直接、そのチャンネルにいる登録児童を数える（名前補完は使わない）。
+            # メンバー実体で複数の子が明確に見えたら共有チャンネル。opener を送らない（他の子に見える誤送信防止）
             member_ids = {
                 int(getattr(m, "id", 0)) for m in getattr(channel, "members", []) if getattr(m, "id", None)
             }
-            member_users = [user_by_discord_id[mid] for mid in member_ids if mid in user_by_discord_id]
-            is_private = len(member_users) == 1  # メンバー実体で子が1人だけ＝専用チャンネル
-            for user_conf in member_users:
+            member_children = [user_by_discord_id[mid] for mid in member_ids if mid in user_by_discord_id]
+            if len(member_children) >= 2:
+                # 共有チャンネル：そこにいる子全員の候補数を増やし（送信先には採らない）、opener を出さない
+                for user_conf in member_children:
+                    nm = str(user_conf.get("name", "")).strip()
+                    if nm:
+                        count_by_name[nm] = count_by_name.get(nm, 0) + 1
+                continue
+            # 単独 or キャッシュ空：_channel_users（名前補完込み）で子を特定して送信先候補にする
+            for user_conf in rs._channel_users(channel, users, user_by_discord_id):
                 nm = str(user_conf.get("name", "")).strip()
                 if not nm:
                     continue
                 count_by_name[nm] = count_by_name.get(nm, 0) + 1
-                # その子専用チャンネル（実メンバーで1人だけ）のときだけ送信先候補にする
-                if is_private:
-                    channel_by_name.setdefault(nm, channel)
+                channel_by_name.setdefault(nm, channel)
     except Exception:
         return {}, {}
     return channel_by_name, count_by_name
