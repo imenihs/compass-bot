@@ -1274,7 +1274,8 @@ async def judge_safety(user_conf: dict, input_text: str) -> dict | None:
         # AI 判定の失敗で安全機能を止めない。Python の床だけで続行する
         _diag("safety_ai_judge_error", {"child": child_name, "error": f"{type(e).__name__}: {e}"})
 
-    merged = safety.merge_judgments(py_result, ai_result)
+    # 発話原文を渡す。正規表現の網羅漏れでカテゴリが落ちても家族語で虐待へ格上げするため
+    merged = safety.merge_judgments(py_result, ai_result, source_text=input_text)
     if merged:
         _diag("safety_signal_detected", {
             "child": child_name,

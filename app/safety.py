@@ -53,11 +53,23 @@ _URGENT_SELF_HARM = [
 # 家庭内の加害者を表す語を広く列挙し、暴力語と組み合わせて検出する。
 # 「お父さんに殴られた」を _BULLYING の「殴られ」に先取りされると虐待が親へ通知されるため、
 # 加害者語 × 暴力語の組み合わせは必ずこちらで拾う（実機テストで再現した事故）。
-_FAMILY = r"(親|おや|父|ちち|お父さん|おとうさん|パパ|とうちゃん|母|はは|お母さん|おかあさん|ママ|かあちゃん|義父|義母|継父|継母|兄|姉|じいちゃん|ばあちゃん|祖父|祖母|家族|うち)"
-_VIOLENCE = r"(殴|なぐ|叩|たた|蹴|け|ぶた|暴力|どなら|怒鳴ら|投げつけ|閉じ込め|首をしめ|しめられ)"
+_FAMILY = (r"(親|おや|父|ちち|お父さん|おとうさん|おとん|パパ|とうちゃん|"
+           r"母|はは|お母さん|おかあさん|おかん|ママ|かあちゃん|"
+           r"義父|義母|継父|継母|兄|姉|じいちゃん|ばあちゃん|祖父|祖母|家族|うちの人)")
+# 暴力語。1文字の平仮名（け・ぶた）は日常語と衝突するため活用形に限定する
+# （「兄にけしごむもらった」を虐待と誤検知した反証を反映）。
+_VIOLENCE = (r"(殴|なぐ|叩|たた|蹴られ|蹴って|蹴と|けられ|けって|けとば|"
+             r"ぶたれ|ぶって|暴力|どなら|どなる|怒鳴ら|怒鳴る|投げつけ|閉じ込め|"
+             r"首をしめ|しめられ|手をあげ|どつか|どつく)")
 _ABUSE = [
-    # 家族 × 暴力（受け身・被害の形）。例「お父さんに殴られた」「ママにたたかれる」
-    rf"{_FAMILY}(に|から)[^。！？]{{0,6}}{_VIOLENCE}",
+    # 家族 × 暴力（受け身）。間隔制限を置かない。
+    # 以前は {0,6} で挟んでいたが、子が状況を詳しく話すほど（「お父さんに、宿題やってないからって
+    # 殴られた」）判定を外し bullying に落ちて**親へ通知される**という最悪の逆相関が起きた（反証で実証）。
+    # 句点までを許容し、詳しく話した子ほど守られなくなる事態を防ぐ。
+    rf"{_FAMILY}(に|から)[^。！？\n]*?{_VIOLENCE}",
+    # 家族 × 暴力（能動）。「お父さんが殴ってくる」「パパが蹴ってくる」を拾う。
+    # 受け身形しか見ていなかったため、これらが完全に素通りしていた（反証で実証）。
+    rf"{_FAMILY}(が|は)[^。！？\n]*?{_VIOLENCE}",
     # ネグレクト
     r"家に帰りたくない", r"うちに帰りたくない", r"帰るのがこわい", r"帰るのが怖い",
     r"ごはんがもらえ", r"ごはんが無い", r"ごはんがない", r"ごはんぬき", r"ごはん抜き",
@@ -88,7 +100,7 @@ _GROOMING = [
 
 # 闇バイト・違法な稼ぎ方。金銭文脈に固有
 _ILLEGAL_WORK = [
-    r"簡単に稼げる", r"かんたんに稼げる", r"высок",  # 保険
+    r"簡単に稼げる", r"かんたんに稼げる",
     r"闇バイト", r"やみバイト", r"高額バイト",
     r"受け子", r"出し子", r"叩き",
 ]
@@ -102,7 +114,6 @@ _SUBSTANCE = [
 
 # 摂食障害の兆候。ダイエット関連の購入としてこの BOT に現れる
 _EATING = [
-    r"food",  # 保険
     r"吐いた", r"はいた.*ダイエット", r"食べたのを吐",
     r"下剤", r"げざい", r"痩せ薬", r"やせ薬",
     r"食べるのが怖", r"太るのが怖",
@@ -237,7 +248,90 @@ def build_ai_judge_prompt(text: str, age: int | None) -> str:
     )
 
 
-def merge_judgments(py_result: dict | None, ai_result: dict | None) -> dict | None:
+# AI が返しうるカテゴリ表記のゆれを既知 enum へ写像する。
+# 綴り・大小・日本語・類義語のいずれで返ってきても取りこぼさない。
+_CATEGORY_ALIASES = {
+    "abuse": "abuse", "neglect": "abuse", "sexual_abuse": "abuse",
+    "child_abuse": "abuse", "domestic_violence": "abuse", "dv": "abuse",
+    "虐待": "abuse", "ネグレクト": "abuse", "家庭内暴力": "abuse", "性的虐待": "abuse",
+    "self_harm": "self_harm", "selfharm": "self_harm", "suicide": "self_harm",
+    "suicidal": "self_harm", "自傷": "self_harm", "希死念慮": "self_harm", "自殺": "self_harm",
+    "grooming": "grooming", "sexual_exploitation": "grooming", "exploitation": "grooming",
+    "グルーミング": "grooming", "性的搾取": "grooming",
+    "bullying": "bullying", "violence": "bullying", "いじめ": "bullying", "暴力": "bullying",
+    "illegal_work": "illegal_work", "illegal": "illegal_work", "闇バイト": "illegal_work",
+    "eating": "eating", "eating_disorder": "eating", "摂食障害": "eating",
+    "substance": "substance", "drug": "substance", "smoking": "substance",
+    "alcohol": "substance", "薬物": "substance", "喫煙": "substance", "飲酒": "substance",
+    "none": "none", "なし": "none", "no": "none", "safe": "none",
+}
+
+_PERPETRATOR_ALIASES = {
+    "family": "family", "parent": "family", "father": "family", "mother": "family",
+    "家族": "family", "親": "family", "父": "family", "母": "family",
+    "outside": "outside", "other": "outside", "stranger": "outside", "friend": "outside",
+    "classmate": "outside", "家族以外": "outside", "他人": "outside", "友達": "outside",
+    "unknown": "unknown", "不明": "unknown",
+}
+
+
+def _normalize_category(value) -> str | None:
+    """AI が返したカテゴリ文字列を既知 enum へ正規化する（fail-safe つき）。
+
+    厳密等価で比較すると "Abuse" "虐待" "neglect" 等が未知値として素通りし、
+    虐待が親へ直送される（有識者の反証で実証）。表記ゆれを吸収したうえで、
+    **どうしても判別できない値は "abuse" に倒す**。分類できないものを親へ通知するより、
+    送らずに記録するほうが害が小さいためである（安全側の既定）。
+
+    Args:
+        value: AI が返した category の値。
+
+    Returns:
+        str | None: 既知 enum。値が無ければ None。
+    """
+    if value is None:
+        return None
+    key = str(value).strip().lower().rstrip(".。!！?？")
+    if not key:
+        return None
+    if key in _CATEGORY_ALIASES:
+        return _CATEGORY_ALIASES[key]
+    # 部分一致でも拾う（"possible_abuse" "abuse_suspected" 等）
+    for alias, canon in _CATEGORY_ALIASES.items():
+        if alias in key and alias != "none":
+            return canon
+    # 未知値は安全側へ倒す。親へ送らない側の分類にする
+    return "abuse"
+
+
+def _normalize_perpetrator(value) -> str:
+    """AI が返した加害者の値を既知 enum へ正規化する。判別できなければ unknown。
+
+    unknown は「家族の可能性を否定できない」として親通知を止める側に働くため、
+    ここでの fail-safe は unknown で足りる。
+    """
+    if value is None:
+        return "unknown"
+    key = str(value).strip().lower()
+    if key in _PERPETRATOR_ALIASES:
+        return _PERPETRATOR_ALIASES[key]
+    for alias, canon in _PERPETRATOR_ALIASES.items():
+        if alias in key:
+            return canon
+    return "unknown"
+
+
+def contains_family_word(text: str) -> bool:
+    """発話に家族を指す語が含まれるか（虐待の取りこぼしを防ぐ後段チェック用）。
+
+    正規表現の間隔制限や活用形の網羅漏れでカテゴリが bullying に落ちても、
+    家族語が同一発話にあれば虐待として扱い直すために使う。
+    """
+    return bool(re.search(_FAMILY, _normalize(text or "")))
+
+
+def merge_judgments(py_result: dict | None, ai_result: dict | None,
+                    source_text: str = "") -> dict | None:
     """Python の床と AI の意味判断を統合する（二重化の要）。
 
     方針は3つ。
@@ -256,7 +350,11 @@ def merge_judgments(py_result: dict | None, ai_result: dict | None) -> dict | No
         dict | None: 統合結果。どちらも検知なしなら None。
     """
     ai = ai_result or {}
-    ai_cat = ai.get("category")
+    # AI が返す文字列は綴り・大小・言語がぶれる。厳密等価で見ると "Abuse" "虐待" "neglect" 等が
+    # 未知値として素通りし、**虐待が親へ直送される**（有識者の反証で実証）。
+    # よって既知 enum へ正規化し、**未知値は abuse 相当（＝親へ送らない）へ fail-safe** で倒す。
+    # 「分類できないものを通知する」より「分類できないものは送らない」ほうが害が小さい。
+    ai_cat = _normalize_category(ai.get("category"))
     ai_said_none = ai_cat == "none"
     if ai_said_none:
         ai_cat = None
@@ -270,15 +368,21 @@ def merge_judgments(py_result: dict | None, ai_result: dict | None) -> dict | No
     except (TypeError, ValueError):
         confidence = 0.0
     confidence = min(max(confidence, 0.0), 1.0)
-    # AI が見た加害者。family なら虐待として扱い親へ送らない
-    perpetrator = ai.get("perpetrator") if ai.get("perpetrator") in ("family", "outside", "unknown") else "unknown"
+    # AI が見た加害者。表記ゆれを吸収し、判別できなければ unknown（親通知を止める側）
+    perpetrator = _normalize_perpetrator(ai.get("perpetrator"))
+    # 発話に家族語があるか。正規表現の網羅漏れでカテゴリが bullying に落ちても、
+    # ここで虐待へ格上げして親通知を止める（カテゴリ順の先取り勝ちに依存しない後段チェック）
+    family_in_text = contains_family_word(source_text) if source_text else False
 
     # AI が明示的に「危険でない」と判断した場合は、通知せず記録だけに落とす。
     # Python 床は意図的に粗く言葉の綾を拾う（実測「この機能は消えたい…じゃなくて消したい」を
     # self_harm と誤検知）。毎回親へ送ると親が麻痺し本当の信号を見落とす（狼少年化）。
     # ただし確信度が低い否定（0.7未満）は AI 自身が迷っているので、抑制せず通常判定へ回す。
     # 虐待は AI が否定しても抑制しない（見逃しの損失が回復不能なため必ず記録を残す）。
-    if ai_said_none and py_cat and py_cat != "abuse" and confidence >= 0.7:
+    # 家族語を含む発話は抑制しない。B の穴で bullying に落ちた虐待の告白が、
+    # AI の否定で抑制されると**親にも子にも何も出ない完全沈黙**になる（反証で実証）。
+    if (ai_said_none and py_cat and py_cat != "abuse"
+            and not family_in_text and confidence >= 0.7):
         return {
             "category": py_cat,
             "urgency": (py_result or {}).get("urgency", "medium"),
@@ -302,7 +406,8 @@ def merge_judgments(py_result: dict | None, ai_result: dict | None) -> dict | No
 
     # カテゴリは、虐待が絡むなら虐待を優先する（親通知を止める側へ倒すため）。
     # AI が「加害者は家族」と見たら、カテゴリ名に関わらず虐待として扱う（bullying と誤ラベルされても救う）。
-    if ai_cat == "abuse" or py_cat == "abuse" or perpetrator == "family":
+    if (ai_cat == "abuse" or py_cat == "abuse" or perpetrator == "family"
+            or (family_in_text and (ai_cat or py_cat) in ("bullying", "self_harm"))):
         category = "abuse"
     else:
         category = ai_cat or py_cat
@@ -364,6 +469,14 @@ _NAME_LIKE = re.compile(
     r"([一-龥ぁ-んァ-ヶA-Za-z]{1,6})(くん|君|ちゃん|さん|先輩|後輩)"
 )
 
+# 伏せてはいけない語。家族や先生を「（同じくらいの子）さん」に化かすと、
+# 親が通知を読んでも**家庭内の話だと分からなくなる**（反証で実証）。関係性こそ親の判断材料になる。
+_NO_REDACT = (
+    "お父さん", "おとうさん", "お母さん", "おかあさん", "おじいちゃん", "おばあちゃん",
+    "お兄ちゃん", "おにいちゃん", "お姉ちゃん", "おねえちゃん", "とうちゃん", "かあちゃん",
+    "おじさん", "おばさん", "先生", "せんせい",
+)
+
 
 def redact_third_party(text: str) -> str:
     """原文から第三者の実名らしき箇所を伏せる（親へ渡す前の加工）。
@@ -377,7 +490,15 @@ def redact_third_party(text: str) -> str:
     Returns:
         str: 実名を伏せた文字列。
     """
-    return _NAME_LIKE.sub(lambda m: f"（同じくらいの子）{m.group(2)}", text or "")
+    def _sub(m):
+        whole = m.group(0)
+        # 家族・先生はそのまま残す（誰との間の出来事かが親の判断材料になる）
+        for keep in _NO_REDACT:
+            if keep in whole:
+                return whole
+        return f"（同じくらいの子）{m.group(2)}"
+
+    return _NAME_LIKE.sub(_sub, text or "")
 
 
 def build_parent_notification(child_name: str, judgment: dict, raw_text: str,

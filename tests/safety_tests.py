@@ -93,8 +93,12 @@ def _test_merge_or_and_suppression():
     r = safety.merge_judgments(safety.detect("もう死にたい"), None)
     _check("or_python_catches", r and r["category"] == "self_harm" and r["notify_parent"] is True, r)
 
-    # Python 床がすり抜けても AI が拾う（方言）
-    _check("floor_misses_dialect", safety.detect("おとんにどつかれてん") is None)
+    # 方言は床でも拾えるようにした（「おとん」「どつく」を語彙へ追加）。
+    # ただし床の網羅には限界があるため、AI 単独でも拾えることを併せて担保する。
+    _check("floor_catches_known_dialect",
+           (safety.detect("おとんにどつかれてん") or {}).get("category") == "abuse",
+           safety.detect("おとんにどつかれてん"))
+    # 床が知らない言い回しは AI が拾う（床を None にして AI 単独経路を検証）
     r = safety.merge_judgments(None, {"category": "abuse", "urgency": "high",
                                       "confidence": 0.85, "perpetrator": "family", "uncertain": False})
     _check("or_ai_catches_dialect", r and r["category"] == "abuse", r)
@@ -117,12 +121,71 @@ def _test_merge_or_and_suppression():
     _check("both_none", safety.merge_judgments(None, {"category": "none", "confidence": 0.9}) is None)
 
 
+def _test_critical_leak_paths():
+    """有識者の反証で再現した、虐待が親へ漏れる3経路が塞がっていること。
+
+    ここが再発すると子を加害者に売ることになる。実装変更のたびに必ず検証する。
+    """
+    # 【A】AI のカテゴリ表記がぶれても親へ送らない（厳密等価で見ていたため漏洩していた）
+    for value in ["abuse", "Abuse", "ABUSE", "abuse.", "虐待", "neglect",
+                  "sexual_abuse", "家庭内暴力", "possible_abuse", "未知の値xyz"]:
+        r = safety.merge_judgments(None, {"category": value, "urgency": "urgent",
+                                          "confidence": 0.9, "perpetrator": "unknown",
+                                          "uncertain": False})
+        _check(f"leakA_category_variant[{value}]",
+               r is not None and r["notify_parent"] is False,
+               f"got={r}")
+
+    # 【B】子が詳しく話しても虐待判定を外さない（間隔制限で bullying に落ち親へ漏れていた）
+    for text in ["お父さんにひどく殴られた",
+                 "お父さんにものすごくひどく殴られた",
+                 "きのうの夜、お父さんにお酒のんでるときに殴られた",
+                 "お父さんに、宿題やってないからって殴られた",
+                 "お父さんに、また、いつもみたいに殴られた"]:
+        r = safety.detect(text)
+        _check(f"leakB_detailed_abuse[{text[:18]}]",
+               r is not None and r["category"] == "abuse", f"got={r}")
+
+    # 【B】能動態も拾う（受け身形しか見ておらず完全に素通りしていた）
+    for text in ["お父さんはいつも私を殴る", "お父さんが殴ってくる", "パパが蹴ってくる"]:
+        r = safety.detect(text)
+        _check(f"leakB_active_voice[{text[:16]}]",
+               r is not None and r["category"] == "abuse", f"got={r}")
+
+    # 【C】家族語がある発話は AI が否定しても抑制しない（親にも子にも何も出ない完全沈黙の防止）
+    text = "お父さんにものすごくひどく殴られた"
+    r = safety.merge_judgments(safety.detect(text),
+                               {"category": "none", "urgency": "none", "confidence": 0.95,
+                                "perpetrator": "unknown", "uncertain": False},
+                               source_text=text)
+    _check("leakC_no_silence_when_family_word",
+           r is not None and not r.get("suppressed_by_ai") and r["category"] == "abuse", f"got={r}")
+
+    # 加害者の表記ゆれも吸収する
+    for value in ["family", "Family", "家族", "parent", "父"]:
+        r = safety.merge_judgments(None, {"category": "bullying", "urgency": "high",
+                                          "confidence": 0.9, "perpetrator": value,
+                                          "uncertain": False})
+        _check(f"leakA_perpetrator_variant[{value}]",
+               r is not None and r["notify_parent"] is False, f"got={r}")
+
+    # 誤検知が戻っていないこと（1文字の平仮名パターンで日常語を拾っていた）
+    for text in ["兄にけしごむもらった", "お母さんからけしゴムもらった", "父からけーきもらった"]:
+        _check(f"leak_no_regression_false_positive[{text[:14]}]",
+               safety.detect(text) is None, f"got={safety.detect(text)}")
+
+
 def _test_notification_content():
     """親への通知が、第三者の実名を伏せ、本人の意向を明記すること。"""
     j = {"category": "bullying", "urgency": "high", "confidence": 0.85,
          "ai_reason": "クラスの子からの暴力の訴え。"}
     body = safety.build_parent_notification("たろう", j, "田中くんに殴られた", child_consent="refused")
     _check("redact_third_party_name", "田中" not in body, body[:120])
+    # 家族語・先生は伏せない（伏せると親が家庭内の話だと分からなくなる）
+    for keep in ["お父さん", "お母さん", "お姉ちゃん", "おばあちゃん", "先生"]:
+        _check(f"redact_keeps_family[{keep}]",
+               keep in safety.redact_third_party(f"{keep}に殴られた"),
+               safety.redact_third_party(f"{keep}に殴られた"))
     _check("keeps_relation_hint", "同じくらいの子" in body, body[:120])
     _check("states_child_refused", "知らせたくない" in body, body[:160])
     _check("warns_not_to_interrogate", "問い詰め" in body, body[:200])
@@ -204,6 +267,7 @@ def main():
     _test_python_floor()
     _test_merge_abuse_never_to_parent()
     _test_merge_or_and_suppression()
+    _test_critical_leak_paths()
     _test_notification_content()
     _test_hotlines_are_constants()
     _test_routing()

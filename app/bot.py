@@ -1,3 +1,4 @@
+import contextlib
 import asyncio
 import os
 import json
@@ -773,6 +774,45 @@ async def _on_message_impl(message: discord.Message):
                 f"`{proxy_name}` はユーザー設定に見つからなかったよ。`settings/users/*.json` の `name` を確認してね。"
             )
             return
+    # 安全判定はここで**前倒しに起動**する（N-11.16）。
+    # 以前は _on_message_impl の最下流にあり、手前の 30 箇所以上の return
+    # （空入力・未登録・親専用コマンドの誤ヒット等）を通った発話が一切判定されなかった。
+    # 仕様上、安全は【処理の優先順位】1) に属し査定・観察より優先するため、実装も最上流へ置く。
+    # 会話の成否に依存しない独立 spawn なので、この時点で起動して差し支えない。
+    # タスク自身が判定から通知までを完結させる。呼び出し側が await しなくても通知が出る形にする。
+    # 上流で起動しても、手前の return（空入力・未登録・コマンド誤ヒット等）で await されなければ
+    # 通知は出ない。安全は「どの経路を通っても必ず届く」ことが要件なので、自己完結型にする。
+    safety_task = None
+    if user_conf is not None and input_block:
+        async def _judge_and_notify(_conf=user_conf, _text=input_block, _sys=system_conf):
+            try:
+                from app.conv.ai_conversation import judge_safety
+                judgment = await judge_safety(_conf, _text)
+            except Exception as e:
+                _log_runtime_event(
+                    _sys, message, _conf, _text,
+                    "safety_judge_failed", {"error": f"{type(e).__name__}: {e}"},
+                )
+                return None
+            if judgment:
+                try:
+                    await _handle_safety_signal(_sys, message, _conf, _text, judgment)
+                except Exception as e:
+                    # 通知の失敗は絶対に握り潰さない
+                    _log_runtime_event(
+                        _sys, message, _conf, _text,
+                        "safety_notify_failed", {"error": f"{type(e).__name__}: {e}"},
+                    )
+            return judgment
+
+        try:
+            safety_task = asyncio.create_task(_judge_and_notify())
+        except Exception as e:
+            _log_runtime_event(
+                system_conf, message, user_conf, input_block,
+                "safety_judge_spawn_failed", {"error": f"{type(e).__name__}: {e}"},
+            )
+
     elif is_parent(message.author.id):
         # 親が子ども用チャンネルで自然言語入力した場合は、そのチャンネルの子を対象にする
         channel_child_conf = _find_channel_child_user_conf(message)
@@ -904,24 +944,15 @@ async def _on_message_impl(message: discord.Message):
     # 安全判定は会話と**並行**して走らせる（N-11.16）。会話がタイムアウト・失敗しても
     # 安全判定は必ず行う（安全を会話の成否に依存させない）。また子が返事をせず離脱しても、
     # 検知した時点で通知が確定するため「怖くて逃げた子ほど通知されない」逆相関を防ぐ。
-    from app.conv.ai_conversation import handle_conversation, judge_safety
-    safety_task = asyncio.create_task(judge_safety(user_conf, input_block))
+    from app.conv.ai_conversation import handle_conversation
     try:
         await handle_conversation(message.channel, user_conf, input_block)
     finally:
-        # 会話が例外で落ちても安全通知は必ず処理する
-        try:
-            judgment = await safety_task
-        except Exception as e:
-            judgment = None
-            _log_runtime_event(
-                system_conf, message, user_conf, input_block,
-                "safety_judge_failed", {"error": f"{type(e).__name__}: {e}"},
-            )
-        if judgment:
-            await _handle_safety_signal(
-                system_conf, message, user_conf, input_block, judgment,
-            )
+        # 通知はタスク側で完結済み。ここでは完了を待つだけにする
+        # （待たずに関数を抜けるとタスクが宙に浮くため、会話経路では必ず回収する）
+        if safety_task is not None:
+            with contextlib.suppress(Exception):
+                await safety_task
     _mark_thinking_sent(message, True)
 
     # 査定提案が出ていたら「親チャンネルのみ」へ通知する（是正設計①・N-11.14）。
