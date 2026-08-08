@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""Learning support feature tests.
+
+Plain-script runner to keep this compatible with the existing test style.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+import tempfile
+import types
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import unquote
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+if "discord" not in sys.modules:
+    discord_stub = types.ModuleType("discord")
+    discord_stub.Client = object
+    sys.modules["discord"] = discord_stub
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def test_reflection_context() -> None:
+    from app.reflection_context import build_reflection_context
+
+    with tempfile.TemporaryDirectory(prefix="compass-learning-") as d:
+        root = Path(d)
+        log_dir = root / "logs"
+        now = datetime.now(timezone.utc).isoformat()
+        _write_jsonl(
+            log_dir / "はな_pocket_journal.jsonl",
+            [
+                {"ts": now, "item": "お菓子", "amount": 180, "satisfaction": 3, "reason": "すぐ食べたくなった"},
+                {"ts": now, "item": "お菓子", "amount": 160, "satisfaction": 4, "reason": "なんとなく買った"},
+                {"ts": now, "item": "本", "amount": 900, "satisfaction": 9, "reason": "調べものに使えた"},
+            ],
+        )
+        context = build_reflection_context(
+            {"name": "はな"},
+            {"log_dir": str(log_dir)},
+            audit_state={
+                "wallet_check_penalties": {
+                    "はな": {"ts": now, "diff": -120, "reported": 880, "expected": 1000}
+                }
+            },
+        )
+
+    dashboard_text = "\n".join(context["dashboard_points"])
+    prompt_text = "\n".join(context["prompt_points"])
+    assert "低満足" in dashboard_text
+    assert "満足度が高" in dashboard_text
+    assert "記録漏れ" in dashboard_text
+    assert "罰" not in dashboard_text + prompt_text
+    assert "ペナルティ" not in dashboard_text + prompt_text
+
+
+def test_followup_policy_endpoint_writes_valid_policy_and_rejects_harmful_note() -> None:
+    import app.server as server
+
+    writes: list[tuple[str, str, object]] = []
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_update_user_field = server.update_user_field
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "parent"
+
+    try:
+        server._get_current_user = fake_current_user
+        server._is_admin = lambda username: username == "parent"
+        server.load_all_users = lambda: [{"name": "はな"}]
+
+        def fake_update_user_field(name: str, field: str, value) -> bool:
+            writes.append((name, field, value))
+            return True
+
+        server.update_user_field = fake_update_user_field
+        response = asyncio.run(
+            server.op_followup_policy(
+                session_token="token",
+                target="はな",
+                enabled="on",
+                focus_area="income_balance",
+                nudge_strength="light",
+                frequency="low",
+                parent_note="収入と支出のバランスを軽く意識させたい",
+            )
+        )
+        assert response.status_code == 303
+        assert writes[-1][0:2] == ("はな", "ai_follow_policy")
+        saved = writes[-1][2]
+        assert saved["enabled"] is True
+        assert saved["focus_area"] == "income_balance"
+        assert saved["parent_note"] == "収入と支出のバランスを軽く意識させたい"
+
+        writes.clear()
+        bad_response = asyncio.run(
+            server.op_followup_policy(
+                session_token="token",
+                target="はな",
+                enabled="on",
+                focus_area="record_habit",
+                nudge_strength="normal",
+                frequency="normal",
+                parent_note="兄弟と比べて厳しく叱る",
+            )
+        )
+        assert bad_response.status_code == 303
+        assert writes == []
+        assert "保存できません" in unquote(bad_response.headers["location"])
+    finally:
+        server._get_current_user = old_get_current_user
+        server._is_admin = old_is_admin
+        server.load_all_users = old_load_all_users
+        server.update_user_field = old_update_user_field
+
+
+def test_dashboard_template_renders_policy_form() -> None:
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+    import app.server as server
+
+    env = Environment(
+        loader=FileSystemLoader(str(REPO_ROOT / "templates")),
+        autoescape=select_autoescape(["html", "xml"]),
+    )
+    template = env.get_template("dashboard.html")
+    html = template.render(
+        username="parent",
+        is_admin=True,
+        users=[
+            {
+                "name": "はな",
+                "dashboard_user_type": "child",
+                "dashboard_order_key": "child:はな",
+                "settings_modal_id": "child-settings-modal-1",
+                "fixed_allowance": 500,
+                "balance": 1200,
+                "low_balance": False,
+                "month_spending": 300,
+                "month_count": 2,
+                "last_spent_date": "2026-05-01",
+                "audit_reported": True,
+                "goals": [],
+                "learning_summary": {
+                    "source_label": "振り返りシグナル",
+                    "metrics": [{"label": "記録件数", "value": "2件"}],
+                    "signals": ["低満足の支出は次回の判断材料になります。"],
+                    "parent_hints": ["買う前に一度待つ声かけが向いています。"],
+                },
+                "learning_insights": {
+                    "source": "learning_insights",
+                    "summary_text": "今週は買う前に待つ練習が向いています。",
+                    "metrics": [{"label": "記録件数", "value": "2件"}],
+                    "insight_cards": [
+                        {
+                            "card_id": "card-1",
+                            "type": "repeated_small_spending",
+                            "title": "少額の反復支出",
+                            "evidence_lines": ["お菓子 3回"],
+                            "skill": "待つ",
+                            "parent_question": "次に買う前に一回待ってみる？",
+                            "parent_action": "予算を一緒に決める",
+                            "child_action": "買う前に残り予算を見る",
+                            "avoid": "叱責しない",
+                            "policy_match": "方針に合っています",
+                            "next_observation": "次の記録で見る",
+                        }
+                    ],
+                },
+                "active_growth_plan": None,
+                "settings_form": {
+                    "name": "はな",
+                    "discord_user_id": "101",
+                    "age": 10,
+                    "gender": "female",
+                    "bot_personality": "sibling",
+                    "fixed_allowance": 500,
+                    "temporary_max": 1000,
+                    "fixed_increase_cap": 100,
+                    "penalty_cap": 50,
+                    "keywords": {
+                        "investment": "検定",
+                        "fun": "漫画",
+                        "danger": "課金",
+                    },
+                },
+                "ai_follow_policy": {
+                    "enabled": True,
+                    "focus_area": "income_balance",
+                    "nudge_strength": "light",
+                    "frequency": "low",
+                    "parent_note": "買う前に待つ",
+                },
+            }
+        ],
+        parent_settings=[
+            {
+                "name": "親",
+                "discord_user_id": "202",
+                "dashboard_user_type": "parent",
+                "dashboard_order_key": "parent:親",
+                "settings_modal_id": "parent-settings-modal-1",
+            }
+        ],
+        dashboard_user_rows=[
+            {
+                "name": "はな",
+                "dashboard_user_type": "child",
+                "dashboard_order_key": "child:はな",
+                "settings_modal_id": "child-settings-modal-1",
+                "fixed_allowance": 500,
+                "balance": 1200,
+                "low_balance": False,
+                "month_spending": 300,
+                "month_count": 2,
+                "last_spent_date": "2026-05-01",
+                "audit_reported": True,
+                "goals": [],
+            },
+            {
+                "name": "親",
+                "dashboard_user_type": "parent",
+                "dashboard_order_key": "parent:親",
+                "settings_modal_id": "parent-settings-modal-1",
+            },
+        ],
+        dashboard_user_order_json='["child:はな","parent:親"]',
+        pending_apps=[],
+        user_gender_choices=server.USER_GENDER_CHOICES,
+        bot_personality_choices=server.BOT_PERSONALITY_CHOICES,
+        user_keyword_buckets=server.USER_KEYWORD_BUCKETS,
+        follow_focus_choices=server.FOLLOW_FOCUS_CHOICES,
+        follow_strength_choices=server.FOLLOW_STRENGTH_CHOICES,
+        follow_frequency_choices=server.FOLLOW_FREQUENCY_CHOICES,
+        flash_msg="保存しました",
+        flash_error="",
+    )
+    assert "/compass-bot/op/followup_policy" in html
+    assert "/compass-bot/op/learning_card_feedback" in html
+    assert "/compass-bot/op/growth_plan" in html
+    assert "/compass-bot/op/user_settings" in html
+    assert "/compass-bot/op/user_order" in html
+    assert "/compass-bot/op/fixed_allowance" not in html
+    assert "月額変更（固定お小遣い）" not in html
+    assert "全ユーザー一覧" in html
+    assert "全ユーザー残高一覧" not in html
+    assert "ユーザー設定" in html
+    assert 'data-settings-open="child-settings-modal-1"' in html
+    assert 'data-settings-open="parent-settings-modal-1"' in html
+    assert 'data-order-key="child:はな"' in html
+    assert 'data-order-key="parent:親"' in html
+    assert 'data-drag-handle' in html
+    assert "ドラッグして並び替え" in html
+    assert "並び順を保存" in html
+    assert "保存しました" in html
+    assert "toast-region" in html
+    assert "data-dashboard-toast" in html
+    assert "data-toast-close" in html
+    assert "5000" in html
+    assert "clearToastQuery" in html
+    assert "searchParams.delete('msg')" in html
+    assert "searchParams.delete('error')" in html
+    assert "window.history.replaceState" in html
+    assert '<div class="alert alert-success"' not in html
+    assert "user-order-drag-active" in html
+    assert "document.addEventListener('pointerup'" in html
+    assert "window.addEventListener('blur', finishUserOrderDrag" in html
+    assert "dashboard-table-wrap" in html
+    assert "dashboard-user-table" in html
+    assert "width: min(1440px" in html
+    assert "@media (max-width: 1024px)" in html
+    assert "@media (max-width: 640px)" in html
+    assert "data-order-move" not in html
+    assert "上へ" not in html
+    assert "下へ" not in html
+    assert "beforeunload" in html
+    assert 'id="child-settings-modal-1"' in html
+    assert 'role="dialog"' in html
+    assert 'aria-modal="true"' in html
+    assert 'data-settings-form' in html
+    assert 'name="user_type" value="child"' in html
+    assert 'name="original_name" value="はな"' in html
+    assert 'data-original-discord-id="101"' in html
+    assert 'id="parent-settings-modal-1"' in html
+    assert 'name="user_type" value="parent"' in html
+    assert 'id="settings-discard-confirm"' in html
+    assert 'id="settings-critical-confirm"' in html
+    assert 'data-settings-cancel' in html
+    assert "toggleUserSettingsRow" not in html
+    assert "検定" in html
+    assert "今週の会話カード" in html
+    assert 'option value="income_balance" selected' in html
+    assert "買う前に待つ" in html
+
+
+def test_user_settings_endpoint_updates_child_settings() -> None:
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_load_all_parents = server.load_all_parents
+    old_find_user_json_path_by_name = server.find_user_json_path_by_name
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "parent"
+
+    with tempfile.TemporaryDirectory(prefix="compass-user-settings-") as d:
+        root = Path(d)
+        user_path = root / "rika.json"
+        user_path.write_text(
+            json.dumps(
+                {
+                    "name": "はな",
+                    "discord_user_id": 101,
+                    "age": 7,
+                    "gender": "female",
+                    "fixed_allowance": 300,
+                    "temporary_max": 1000,
+                    "fixed_increase_cap": 100,
+                    "penalty_cap": 10,
+                    "keywords": {"investment": ["ダンス"], "fun": ["ゲーム"], "danger": ["課金"]},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server.load_all_users = lambda: [{"name": "はな", "discord_user_id": 101}]
+            server.load_all_parents = lambda: []
+            server.find_user_json_path_by_name = lambda name: user_path if name == "はな" else None
+
+            response = asyncio.run(
+                server.op_user_settings(
+                    session_token="token",
+                    user_type="child",
+                    original_name="はな",
+                    name="はな",
+                    discord_user_id="123456789012345678",
+                    age="9",
+                    gender="female",
+                    bot_personality="friend",
+                    fixed_allowance="800",
+                    temporary_max="2500",
+                    fixed_increase_cap="150",
+                    penalty_cap="",
+                    keywords_investment="検定\n英語",
+                    keywords_fun="漫画、ゲーム",
+                    keywords_danger="課金\n高額ガチャ",
+                )
+            )
+            assert response.status_code == 303
+            saved = json.loads(user_path.read_text(encoding="utf-8"))
+            assert saved["discord_user_id"] == 123456789012345678
+            assert saved["age"] == 9
+            assert saved["bot_personality"] == "friend"
+            assert saved["fixed_allowance"] == 800
+            assert saved["temporary_max"] == 2500
+            assert saved["fixed_increase_cap"] == 150
+            assert saved["penalty_cap"] is None
+            assert saved["keywords"]["investment"] == ["検定", "英語"]
+            assert saved["keywords"]["fun"] == ["漫画", "ゲーム"]
+            assert saved["keywords"]["danger"] == ["課金", "高額ガチャ"]
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.load_all_parents = old_load_all_parents
+            server.find_user_json_path_by_name = old_find_user_json_path_by_name
+
+
+def test_user_order_endpoint_saves_normalized_dashboard_order() -> None:
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_load_all_parents = server.load_all_parents
+    old_setting_path = server.SETTING_PATH
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "parent"
+
+    with tempfile.TemporaryDirectory(prefix="compass-user-order-") as d:
+        root = Path(d)
+        setting_path = root / "setting.json"
+        setting_path.write_text(json.dumps({"web_base_url": "https://example.test"}, indent=2), encoding="utf-8")
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server.load_all_users = lambda: [
+                {"name": "はな", "discord_user_id": 101},
+                {"name": "ゆい", "discord_user_id": 102},
+            ]
+            server.load_all_parents = lambda: [{"name": "親", "discord_user_id": 202}]
+            server.SETTING_PATH = setting_path
+
+            response = asyncio.run(
+                server.op_user_order(
+                    session_token="token",
+                    user_order=json.dumps(["parent:親", "child:ゆい", "child:不在", "child:はな"], ensure_ascii=False),
+                )
+            )
+            assert response.status_code == 303
+            saved = json.loads(setting_path.read_text(encoding="utf-8"))
+            assert saved["web_dashboard"]["user_order"] == ["parent:親", "child:ゆい", "child:はな"]
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.load_all_parents = old_load_all_parents
+            server.SETTING_PATH = old_setting_path
+
+
+def test_user_settings_endpoint_updates_parent_settings() -> None:
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_load_all_parents = server.load_all_parents
+    old_parents_dir = server.PARENTS_DIR
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "parent"
+
+    with tempfile.TemporaryDirectory(prefix="compass-parent-settings-") as d:
+        root = Path(d)
+        parent_path = root / "parent.json"
+        parent_path.write_text(
+            json.dumps({"name": "親", "discord_user_id": 202}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server.load_all_users = lambda: []
+            server.load_all_parents = lambda: [{"name": "親", "discord_user_id": 202}]
+            server.PARENTS_DIR = root
+
+            response = asyncio.run(
+                server.op_user_settings(
+                    session_token="token",
+                    user_type="parent",
+                    original_name="親",
+                    name="親",
+                    discord_user_id="2025555555",
+                )
+            )
+            assert response.status_code == 303
+            saved = json.loads(parent_path.read_text(encoding="utf-8"))
+            assert saved["name"] == "親"
+            assert saved["discord_user_id"] == 2025555555
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.load_all_parents = old_load_all_parents
+            server.PARENTS_DIR = old_parents_dir
+
+
+def test_learning_card_and_growth_plan_endpoints_write_isolated_state() -> None:
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_state_dir = server.LEARNING_SUPPORT_STATE_DIR
+    old_plan_dir = server.GROWTH_PLANS_DIR
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "parent"
+
+    with tempfile.TemporaryDirectory(prefix="compass-web-state-") as d:
+        root = Path(d)
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server.load_all_users = lambda: [{"name": "はな"}]
+            server.LEARNING_SUPPORT_STATE_DIR = root / "learning_support_state"
+            server.GROWTH_PLANS_DIR = root / "growth_plans"
+
+            card_response = asyncio.run(
+                server.op_learning_card_feedback(
+                    session_token="token",
+                    target="はな",
+                    card_id="card-1",
+                    feedback="use_this_week",
+                    card_type="record_habit",
+                    parent_question="次の買い物で一言理由を足す？",
+                    child_action="理由を一言書く",
+                )
+            )
+            assert card_response.status_code == 303
+            state_files = list((root / "learning_support_state").glob("*.json"))
+            assert len(state_files) == 1
+            state = json.loads(state_files[0].read_text(encoding="utf-8"))
+            assert state["last_card_id"] == "card-1"
+            assert state["last_parent_question"] == "次の買い物で一言理由を足す？"
+
+            plan_response = asyncio.run(
+                server.op_growth_plan(
+                    session_token="token",
+                    target="はな",
+                    plan_id="",
+                    action="save",
+                    status="active",
+                    request_type="allowance_increase",
+                    child_reason="本を買いたい",
+                    parent_condition="1週間記録する",
+                    agreed_action="毎日1つ記録する",
+                    review_at="2026-05-10",
+                    reward_amount="100",
+                    notes="親確認済み",
+                )
+            )
+            assert plan_response.status_code == 303
+            plan_files = list((root / "growth_plans").glob("*.json"))
+            assert len(plan_files) == 1
+            plans = json.loads(plan_files[0].read_text(encoding="utf-8"))
+            assert plans["plans"][0]["agreed_action"] == "毎日1つ記録する"
+            assert plans["plans"][0]["reward_amount"] == 100
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.LEARNING_SUPPORT_STATE_DIR = old_state_dir
+            server.GROWTH_PLANS_DIR = old_plan_dir
+
+
+def test_child_challenge_feedback_and_template_do_not_expose_parent_policy() -> None:
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+    import app.server as server
+
+    old_get_current_user = server._get_current_user
+    old_is_admin = server._is_admin
+    old_load_all_users = server.load_all_users
+    old_state_dir = server.LEARNING_SUPPORT_STATE_DIR
+    old_build_learning_insights = server.build_learning_insights
+
+    async def fake_current_user(_token: str | None) -> str:
+        return "はな"
+
+    with tempfile.TemporaryDirectory(prefix="compass-child-state-") as d:
+        root = Path(d)
+        try:
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: False
+            server.load_all_users = lambda: [{"name": "はな"}]
+            server.LEARNING_SUPPORT_STATE_DIR = root / "learning_support_state"
+
+            def fake_build_learning_insights(**_kwargs) -> dict:
+                return {
+                    "summary_text": "テスト",
+                    "metrics": [],
+                    "insight_cards": [],
+                    "child_challenge": {
+                        "challenge_id": "challenge-1",
+                        "title": "親メモからのチャレンジ",
+                        "action": "買う前に一度待つ練習を軽く促してほしい",
+                    },
+                    "source_notes": [],
+                }
+
+            server.build_learning_insights = fake_build_learning_insights
+            insights = server._normalize_learning_insights(
+                "はな",
+                {"log_dir": str(root / "logs")},
+                {
+                    "name": "はな",
+                    "ai_follow_policy": {
+                        "enabled": True,
+                        "parent_note": "買う前に一度待つ練習を軽く促してほしい",
+                    },
+                },
+                [],
+                {},
+            )
+            assert "親メモ" not in insights["child_challenge"]["title"]
+            assert "買う前に一度待つ練習" not in insights["child_challenge"]["action"]
+
+            response = asyncio.run(
+                server.op_child_challenge_feedback(
+                    session_token="token",
+                    challenge_id="challenge-1",
+                    feedback="done",
+                    target="",
+                    child_action="理由を一言書く",
+                )
+            )
+            assert response.status_code == 303
+            state_files = list((root / "learning_support_state").glob("*.json"))
+            assert len(state_files) == 1
+            state_text = state_files[0].read_text(encoding="utf-8")
+            assert "parent_note" not in state_text
+            assert "ai_follow_policy" not in state_text
+
+            env = Environment(
+                loader=FileSystemLoader(str(REPO_ROOT / "templates")),
+                autoescape=select_autoescape(["html", "xml"]),
+            )
+            template = env.get_template("dashboard.html")
+            html = template.render(
+                username="はな",
+                is_admin=False,
+                my_child_challenge={
+                    "challenge_id": "challenge-1",
+                    "title": "記録に一言足す",
+                    "action": "理由を一言書く",
+                    "expected_time": "5分以内",
+                },
+                my_learning_summary={
+                    "signals": ["親メモ: 買う前に一度待つ練習を軽く促してほしい"],
+                    "child_hints": ["内部方針"],
+                },
+                my_balance=1200,
+                my_low_balance=False,
+                my_goals=[],
+                my_month_spending=300,
+                my_month_count=2,
+                my_recent_items=[],
+                flash_msg="",
+                flash_error="",
+            )
+            assert "次の小さなチャレンジ" in html
+            assert "買う前に一度待つ練習" not in html
+            assert "内部方針" not in html
+            assert "/compass-bot/op/followup_policy" not in html
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server.load_all_users = old_load_all_users
+            server.LEARNING_SUPPORT_STATE_DIR = old_state_dir
+            server.build_learning_insights = old_build_learning_insights
+
+
+def test_server_unhandled_exception_handler_logs_and_hides_details() -> None:
+    import app.server as server
+
+    with tempfile.TemporaryDirectory(prefix="compass-server-error-") as d:
+        root = Path(d)
+        log_dir = root / "logs"
+        old_load_system = server.load_system
+        old_get_log_dir = server.get_log_dir
+        try:
+            server.load_system = lambda: {"log_dir": str(log_dir)}
+            server.get_log_dir = lambda system_conf: Path(system_conf["log_dir"])
+            request = types.SimpleNamespace(
+                method="GET",
+                url=types.SimpleNamespace(path="/compass-bot/dashboard"),
+                client=types.SimpleNamespace(host="127.0.0.1"),
+                headers={"accept": "application/json"},
+            )
+            response = asyncio.run(
+                server.unhandled_exception_handler(
+                    request,
+                    RuntimeError("simulated web secret"),
+                )
+            )
+            body = response.body.decode("utf-8")
+            assert response.status_code == 500
+            assert "管理者に連絡" in body
+            assert "待っても直らない" in body
+            assert "simulated web secret" not in body
+            diagnostics_path = log_dir / "runtime_diagnostics.jsonl"
+            rows = [
+                json.loads(line)
+                for line in diagnostics_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            assert any(
+                row.get("event") == "server_unhandled_error"
+                and row.get("path") == "/compass-bot/dashboard"
+                and row.get("error_type") == "RuntimeError"
+                and row.get("error_message") == "simulated web secret"
+                for row in rows
+            )
+        finally:
+            server.load_system = old_load_system
+            server.get_log_dir = old_get_log_dir
+
+
+def test_web_adjust_rejects_invalid_direction_without_balance_change() -> None:
+    import app.server as server
+    from app.wallet_service import WalletService
+
+    with tempfile.TemporaryDirectory(prefix="compass-adjust-") as d:
+        root = Path(d)
+        wallet = WalletService()
+        wallet.wallet_state_path = root / "wallet_state.json"
+        wallet.wallet_audit_state_path = root / "wallet_audit_state.json"
+        wallet.set_balance("はな", 1000)
+
+        old_get_current_user = server._get_current_user
+        old_is_admin = server._is_admin
+        old_wallet_service = server._wallet_service
+        old_find_user_by_name = server.find_user_by_name
+        old_load_system = server.load_system
+        try:
+            async def fake_current_user(_token: str | None) -> str:
+                return "parent"
+
+            server._get_current_user = fake_current_user
+            server._is_admin = lambda username: username == "parent"
+            server._wallet_service = wallet
+            server.find_user_by_name = lambda name: {"name": name} if name == "はな" else None
+            server.load_system = lambda: {"log_dir": str(root / "logs")}
+
+            response = asyncio.run(
+                server.op_adjust(
+                    session_token="token",
+                    target="はな",
+                    amount="500円",
+                    direction="bad",
+                )
+            )
+            assert response.status_code == 303
+            assert "増減の指定が正しくありません" in unquote(response.headers["location"])
+            assert wallet.get_balance("はな") == 1000
+        finally:
+            server._get_current_user = old_get_current_user
+            server._is_admin = old_is_admin
+            server._wallet_service = old_wallet_service
+            server.find_user_by_name = old_find_user_by_name
+            server.load_system = old_load_system
+
+
+def test_wallet_state_corruption_fails_closed() -> None:
+    from app.wallet_service import WalletService
+
+    with tempfile.TemporaryDirectory(prefix="compass-wallet-corrupt-") as d:
+        root = Path(d)
+        wallet = WalletService()
+        wallet.wallet_state_path = root / "wallet_state.json"
+        wallet.wallet_audit_state_path = root / "wallet_audit_state.json"
+        wallet.wallet_state_path.write_text("{broken", encoding="utf-8")
+
+        try:
+            wallet.update_balance(
+                user_conf={"name": "はな"},
+                system_conf={"log_dir": str(root / "logs")},
+                delta=500,
+                action="test",
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("corrupt wallet_state.json should fail closed")
+
+        assert wallet.wallet_state_path.read_text(encoding="utf-8") == "{broken"
+        assert not (root / "logs" / "はな_wallet_ledger.jsonl").exists()
+
+
+def main() -> int:
+    tests = [
+        test_reflection_context,
+        test_followup_policy_endpoint_writes_valid_policy_and_rejects_harmful_note,
+        test_dashboard_template_renders_policy_form,
+        test_user_settings_endpoint_updates_child_settings,
+        test_user_order_endpoint_saves_normalized_dashboard_order,
+        test_user_settings_endpoint_updates_parent_settings,
+        test_learning_card_and_growth_plan_endpoints_write_isolated_state,
+        test_child_challenge_feedback_and_template_do_not_expose_parent_policy,
+        test_server_unhandled_exception_handler_logs_and_hides_details,
+        test_web_adjust_rejects_invalid_direction_without_balance_change,
+        test_wallet_state_corruption_fails_closed,
+    ]
+    failures = []
+    for test in tests:
+        try:
+            test()
+            print(json.dumps({"test": test.__name__, "passed": True}, ensure_ascii=False), flush=True)
+        except Exception as exc:
+            failures.append(test.__name__)
+            print(
+                json.dumps(
+                    {"test": test.__name__, "passed": False, "error": f"{type(exc).__name__}: {exc}"},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

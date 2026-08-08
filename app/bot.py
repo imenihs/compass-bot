@@ -906,9 +906,9 @@ async def _on_message_impl(message: discord.Message):
     # 実残高は安全）。
     # 免除は「発話者本人の子アカウントが、いま対象になっている user_conf の子と一致する」ときだけに厳格化する。
     # 「何らかの子として登録されているか」(bool)だけで免除すると、兼務ID(親A=子テストが同一ID)が別の子
-    # (はな)のチャンネルで自然文を送ったとき、_find_channel_child_user_conf が user_conf をりかへ差し替え、
-    # find_child_user_by_discord_id はテストを返して免除され、COMPASS_ACTIVE_CHILD=りかで record_expense が
-    # 走る＝親の発話でりかの実残高が動く越境になる。env 束縛は「解決した子(はな)」を守るだけで、user_conf 自体が
+    # (はな)のチャンネルで自然文を送ったとき、_find_channel_child_user_conf が user_conf をはなへ差し替え、
+    # find_child_user_by_discord_id はテストを返して免除され、COMPASS_ACTIVE_CHILD=はなで record_expense が
+    # 走る＝親の発話ではなの実残高が動く越境になる。env 束縛は「解決した子(はな)」を守るだけで、user_conf 自体が
     # 別の子に差し替わっているこの越境は防げない。発話者の子本人＝対象児のときだけ通す。
     # find_child_user_by_discord_id（子ディレクトリのみ走査）を使う。find_user_by_discord_id は親優先で
     # 親を先に返すため、純粋な親でも「子として実在」判定になりブロックが不発になる。
