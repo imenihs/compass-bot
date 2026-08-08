@@ -1035,15 +1035,29 @@ async def _handle_parent_conversation_locked(channel, session_key: str, input_te
 
     reply.record_incoming(session_key, input_text, kind=SESSION_KIND)
 
+    # 子会話と同じく、送った「確認中」は本応答が出たら消す（残り続けないように）
+    thinking_sent: list = []
+
     async def _thinking_after_delay():
         try:
             await asyncio.sleep(THINKING_DELAY_SEC)
-            await channel.send("確認しているよ、ちょっと待ってね。")
+            sent = await channel.send("確認しているよ、ちょっと待ってね。")
+            if sent is not None:
+                thinking_sent.append(sent)
         except asyncio.CancelledError:
             raise
         except Exception:
             pass
     thinking_task = asyncio.create_task(_thinking_after_delay())
+
+    async def _clear_thinking() -> None:
+        """送信済みの「確認中」を消す。消せなくても会話は止めない。"""
+        for msg in thinking_sent:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        thinking_sent.clear()
 
     system_prompt = _build_parent_system_prompt(child_names)
     try:
@@ -1072,6 +1086,7 @@ async def _handle_parent_conversation_locked(channel, session_key: str, input_te
             result = ("うまく処理できませんでした。お子さんの残高が変わっていないか、"
                       "『みんなの残高』で確認してください。もう一度行うときは、変わっていないのを確かめてからにしてください。")
 
+    await _clear_thinking()
     return await reply.send_reply(channel, result, user_name=session_key, kind=SESSION_KIND)
 
 
@@ -1097,10 +1112,17 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
 
     # 3. 「考え中」は遅延送信する。素の雑談は3〜5秒で返るため、その場合は出さずに連投ノイズを避け、
     #    tool 込みで遅いときだけ出す（reply.py のとおり考え中表示は send_reply を通さない例外送信）
+    # 送った「考え中」メッセージを覚えておき、本応答が出たら消す（2026/08/09）。
+    # 以前は消しておらず、本応答と並んで残り続けていた（実機で「考えているよ」が毎回残る指摘）。
+    # 進捗表示は「待たせている間だけ意味がある」ものなので、用が済んだら消すのが正しい。
+    thinking_sent: list = []
+
     async def _thinking_after_delay():
         try:
             await asyncio.sleep(THINKING_DELAY_SEC)
-            await channel.send("考えているよ、ちょっと待ってね。")
+            sent = await channel.send("考えているよ、ちょっと待ってね。")
+            if sent is not None:
+                thinking_sent.append(sent)
         except asyncio.CancelledError:
             # 早く応答できたときはキャンセルされる。何も送らない
             raise
@@ -1108,6 +1130,16 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
             # 進捗表示の失敗は本処理を止めない
             pass
     thinking_task = asyncio.create_task(_thinking_after_delay())
+
+    async def _clear_thinking() -> None:
+        """送信済みの「考え中」を消す。消せなくても会話は止めない。"""
+        for msg in thinking_sent:
+            try:
+                await msg.delete()
+            except Exception:
+                # 権限不足・既に削除済み等。進捗表示の後始末で本応答を妨げない
+                pass
+        thinking_sent.clear()
 
     # 4. 発話は素のまま、人格・約束は --append-system-prompt、本人性は env で渡して claude を起動する
     # 基本プロンプトに、お金・学習の話題のターンだけコーチング指示を足す（出し分け・反復抑制・to_thread は
@@ -1180,6 +1212,8 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
             )
 
     # 6. 唯一の出口から送信する（会話ログ記録＋分割を集約）
+    #    本応答を出す直前に「考え中」を消す。待たせている間だけ意味がある表示のため
+    await _clear_thinking()
     return await reply.send_reply(channel, result, user_name=user_name, kind=SESSION_KIND)
 
 
