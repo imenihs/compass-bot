@@ -1268,14 +1268,27 @@ async def judge_safety(user_conf: dict, input_text: str) -> dict | None:
             disable_tools=True, new_session_id=str(uuid.uuid4()),
         )
         ok, result, _sid = _parse_output(stdout)
-        if ok and result:
+        if not ok or not result:
+            # 例外にならない壊れ方（CLI が異常終了・空応答）。無音にすると
+            # AI 判定が恒常的に死んでいても誰も気づかず、静かに Python 床だけの単眼になる。
+            _diag("safety_ai_judge_unavailable",
+                  {"child": child_name, "returncode": returncode, "stderr": stderr[:200]})
+        else:
             ai_result = _parse_safety_json(result)
+            if ai_result is None:
+                # JSON として解釈できない。モデル更新で出力形式が変わった合図
+                _diag("safety_ai_judge_unparseable",
+                      {"child": child_name, "head": result[:200]})
     except Exception as e:
         # AI 判定の失敗で安全機能を止めない。Python の床だけで続行する
         _diag("safety_ai_judge_error", {"child": child_name, "error": f"{type(e).__name__}: {e}"})
 
     # 発話原文を渡す。正規表現の網羅漏れでカテゴリが落ちても家族語で虐待へ格上げするため
     merged = safety.merge_judgments(py_result, ai_result, source_text=input_text)
+    if ai_result is None:
+        # 検知の有無に関わらず「AI が判定できなかった」ことを必ず残す。
+        # merged が無いときだけ無記録だと、劣化が長期間見えなくなる。
+        _diag("safety_ai_judge_missing", {"child": child_name, "had_floor": py_result is not None})
     if merged:
         _diag("safety_signal_detected", {
             "child": child_name,

@@ -501,8 +501,42 @@ def redact_third_party(text: str) -> str:
     return _NAME_LIKE.sub(_sub, text or "")
 
 
+# 直近に親へ通知した内容を覚えておき、短時間の重複を集約する。
+# {(子, カテゴリ): [最終通知の epoch 秒, 集約した件数]}
+_RECENT_ALERTS: dict[tuple[str, str], list] = {}
+# 同一の子・同一カテゴリを再通知しない窓（秒）。この間の再検知は件数だけ数える
+ALERT_DEDUP_WINDOW_SEC = 1800
+
+
+def should_send_alert(child_name: str, category: str, now_sec: float) -> tuple[bool, int]:
+    """親へ通知してよいか（重複の集約）を判定する。
+
+    同じ子の同じカテゴリを毎ターン通知すると親が麻痺し、本当の信号を見落とす（狼少年化）。
+    一方で抑制しすぎると2回目の告白が消えるため、**抑制ではなく集約**にする。
+    窓の間は送らずに件数を数え、窓を越えた次の通知でまとめて件数を伝える。
+
+    Args:
+        child_name: 対象児童。
+        category: 危険信号のカテゴリ。
+        now_sec: 現在時刻（epoch 秒）。テスト容易性のため引数で受ける。
+
+    Returns:
+        tuple[bool, int]: (送ってよいか, 前回からの抑制件数)。
+    """
+    key = (str(child_name or ""), str(category or ""))
+    rec = _RECENT_ALERTS.get(key)
+    if rec is None or (now_sec - rec[0]) >= ALERT_DEDUP_WINDOW_SEC:
+        suppressed = rec[1] if rec else 0
+        _RECENT_ALERTS[key] = [now_sec, 0]
+        return True, suppressed
+    # 窓内。送らずに件数だけ積む（記録は呼び出し側が診断へ残す）
+    rec[1] += 1
+    return False, rec[1]
+
+
 def build_parent_notification(child_name: str, judgment: dict, raw_text: str,
-                              child_consent: str = "unknown") -> str:
+                              child_consent: str = "unknown",
+                              repeated_count: int = 0) -> str:
     """親チャンネルへ送る通知文を組み立てる（①要約 → ②背景 → ③原文の順）。
 
     要約と背景を先に置くのは、親が**重要度と緊急性を誤判断しない**ようにするため。
@@ -534,6 +568,10 @@ def build_parent_notification(child_name: str, judgment: dict, raw_text: str,
         "**■ どういう状況か**",
         f"{judgment.get('ai_reason') or '会話の中に気になる内容がありました。'}",
     ]
+
+    # 直近に同種の訴えが繰り返されていた場合は件数を伝える（頻度そのものが重要な情報）
+    if repeated_count > 0:
+        lines.append(f"※ この30分の間に、同じような訴えが他に {repeated_count} 回ありました。")
 
     # 確信度が低いときは、親が過剰に反応しないよう正直に添える
     conf = judgment.get("confidence")

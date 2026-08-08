@@ -263,11 +263,69 @@ def _test_routing():
     asyncio.run(run())
 
 
+def _test_alert_aggregation():
+    """同一の子・同一カテゴリの短時間の繰り返しが、抑制でなく集約されること。
+
+    毎ターン通知すると親が麻痺し本当の信号を見落とす（狼少年化）。
+    一方で抑制しすぎると2回目の告白が消えるため、件数を数えて後で伝える。
+    """
+    safety._RECENT_ALERTS.clear()
+    now = 1000.0
+    ok1, rep1 = safety.should_send_alert("たろう", "bullying", now)
+    _check("aggregate_first_sends", ok1 is True and rep1 == 0, f"{ok1},{rep1}")
+    # 窓内の繰り返しは送らず数える
+    for i in range(4):
+        ok, rep = safety.should_send_alert("たろう", "bullying", now + 1 + i)
+        _check(f"aggregate_within_window[{i}]", ok is False, f"{ok},{rep}")
+    # 別カテゴリは独立して送る
+    ok2, _ = safety.should_send_alert("たろう", "self_harm", now + 2)
+    _check("aggregate_other_category_sends", ok2 is True, ok2)
+    # 別の子も独立
+    ok3, _ = safety.should_send_alert("はな", "bullying", now + 2)
+    _check("aggregate_other_child_sends", ok3 is True, ok3)
+    # 窓を越えたら、抑制した件数を添えて再送する
+    ok4, rep4 = safety.should_send_alert(
+        "たろう", "bullying", now + safety.ALERT_DEDUP_WINDOW_SEC + 1)
+    _check("aggregate_after_window_sends_with_count", ok4 is True and rep4 == 4, f"{ok4},{rep4}")
+    # 件数が通知本文に反映されること
+    body = safety.build_parent_notification(
+        "たろう", {"category": "bullying", "urgency": "high", "confidence": 0.9,
+                   "ai_reason": "繰り返しの訴え"},
+        "クラスの子に殴られた", child_consent="unknown", repeated_count=4)
+    _check("aggregate_count_in_body", "他に 4 回" in body, body[:200])
+    safety._RECENT_ALERTS.clear()
+
+
+def _test_malformed_ai_never_leaks():
+    """AI 応答が壊れた・型が異常でも、虐待が親へ漏れないこと（fail-safe）。"""
+    text = "お父さんに殴られた"
+    for label, ai in [
+        ("none", None),
+        ("empty", {}),
+        ("category_none", {"category": None, "confidence": 0.9}),
+        ("category_number", {"category": 123, "confidence": 0.9}),
+        ("category_list", {"category": ["abuse"], "confidence": 0.9}),
+        ("confidence_str", {"category": "abuse", "confidence": "高い", "perpetrator": "family"}),
+        ("confidence_none", {"category": "abuse", "confidence": None, "perpetrator": "family"}),
+        ("confidence_out_of_range", {"category": "abuse", "confidence": 99, "perpetrator": "family"}),
+        ("perpetrator_number", {"category": "bullying", "confidence": 0.9, "perpetrator": 5}),
+        ("all_broken", {"category": {"x": 1}, "confidence": [], "perpetrator": None, "uncertain": None}),
+    ]:
+        try:
+            r = safety.merge_judgments(safety.detect(text), ai, source_text=text)
+            leaked = bool(r and r.get("notify_parent"))
+        except Exception as e:
+            leaked, r = True, f"EXCEPTION {type(e).__name__}"
+        _check(f"malformed_ai_no_leak[{label}]", not leaked, f"got={r}")
+
+
 def main():
     _test_python_floor()
     _test_merge_abuse_never_to_parent()
     _test_merge_or_and_suppression()
     _test_critical_leak_paths()
+    _test_alert_aggregation()
+    _test_malformed_ai_never_leaks()
     _test_notification_content()
     _test_hotlines_are_constants()
     _test_routing()

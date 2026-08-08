@@ -130,6 +130,10 @@ def _child_income_over_limit_message(amount: int, limit: int, user_name: str) ->
 # 貯金目標の補完入力で受け付ける上限。通常の子供向け目標として十分な範囲にする。
 MAX_GOAL_INPUT_AMOUNT = 10_000_000
 _thinking_sent_message_keys: set[tuple[str, int]] = set()
+# 走行中の安全判定タスクへの強参照。asyncio はタスクへの参照が無くなると
+# 実行途中でも GC 対象になりうる（CPython の既知の挙動）。安全通知が黙って消えるのは
+# 最も避けるべき失敗なので、完了までここで参照を保持する。
+_safety_tasks: set = set()
 
 
 wallet_service = WalletService()
@@ -225,10 +229,23 @@ async def _handle_safety_signal(system_conf, message, user_conf, input_block, ju
         )
         return
 
+    # 同じ子・同じカテゴリの短時間の繰り返しは集約する（毎ターン送ると親が麻痺し狼少年化する）。
+    # 抑制ではなく集約なので、窓を越えた次の通知で「他に N 回ありました」と件数を伝える。
+    import time as _time
+    ok_to_send, repeated = safety.should_send_alert(child_name, category, _time.time())
+    if not ok_to_send:
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_alert_aggregated",
+            {"category": category, "suppressed_count": repeated},
+        )
+        return
+
     # 子の同意はこの時点では取れていない（会話の中で確認するのは AI 側の役割）。
     # 返事を待たずに送るのが原則であり、確認できていない旨を通知に明記する。
     body = safety.build_parent_notification(
         child_name, judgment, input_block, child_consent="unknown",
+        repeated_count=repeated,
     )
     mention = " ".join(f"<@{pid}>" for pid in sorted(get_parent_ids())) or ""
     try:
@@ -812,6 +829,9 @@ async def _on_message_impl(message: discord.Message):
 
         try:
             safety_task = asyncio.create_task(_judge_and_notify())
+            # 完了まで強参照を保持する（await されない経路でも GC で消えないようにする）
+            _safety_tasks.add(safety_task)
+            safety_task.add_done_callback(_safety_tasks.discard)
         except Exception as e:
             _log_runtime_event(
                 system_conf, message, user_conf, input_block,
