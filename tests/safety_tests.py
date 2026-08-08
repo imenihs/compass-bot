@@ -247,9 +247,15 @@ def _test_routing():
             "category": "bullying", "urgency": "high", "notify_parent": True,
             "hotline_key": "bullying", "ai_reason": "クラスの子からの暴力", "confidence": 0.9,
             "perpetrator": "outside"})
+        # 親へ1通。子へは①初回予告 ②同意の確認 ③通知後のケア の3通（いずれも意図した挙動）
         _check("route_bullying_to_parent_only",
-               len(child_ch.sent) == 0 and len(parent_ch.sent) == 1,
+               len(parent_ch.sent) == 1,
                f"child={len(child_ch.sent)} parent={len(parent_ch.sent)}")
+        _check("route_bullying_child_gets_consent_and_care",
+               len(child_ch.sent) == 3
+               and "伝えてもいいかな" in child_ch.sent[1]
+               and "伝えたよ" in child_ch.sent[2],
+               [m[:30] for m in child_ch.sent])
 
         # 抑制された誤検知 → どちらにも送らない
         child_ch.sent.clear(); parent_ch.sent.clear()
@@ -319,6 +325,70 @@ def _test_malformed_ai_never_leaks():
         _check(f"malformed_ai_no_leak[{label}]", not leaked, f"got={r}")
 
 
+def _test_consent_flow():
+    """同意は事前に尋ね、拒否でも通知し、意向を親へ添えること（社長指示の核心）。"""
+    safety._CONSENT_PENDING.clear()
+    now = 5000.0
+    # 尋ねる文に「伝えてもいいかな」と原文も見せる旨が含まれる（黙って全文を送るのは嘘になる）
+    q = safety.build_consent_question({"category": "bullying"})
+    _check("consent_asks_permission", "伝えてもいいかな" in q, q[:80])
+    _check("consent_discloses_raw_text", "言葉もいっしょに" in q, q[:120])
+
+    # 返事の分類
+    for text, want in [("いいよ", "agreed"), ("うん", "agreed"),
+                       ("だめ", "refused"), ("言わないで", "refused"), ("内緒にして", "refused"),
+                       ("おなかすいた", "unknown")]:
+        _check(f"consent_classify[{text}]", safety.classify_consent(text) == want,
+               safety.classify_consent(text))
+
+    # 尋ねた直後の返事は取り込まれる
+    safety.mark_consent_pending("たろう", "bullying", now)
+    _check("consent_records_reply", safety.record_consent_reply("たろう", "だめ", now + 5) is True)
+    _check("consent_takes_refused", safety.take_consent("たろう") == "refused")
+    # 取り出したら消える（次の判定へ持ち越さない）
+    _check("consent_cleared_after_take", safety.take_consent("たろう") == "unknown")
+
+    # 猶予を過ぎた発話は返事とみなさない
+    safety.mark_consent_pending("はな", "bullying", now)
+    _check("consent_ignores_late_reply",
+           safety.record_consent_reply("はな", "いいよ", now + safety.CONSENT_WAIT_SEC + 10) is False)
+
+    # 沈黙は unknown（拒否と区別する）
+    safety.mark_consent_pending("ゆい", "bullying", now)
+    _check("consent_silence_is_unknown", safety.take_consent("ゆい") == "unknown")
+    safety._CONSENT_PENDING.clear()
+
+
+def _test_post_notification_care():
+    """通知後に子を放り出さないこと。拒否した子には謝りつつ譲らないこと。"""
+    care = safety.build_post_notification_care({"category": "self_harm", "urgency": "high"}, "refused")
+    _check("care_apologizes_when_refused", "ごめん" in care, care[:100])
+    _check("care_holds_the_line", "ゆずれなかった" in care, care[:150])
+    _check("care_keeps_door_open", "ここで話していい" in care, care[:200])
+
+    # 切迫時は窓口も添える
+    g = safety.build_urgency_guidance({"urgency": "urgent", "hotline_key": "self_harm"})
+    _check("urgency_adds_hotline_when_urgent", "0120" in g, g[:120])
+    _check("urgency_silent_when_not_urgent",
+           safety.build_urgency_guidance({"urgency": "high", "hotline_key": "self_harm"}) == "")
+
+
+def _test_safety_notice():
+    """初回の予告が、伝える条件とAIの限界を示すこと。"""
+    _check("notice_states_when_told", "おうちの人に伝えることがある" in safety.SAFETY_NOTICE,
+           safety.SAFETY_NOTICE[:120])
+    _check("notice_states_privacy", "ここだけの話" in safety.SAFETY_NOTICE, safety.SAFETY_NOTICE[:200])
+    _check("notice_states_ai_limits", "いつも見ているわけじゃない" in safety.SAFETY_NOTICE,
+           safety.SAFETY_NOTICE[:250])
+    _check("notice_gives_emergency", "119" in safety.SAFETY_NOTICE, safety.SAFETY_NOTICE[:280])
+    # 一度出したら再度は出さない
+    safety._NOTICE_DONE.discard("テスト子")
+    _check("notice_needed_first", safety.needs_safety_notice("テスト子") is True)
+    safety.mark_safety_notice_done("テスト子")
+    _check("notice_not_needed_after", safety.needs_safety_notice("テスト子") is False)
+    safety._NOTICE_DONE.discard("テスト子")
+
+
 def main():
     _test_python_floor()
     _test_merge_abuse_never_to_parent()
@@ -326,6 +396,9 @@ def main():
     _test_critical_leak_paths()
     _test_alert_aggregation()
     _test_malformed_ai_never_leaks()
+    _test_consent_flow()
+    _test_post_notification_care()
+    _test_safety_notice()
     _test_notification_content()
     _test_hotlines_are_constants()
     _test_routing()

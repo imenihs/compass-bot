@@ -534,6 +534,133 @@ def should_send_alert(child_name: str, category: str, now_sec: float) -> tuple[b
     return False, rec[1]
 
 
+# 子へ同意を尋ねてから通知するまでの猶予（秒）。
+# 返事を待つのが目的ではなく、返事があればそれを通知へ添えるための短い窓。
+# 長くすると「怖くて逃げた子」の通知が遅れるため、短く取る。
+CONSENT_WAIT_SEC = 90
+
+# 同意の確認待ち。{子の名前: [尋ねた epoch 秒, カテゴリ]}
+_CONSENT_PENDING: dict[str, list] = {}
+
+# 子の返事を同意/拒否へ振り分ける語。判別できなければ unknown（＝確認できていない扱い）
+_CONSENT_YES = ("いい", "いいよ", "うん", "おk", "ok", "はい", "つたえて", "伝えて", "おねがい", "お願い")
+_CONSENT_NO = ("だめ", "ダメ", "いや", "やだ", "いわないで", "言わないで", "ないしょ", "内緒",
+               "しないで", "やめて", "つたえないで", "伝えないで")
+
+
+
+# 初回の予告を済ませた子。プロセス内で保持し、再起動時は再度予告する（重複より漏れを避ける）
+_NOTICE_DONE: set = set()
+
+SAFETY_NOTICE = (
+    "はじめに、ひとつだけ伝えておくね。\n"
+    "きみが**あぶない目にあってるかも**って思ったときだけ、おうちの人に伝えることがあるよ。"
+    "たとえば、だれかに傷つけられてるときや、きみ自身がとてもつらいときね。\n"
+    "それ以外の話は、ここだけの話にしておくよ。お金の相談も、ふつうのおしゃべりもね。\n"
+    "あと、ぼくはいつも見ているわけじゃないんだ。"
+    "すぐに助けがいるときは、そばの大人か、119番・110番にたよってね。"
+)
+
+
+def needs_safety_notice(child_name: str) -> bool:
+    """この子へ安全方針の予告をまだしていないか。
+
+    事後に「実は親へ伝えていた」と知られると裏切りになる。
+    ルールが分かっている子のほうが結果的に話すため、検知の質もむしろ上がる。
+    """
+    return str(child_name or "") not in _NOTICE_DONE
+
+
+def mark_safety_notice_done(child_name: str) -> None:
+    """予告済みとして記録する。"""
+    _NOTICE_DONE.add(str(child_name or ""))
+
+
+def build_consent_question(judgment: dict) -> str:
+    """親へ伝えてよいかを子に尋ねる文を作る（事後報告でなく事前に確認する）。
+
+    黙って告げ口すれば、後で発覚したとき AI への信頼が永久に失われる。
+    ただし「言わない」と約束はしない（嘘をつかない）。拒否されても安全のため通知はする。
+
+    Args:
+        judgment: merge_judgments の結果。
+
+    Returns:
+        str: 子へ送る確認文。
+    """
+    return (
+        "ひとつ聞かせて。いま話してくれたこと、おうちの人に伝えてもいいかな？\n"
+        "きみを心配してるからで、しかられるようにするためじゃないよ。\n"
+        "（伝えるときは、きみが話してくれた言葉もいっしょに見てもらうことになるよ）"
+    )
+
+
+def classify_consent(reply_text: str) -> str:
+    """子の返事を同意状況へ分類する。判別できなければ unknown。
+
+    Args:
+        reply_text: 子の返事。
+
+    Returns:
+        str: "agreed" / "refused" / "unknown"。
+    """
+    t = _normalize(reply_text or "")
+    if not t:
+        return "unknown"
+    # 否定を先に見る（「いいよ」と「よくない」を取り違えないため）
+    for w in _CONSENT_NO:
+        if _normalize(w) in t:
+            return "refused"
+    for w in _CONSENT_YES:
+        if _normalize(w) in t:
+            return "agreed"
+    return "unknown"
+
+
+def mark_consent_pending(child_name: str, category: str, now_sec: float) -> None:
+    """子へ同意を尋ねた状態にする。次の発話を返事として受け取れるようにする。"""
+    _CONSENT_PENDING[str(child_name or "")] = [now_sec, str(category or ""), "unknown"]
+
+
+def record_consent_reply(child_name: str, reply_text: str, now_sec: float) -> bool:
+    """子の次の発話を同意の返事として取り込む。
+
+    尋ねた直後の発話だけを返事とみなす。時間が経ってからの無関係な発話を
+    返事と誤解しないよう、猶予（CONSENT_WAIT_SEC）を過ぎたものは無視する。
+
+    Args:
+        child_name: 対象児童。
+        reply_text: 子の発話。
+        now_sec: 現在時刻（epoch 秒）。
+
+    Returns:
+        bool: 返事として取り込んだら True。
+    """
+    key = str(child_name or "")
+    rec = _CONSENT_PENDING.get(key)
+    if not rec:
+        return False
+    if (now_sec - rec[0]) > CONSENT_WAIT_SEC:
+        # 古すぎる。返事とみなさない
+        _CONSENT_PENDING.pop(key, None)
+        return False
+    verdict = classify_consent(reply_text)
+    if verdict == "unknown":
+        return False
+    rec[2] = verdict
+    return True
+
+
+def take_consent(child_name: str) -> str:
+    """尋ねた同意の結果を取り出して消す。返事が無ければ unknown。
+
+    unknown は「確認できていない」であり、拒否とは区別して親へ伝える
+    （沈黙・離脱は拒否と同じく通知するが、親への伝え方が変わる）。
+    """
+    rec = _CONSENT_PENDING.pop(str(child_name or ""), None)
+    return rec[2] if rec else "unknown"
+
+
 def build_parent_notification(child_name: str, judgment: dict, raw_text: str,
                               child_consent: str = "unknown",
                               repeated_count: int = 0) -> str:
@@ -633,6 +760,57 @@ def build_child_hotline_message(judgment: dict) -> str:
         "学校の先生や保健室の先生、親戚の人でもいい。"
         "話せそうな人、だれか思いつくかな？"
     )
+
+
+
+def build_post_notification_care(judgment: dict, child_consent: str) -> str:
+    """親へ伝えた後に、子へ返す言葉を作る（放り出さない）。
+
+    伝えたことを黙っていると、後で発覚したときに裏切りになる。
+    一方で「言ったからね」と突き放すのも最悪である。伝えた事実を認めたうえで、
+    ここで話し続けてよいことを示す。
+
+    Args:
+        judgment: merge_judgments の結果。
+        child_consent: "agreed" / "refused" / "unknown"。
+
+    Returns:
+        str: 子へ送る言葉。
+    """
+    if child_consent == "refused":
+        head = (
+            "さっきのこと、おうちの人に伝えたよ。きみは言いたくないって言ってたのに、ごめんね。\n"
+            "でも、きみが心配だったんだ。ここだけは、ゆずれなかった。"
+        )
+    elif child_consent == "agreed":
+        head = "さっきのこと、おうちの人に伝えたよ。話してくれてありがとう。"
+    else:
+        head = "さっきのこと、おうちの人に伝えたよ。きみが心配だったんだ。"
+    return (
+        f"{head}\n\n"
+        "こわかったよね。話しにくいことを話してくれて、えらかったと思う。\n"
+        "これからも、ここで話していいからね。ぼくはいるよ。"
+    )
+
+
+def build_urgency_guidance(judgment: dict) -> str:
+    """切迫度に応じて、子への伝え方を変える補足を作る（段階化）。
+
+    仕様では切迫度で扱いを変えると定めたが、実装では通知文のヘッダを変えるだけで
+    処理が同一だった。切迫している場合は、子に対しても今すぐ頼れる先を明示する。
+
+    Args:
+        judgment: merge_judgments の結果。
+
+    Returns:
+        str: 子へ添える補足。切迫していなければ空文字。
+    """
+    if judgment.get("urgency") != "urgent":
+        return ""
+    body = hotlines_for(judgment.get("hotline_key"), urgent=True)
+    if not body:
+        return f"\n{EMERGENCY_LINE}"
+    return f"\nもし今すぐしんどいときは、ここにも話せるよ。\n{body}"
 
 
 def hotlines_for(hotline_key: str | None, urgent: bool = False) -> str:

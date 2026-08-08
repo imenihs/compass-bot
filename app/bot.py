@@ -165,6 +165,8 @@ async def _handle_safety_signal(system_conf, message, user_conf, input_block, ju
         input_block: 子の発話原文。
         judgment: safety.merge_judgments の結果。
     """
+    import time as _time
+
     from app import safety
 
     child_name = str(user_conf.get("name", ""))
@@ -229,9 +231,35 @@ async def _handle_safety_signal(system_conf, message, user_conf, input_block, ju
         )
         return
 
+    # この子への初回だけ、安全方針を予告する（事後に知られると裏切りになる）。
+    # 全会話で出すとうるさいので、危険信号を検知して通知する直前に一度だけ出す。
+    if safety.needs_safety_notice(child_name):
+        try:
+            await message.channel.send(safety.SAFETY_NOTICE)
+            safety.mark_safety_notice_done(child_name)
+        except Exception as e:
+            _log_runtime_event(
+                system_conf, message, user_conf, input_block,
+                "safety_notice_send_failed", {"error": f"{type(e).__name__}: {e}"},
+            )
+
+    # 子へ「伝えてもいいかな」と先に尋ねる（事後報告にしない）。
+    # ただし返事は待たない。沈黙・離脱でも通知は確定させる（怖くて逃げた子ほど通知されない逆相関の防止）。
+    # 短い猶予の間に返事があれば、その意向を通知へ添える。
+    try:
+        await message.channel.send(safety.build_consent_question(judgment))
+        safety.mark_consent_pending(child_name, category, _time.time())
+    except Exception as e:
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_consent_question_failed", {"error": f"{type(e).__name__}: {e}"},
+        )
+    # 猶予の間だけ待つ。この待ちで通知が止まることはない（待った後に必ず送る）
+    await asyncio.sleep(safety.CONSENT_WAIT_SEC)
+    child_consent = safety.take_consent(child_name)
+
     # 同じ子・同じカテゴリの短時間の繰り返しは集約する（毎ターン送ると親が麻痺し狼少年化する）。
     # 抑制ではなく集約なので、窓を越えた次の通知で「他に N 回ありました」と件数を伝える。
-    import time as _time
     ok_to_send, repeated = safety.should_send_alert(child_name, category, _time.time())
     if not ok_to_send:
         _log_runtime_event(
@@ -244,7 +272,7 @@ async def _handle_safety_signal(system_conf, message, user_conf, input_block, ju
     # 子の同意はこの時点では取れていない（会話の中で確認するのは AI 側の役割）。
     # 返事を待たずに送るのが原則であり、確認できていない旨を通知に明記する。
     body = safety.build_parent_notification(
-        child_name, judgment, input_block, child_consent="unknown",
+        child_name, judgment, input_block, child_consent=child_consent,
         repeated_count=repeated,
     )
     mention = " ".join(f"<@{pid}>" for pid in sorted(get_parent_ids())) or ""
@@ -254,8 +282,20 @@ async def _handle_safety_signal(system_conf, message, user_conf, input_block, ju
             system_conf, message, user_conf, input_block,
             "safety_alert_sent",
             {"category": category, "urgency": judgment.get("urgency"),
-             "confidence": judgment.get("confidence")},
+             "confidence": judgment.get("confidence"),
+             "child_consent": child_consent},
         )
+        # 伝えた後に子を放り出さない。伝えた事実を認め、ここで話し続けてよいと示す。
+        # 黙っていると後で発覚したとき裏切りになり、「言ったからね」と突き放すのも最悪である。
+        try:
+            care = safety.build_post_notification_care(judgment, child_consent)
+            care += safety.build_urgency_guidance(judgment)
+            await message.channel.send(care)
+        except Exception as e:
+            _log_runtime_event(
+                system_conf, message, user_conf, input_block,
+                "safety_care_send_failed", {"error": f"{type(e).__name__}: {e}"},
+            )
     except Exception as e:
         _log_runtime_event(
             system_conf, message, user_conf, input_block,
@@ -804,6 +844,17 @@ async def _on_message_impl(message: discord.Message):
     # タスク自身が判定から通知までを完結させる。呼び出し側が await しなくても通知が出る形にする。
     # 上流で起動しても、手前の return（空入力・未登録・コマンド誤ヒット等）で await されなければ
     # 通知は出ない。安全は「どの経路を通っても必ず届く」ことが要件なので、自己完結型にする。
+    # 直前に「おうちの人に伝えていいかな」と尋ねていれば、この発話を返事として取り込む。
+    # 取り込みは通知の可否を変えない（拒否でも送る）。親への伝え方だけが変わる。
+    if user_conf is not None and input_block:
+        try:
+            import time as _t
+            from app import safety as _safety
+            _safety.record_consent_reply(str(user_conf.get("name", "")), input_block, _t.time())
+        except Exception:
+            # 同意の取り込み失敗で会話も安全判定も止めない
+            pass
+
     safety_task = None
     if user_conf is not None and input_block:
         async def _judge_and_notify(_conf=user_conf, _text=input_block, _sys=system_conf):
