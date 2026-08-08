@@ -1492,6 +1492,21 @@ async def post_register(request: Request, username: str = Form(...)):
     })
 
 
+@app.get("/compass-bot/readme", response_class=HTMLResponse)
+async def get_readme(request: Request, session_token: Optional[str] = Cookie(default=None)):
+    """使い方ガイド（詳細版ドキュメントの正本）を表示する。
+
+    導入手順を読む時点ではまだログインできないため、認証を要求しない。
+    公開情報のみを載せる前提のページであり、残高等の実データは一切扱わない。
+    ログイン済みならヘッダーにユーザー名を出すため、セッションがあれば解決だけしておく。
+    """
+    username = await _get_current_user(session_token)
+    return templates.TemplateResponse("readme.html", {
+        "request": request,
+        "username": username,
+    })
+
+
 @app.get("/compass-bot/login", response_class=HTMLResponse)
 async def get_login(request: Request):
     """ログインページを表示する"""

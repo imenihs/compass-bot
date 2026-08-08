@@ -1,0 +1,755 @@
+{% extends "base.html" %}
+{% block title %}使い方ガイド — Compass Bot{% endblock %}
+{% block content %}
+
+<style>
+  /* 使い方ガイド専用のレイアウト。目次を左に固定し、本文を右に流す2カラム */
+  .doc-layout { display: grid; grid-template-columns: 240px 1fr; gap: 24px; align-items: start; }
+  /* 目次はスクロールしても追従させる。長い本文を読みながら章を移動できるようにする */
+  .doc-toc {
+    position: sticky; top: 16px; background: #fff; border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 18px 16px; max-height: calc(100vh - 40px);
+    overflow-y: auto;
+  }
+  .doc-toc h3 { font-size: 0.9rem; color: #5865f2; margin-bottom: 10px; }
+  .doc-toc a {
+    display: block; color: #555; text-decoration: none; font-size: 0.85rem;
+    padding: 4px 6px; border-radius: 4px; line-height: 1.4;
+  }
+  .doc-toc a:hover { background: #eef1ff; color: #5865f2; }
+  /* 目次内の下位項目は字下げして階層を示す */
+  .doc-toc a.sub { padding-left: 16px; font-size: 0.8rem; color: #777; }
+  .doc-body { min-width: 0; }
+  /* 章は基本カードと同じ見た目に揃え、ダッシュボードと地続きに見せる */
+  .doc-body section {
+    background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    padding: 24px; margin-bottom: 20px;
+  }
+  /* アンカー移動時に見出しがヘッダーへ潜らないよう余白を確保する */
+  .doc-body section { scroll-margin-top: 16px; }
+  .doc-body h2 {
+    font-size: 1.15rem; color: #5865f2; margin-bottom: 14px;
+    padding-bottom: 8px; border-bottom: 2px solid #eef1ff;
+  }
+  .doc-body h3 { font-size: 1rem; color: #444; margin: 20px 0 8px; }
+  .doc-body h4 { font-size: 0.92rem; color: #555; margin: 14px 0 6px; }
+  .doc-body p { line-height: 1.8; margin-bottom: 10px; font-size: 0.92rem; }
+  .doc-body ul, .doc-body ol { margin: 0 0 12px 20px; }
+  .doc-body li { line-height: 1.8; margin-bottom: 5px; font-size: 0.92rem; }
+  .doc-body code {
+    background: #f4f5fb; color: #c7254e; padding: 1px 5px;
+    border-radius: 3px; font-size: 0.86em; word-break: break-all;
+  }
+  /* コード塊は横に長くなりがちなので、カードを壊さず内部でスクロールさせる */
+  .doc-body pre {
+    background: #2b2d3a; color: #e6e6ef; padding: 14px 16px; border-radius: 6px;
+    overflow-x: auto; margin-bottom: 12px; font-size: 0.85rem; line-height: 1.6;
+  }
+  .doc-body pre code { background: none; color: inherit; padding: 0; }
+  /* 表も同様に、狭い画面ではラッパー側で横スクロールさせる */
+  .doc-table-wrap { overflow-x: auto; margin-bottom: 12px; }
+  .doc-body table { min-width: 480px; }
+  /* 注意喚起。危険度に応じて3段階で色を変える */
+  .doc-note {
+    border-left: 4px solid #5865f2; background: #f7f8ff;
+    padding: 12px 16px; border-radius: 0 6px 6px 0; margin: 12px 0; font-size: 0.9rem; line-height: 1.75;
+  }
+  .doc-note.warn { border-left-color: #e8a33d; background: #fff9f0; }
+  .doc-note.danger { border-left-color: #d9534f; background: #fff5f5; }
+  .doc-note strong { color: #333; }
+  /* Discordコマンド例。左の色帯で「打つもの」だと一目で分かるようにする */
+  .cmd-block { border-left: 3px solid #5865f2; padding-left: 12px; margin-bottom: 16px; }
+  .cmd-block .cmd-desc { font-size: 0.88rem; color: #666; margin-bottom: 6px; }
+  .doc-intro { color: #666; font-size: 0.9rem; line-height: 1.8; margin-bottom: 4px; }
+  /* 用語の対応表など、短い定義の並びを読みやすくする */
+  .doc-dl { margin: 0 0 12px 0; }
+  .doc-dl dt { font-weight: 600; color: #444; font-size: 0.9rem; margin-top: 10px; }
+  .doc-dl dd { margin: 3px 0 0 16px; color: #666; font-size: 0.88rem; line-height: 1.7; }
+  .doc-back { display: inline-block; margin-bottom: 16px; font-size: 0.88rem; color: #5865f2; text-decoration: none; }
+  .doc-back:hover { text-decoration: underline; }
+  @media (max-width: 900px) {
+    /* 狭い画面では目次を本文の上へ落とし、追従を解除する */
+    .doc-layout { grid-template-columns: 1fr; }
+    .doc-toc { position: static; max-height: none; }
+    .doc-toc a { display: inline-block; margin-right: 4px; }
+    .doc-toc a.sub { display: none; }
+  }
+</style>
+
+<a href="/compass-bot/dashboard" class="doc-back">← ダッシュボードへ戻る</a>
+
+<div class="doc-layout">
+
+  <!-- 目次: 章立てはこのページの構成と一致させる -->
+  <nav class="doc-toc">
+    <h3>目次</h3>
+    <a href="#about">このBotについて</a>
+    <a href="#principles" class="sub">設計原則</a>
+    <a href="#features">できること</a>
+    <a href="#child-commands">子ども向けの使い方</a>
+    <a href="#parent-commands">親向けの使い方</a>
+    <a href="#dashboard">Webダッシュボード</a>
+    <a href="#setup">導入手順</a>
+    <a href="#claude-cli" class="sub">claude CLI の用意</a>
+    <a href="#backup" class="sub">会話履歴の保存先</a>
+    <a href="#install" class="sub">インストール</a>
+    <a href="#publish" class="sub">Webの公開設定</a>
+    <a href="#users">ユーザーの追加</a>
+    <a href="#settings">設定ファイル</a>
+    <a href="#logs">ログと保存データ</a>
+    <a href="#notes">注意点</a>
+  </nav>
+
+  <div class="doc-body">
+
+    <!-- ============ このBotについて ============ -->
+    <section id="about">
+      <h2>🧭 このBotについて</h2>
+      <p>Compass Bot は、子どもが自分のお小遣いを自主的に管理し、親と並走しながらお金の使い方を学ぶための Discord Bot です。</p>
+      <p>単なる残高管理ツールでも、親が子どもを監視するための仕組みでもありません。子どもが「何に使ったか」「なぜ使ったか」「使ってみて満足したか」を記録し、あとから振り返れることを重視しています。親はその記録を見て、必要なときだけ支援・相談・安全確認を行います。</p>
+
+      <h3 id="principles">設計原則</h3>
+      <ul>
+        <li>子どもの主体性を優先する。親の管理画面や通知は、子どもの自律を支えるための補助機能とする。</li>
+        <li>感想・理由・満足度は、査定のための点数付けではなく、振り返りと学習の材料として扱う。</li>
+        <li>残高不一致は、まず記録漏れに気づく機会として扱う。自動的な強い罰ではなく、透明で取り戻せる軽い影響に留める。</li>
+        <li>兄弟・他人との比較はしない。比較する場合は過去の本人との比較だけにする。</li>
+        <li>お金の判断は、金額だけでなく目的・計画・振り返り・記録習慣を合わせて見る。</li>
+        <li>収集した情報は、必ず子ども本人の振り返り、親との会話、次回査定の説明可能な判断材料のいずれかに活用する。</li>
+        <li>便利さよりも、子どもが自分で気づき、考え、次の使い方を改善できることを優先する。</li>
+      </ul>
+    </section>
+
+    <!-- ============ できること ============ -->
+    <section id="features">
+      <h2>✨ できること</h2>
+
+      <h3>会話Bot（AIが会話を主導）</h3>
+      <ul>
+        <li>子どもは Discord で自然な言葉で話しかけるだけ。AI が会話を主導し、文脈は会話が途切れても続きます。</li>
+        <li>残高・支出・入金・目標・査定などお金を動かす処理は AI が直接計算せず、Bot 側で厳密に実行します（金額の誤りが残高に反映されない設計）。</li>
+        <li>増額の相談には、AI が突き放さず一緒に計画を考え、正当な理由があれば査定額を「提案」します。実際の支給は親の承認で確定します（子どもが自分でお金を増やせない）。</li>
+        <li>支給できる金額には上限があり、Bot 側で必ず守られます。</li>
+        <li>親は <code>名前の代理</code> で子どもに代わって投稿できます。</li>
+      </ul>
+
+      <h3>お小遣い帳</h3>
+      <ul>
+        <li><code>使った物</code> / <code>理由</code> / <code>満足度（0〜10）</code> / <code>金額（任意）</code> を記録します。</li>
+        <li>ラベル形式でも簡易形式でも入力でき、<code>支出 500円 お菓子</code> のように残高を減らしつつ同時に記録することもできます。</li>
+      </ul>
+
+      <h3>ウォレット（残高管理）</h3>
+      <ul>
+        <li>初期設定で現在の所持金を登録します。</li>
+        <li>残高報告との差分を確認し、記録漏れに気づく材料にします。</li>
+      </ul>
+
+      <h3>定期運用（自動）</h3>
+      <ul>
+        <li>毎月の支給前に固定お小遣いのリマインドを送ります。</li>
+        <li>毎月決まった時刻に、対象チャンネルへ残高報告のお願いを送ります。</li>
+      </ul>
+
+      <h3>親向け機能</h3>
+      <ul>
+        <li><strong>全体確認</strong>: 全員の残高・報告状況・最終支出日を一覧表示します。</li>
+        <li><strong>支出傾向分析</strong>: 過去3ヶ月の件数・満足度平均・よく買った品目を表示します。</li>
+        <li><strong>低残高アラート</strong>（自動）: 残高が設定した閾値を下回ると親チャンネルに通知します。</li>
+        <li><strong>月次サマリー</strong>（自動）: 毎月、前月の支出統計を親チャンネルへ送ります。</li>
+      </ul>
+
+      <h3>目標貯金</h3>
+      <ul>
+        <li>目標を設定し、進捗をプログレスバーで確認できます（1人あたり複数登録可・最大5件）。</li>
+      </ul>
+
+      <h3>学習支援・親子の会話づくり</h3>
+      <ul>
+        <li>支出の記録から、親子で話すきっかけになるカードや、子どもへの小さな行動提案を作ります。</li>
+        <li>子どもには内部のメモや方針は見せず、一度に1つだけ前向きな行動を提案します。</li>
+        <li>親は子どもごとに、AI のフォロー方針（重視する観点・声かけの強さ）を設定できます。</li>
+      </ul>
+
+      <h3>能動的な声かけ</h3>
+      <ul>
+        <li>記録が途切れている、前に決めた行動に反応がない、といったときに、Bot から子どもへ短い声かけを送ります（有効化した場合）。</li>
+        <li>「放置」「サボり」といった責める表現は使わず、戻りやすい小さな行動だけを促します。</li>
+      </ul>
+
+      <h3>安全・プライバシー</h3>
+      <ul>
+        <li>お金を動かす処理には上限と本人確認があり、なりすましや過剰な自己入金を防ぎます。</li>
+        <li>エラー時は内部の原因を利用者に見せず、やさしい案内を返します。</li>
+        <li>子どもへの声かけは、他人や兄弟との比較・人格否定・強い叱責をしません。</li>
+      </ul>
+    </section>
+
+    <!-- ============ 子ども向けコマンド ============ -->
+    <section id="child-commands">
+      <h2>💬 子ども向けの使い方</h2>
+      <p class="doc-intro">Discord で Bot に話しかけて使います。基本は自然な言葉で大丈夫です。下は決まった形で打ちたいときの一覧です。</p>
+
+      <h3>1. 査定（お小遣いの相談）</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">買いたいものを理由と一緒に相談する。AI が計画を一緒に考え、正当な理由があれば金額を提案する（支給は親の承認で確定）。</div>
+        <pre><code>@compass-bot 3Dプリンタ買いたい
+理由: 工作したい
+予算: 3万円</code></pre>
+      </div>
+
+      <h3>2. 使い方の説明</h3>
+      <div class="cmd-block">
+        <pre><code>@compass-bot 使い方</code></pre>
+      </div>
+
+      <h3>3. 初期設定（ウォレット初期残高）</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">いま持っているお金を最初に登録する。</div>
+        <pre><code>@compass-bot 初期設定
+@compass-bot 1200円</code></pre>
+      </div>
+
+      <h3>4. 支出記録（お小遣い帳）</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">案内を起動する:</div>
+        <pre><code>@compass-bot 支出記録</code></pre>
+        <div class="cmd-desc">ラベル形式で記録する:</div>
+        <pre><code>@compass-bot 使った物: ノート
+理由: 英語 の テスト 対策
+満足度: 8
+金額: 300円</code></pre>
+        <div class="cmd-desc">簡易形式で記録する（金額は任意）:</div>
+        <pre><code>@compass-bot ノート / 英語のテスト対策で必要だった / 8
+@compass-bot ノート / 英語のテスト対策で必要だった / 8 / 300円</code></pre>
+      </div>
+
+      <h3>5. 現在残高確認</h3>
+      <div class="cmd-block">
+        <pre><code>@compass-bot 残高確認</code></pre>
+      </div>
+      <div class="doc-note">
+        親が子ども用チャンネルで <code>残高おしえて</code> と送った場合は、親本人ではなく<strong>そのチャンネルの子ども</strong>の残高を返します。親は <code>はなの残高おしえて</code> のように名前を明示して確認することもできます。
+      </div>
+
+      <h3>6. 残高報告</h3>
+      <div class="cmd-block">
+        <pre><code>@compass-bot 残高報告 1200円</code></pre>
+      </div>
+      <div class="doc-note warn">
+        残高報告・初期設定・財布チェック中の金額入力は、誤入力防止のため <strong><code>円</code> まで書いてください</strong>。Discord ID のような巨大な数字列や、現実的な上限を超える金額は反映せず再入力待ちにします。
+      </div>
+
+      <h3>7. 手動支出（残高から差し引く）</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">残高を減らして、お小遣い帳にも同時に記録する。</div>
+        <pre><code>@compass-bot 支出 500円 お菓子</code></pre>
+      </div>
+
+      <h3>8. 臨時収入（残高に加算）</h3>
+      <div class="cmd-block">
+        <pre><code>@compass-bot 入金 3000円 お年玉</code></pre>
+      </div>
+
+      <h3>9. 入出金台帳確認</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">直近10件の入出金履歴を表示する。</div>
+        <pre><code>@compass-bot 入出金履歴
+@compass-bot 台帳確認</code></pre>
+      </div>
+
+      <h3>10. 今月の振り返り</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">当月の支出件数・合計額・満足度平均・Top3品目・現在残高を表示する。</div>
+        <pre><code>@compass-bot 振り返り</code></pre>
+      </div>
+
+      <h3>11. 査定履歴確認</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">直近5件の査定金額（固定・臨時・合計）を一覧表示する。</div>
+        <pre><code>@compass-bot 査定履歴</code></pre>
+      </div>
+
+      <h3>12. 目標貯金（最大5件）</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">目標を設定する（同名タイトルなら金額を上書き更新）:</div>
+        <pre><code>貯金目標 ゲーム機 30000円
+貯金目標 旅行費 10000円</code></pre>
+        <div class="cmd-desc">進捗を確認する（全目標のプログレスバー表示）:</div>
+        <pre><code>目標確認</code></pre>
+        <div class="cmd-desc">特定の目標を削除する:</div>
+        <pre><code>目標削除 ゲーム機</code></pre>
+        <div class="cmd-desc">タイトル未指定で削除する（一覧を表示してタイトルを案内）:</div>
+        <pre><code>目標削除</code></pre>
+        <div class="cmd-desc">全目標を一括削除する:</div>
+        <pre><code>目標全削除</code></pre>
+      </div>
+      <div class="doc-note">
+        目標設定の補完入力でも金額は <code>円</code> 必須です。金額だけ先に入力した後に <code>残高おしえて</code> など別コマンドらしい文が来た場合は、目標名として保存せず再入力を促します。
+      </div>
+    </section>
+
+    <!-- ============ 親向けコマンド ============ -->
+    <section id="parent-commands">
+      <h2>👪 親向けの使い方</h2>
+      <p class="doc-intro">親として登録された Discord ユーザーだけが使えるコマンドです。</p>
+
+      <h3>13. 親による代理投稿</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">子どもに代わって投稿する。</div>
+        <pre><code>@compass-bot たろうの代理 参考書を買いたい</code></pre>
+      </div>
+
+      <h3>14. 全体確認ダッシュボード</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">全ユーザーの残高・残高報告状況・最終支出日を一覧表示する。</div>
+        <pre><code>全体確認</code></pre>
+      </div>
+
+      <h3>15. 支出傾向分析</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">過去3ヶ月の月別件数・満足度平均・Top5品目を表示する。</div>
+        <pre><code>たろうの分析
+全員の分析</code></pre>
+      </div>
+
+      <h3>16. 手動支給</h3>
+      <div class="cmd-block">
+        <pre><code>支給 たろう 700円</code></pre>
+      </div>
+
+      <h3>17. 残高調整（加算・減算）</h3>
+      <div class="cmd-block">
+        <pre><code>残高調整 たろう +500円
+残高調整 たろう -300円</code></pre>
+      </div>
+
+      <h3>18. 設定変更（固定お小遣い・臨時上限）</h3>
+      <div class="cmd-block">
+        <pre><code>設定変更 たろう 固定 800円
+設定変更 たろう 臨時 5000円</code></pre>
+      </div>
+      <div class="doc-note warn">
+        支給・残高調整・設定変更は、<strong>コマンド全体がこの形式のときだけ</strong>実行されます。<code>はなのお小遣い金額を変えたい</code> のような自然文や、<code>昨日 支給 はな 300円 ってやった?</code> のような文中に含まれる形では実行されません（誤操作で実残高が動くのを防ぐため）。この場合は明示コマンド形式を案内します。
+      </div>
+
+      <h3>19. 一括支給（全員の固定お小遣いを加算）</h3>
+      <div class="cmd-block">
+        <pre><code>一括支給</code></pre>
+      </div>
+
+      <h3>20. 他ユーザーの台帳確認</h3>
+      <div class="cmd-block">
+        <pre><code>@compass-bot たろうの台帳</code></pre>
+      </div>
+
+      <h3>21. 全チャンネルへの一斉アナウンス</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc"><code>allow_channel_ids</code> の全チャンネルに任意のメッセージを送信する。</div>
+        <pre><code>アナウンス 今月の支給日は5日です</code></pre>
+      </div>
+
+      <h3>22. 使い方の送信（単体チャンネル）</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">コマンドを送ったチャンネル1つだけに使い方を送信する。</div>
+        <pre><code>使い方の説明</code></pre>
+      </div>
+
+      <h3>23. 使い方の一斉通知（全チャンネル）</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc"><code>allow_channel_ids</code> の全チャンネルへ使い方と初期設定を通知する。</div>
+        <pre><code>使い方の説明と初期設定</code></pre>
+      </div>
+
+      <h3>24. 残高チェック案内の即時送信</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">各チャンネルに今月の残高チェック案内を即時送信する。</div>
+        <pre><code>@compass-bot 残高チェック送信
+@compass-bot 月頭案内送信</code></pre>
+      </div>
+
+      <h3>25. リマインダーテスト</h3>
+      <div class="cmd-block">
+        <pre><code>@compass-bot reminder test</code></pre>
+      </div>
+
+      <h3>26. Webダッシュボード アクセス承認</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">ユーザーからの申請を承認して仮パスワードを発行する。承認すると Discord に仮パスワードが通知される。</div>
+        <pre><code>web承認 たろう</code></pre>
+      </div>
+    </section>
+
+    <!-- ============ Webダッシュボード ============ -->
+    <section id="dashboard">
+      <h2>🖥️ Webダッシュボード</h2>
+      <p>ブラウザからお小遣いの状況を確認できます。<strong>親・子どもの両方が利用可能</strong>で、ログイン後の表示内容はユーザー種別で自動的に切り替わります。</p>
+
+      <h3>登録フロー（初回のみ）</h3>
+      <ol>
+        <li><strong>アクセス申請</strong> — <code>/compass-bot/register</code> を開き、ユーザー名を入力して申請します。ユーザー名は設定ファイルの <code>name</code> フィールドと一致させてください（親・子どもとも）。</li>
+        <li><strong>親が Discord で承認</strong> — Discord に申請通知が届くので、親が <code>web承認 [ユーザー名]</code> と送信します。仮パスワードが Discord に通知されます。</li>
+        <li><strong>本パスワード設定</strong> — <code>/compass-bot/set_password</code> を開き、仮パスワードを入力して本パスワード（8文字以上）を設定します。</li>
+        <li><strong>ログイン</strong> — <code>/compass-bot/login</code> またはトップページからログインします。</li>
+      </ol>
+
+      <h3>表示内容</h3>
+      <div class="doc-table-wrap">
+        <table>
+          <thead><tr><th>ユーザー種別</th><th>表示内容</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>親（管理者）</td>
+              <td>全ユーザーの残高・月額お小遣い・今月支出・低残高フラグ・貯金目標・残高報告状況、表示順保存、支給／残高調整、承認待ち申請一覧</td>
+            </tr>
+            <tr>
+              <td>子ども（一般）</td>
+              <td>自分の残高・今月支出・直近5件の支出記録・貯金目標の進捗</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>画面の操作</h3>
+      <ul>
+        <li>全ユーザー一覧の各行の <code>設定</code> からモーダルを開き、子ども別の設定を編集できます。親ユーザーの設定も同じ一覧の親行から編集できます。</li>
+        <li>一覧の並び順はドラッグハンドルで入れ替え、<code>並び順を保存</code> で保存します（保存先は <code>settings/setting.json</code> の <code>web_dashboard.user_order</code>）。未保存時は名前順で表示されます。</li>
+        <li>モーダルは画面外クリックでは閉じません。<code>Esc</code> または <code>キャンセル</code> で閉じます。未保存の変更がある場合は破棄確認を表示し、<code>name</code> / <code>discord_user_id</code> の変更保存時は重要項目の確認を表示します。</li>
+        <li>操作後の成功・失敗メッセージは画面下部のトーストで表示し、5秒後に自動で閉じます。</li>
+        <li>PC では最大1440px まで広がり、タブレット・スマホでは画面幅に合わせて縮みます。列数の多い一覧は狭い画面で横スクロールします。</li>
+      </ul>
+
+      <div class="doc-note">
+        <strong>管理者権限の自動付与</strong>: Web 登録時のユーザー名が設定ファイルの <code>name</code> と一致し、そのユーザーが <code>settings/users/parents/</code> に登録されていれば、パスワード設定時に自動的に管理者（親）として登録されます。
+      </div>
+      <div class="doc-note warn">
+        セッションは <strong>7日間有効</strong>です。期限切れ後は再ログインが必要です。
+      </div>
+    </section>
+
+    <!-- ============ 導入手順 ============ -->
+    <section id="setup">
+      <h2>🔧 導入手順</h2>
+
+      <h3>必要環境</h3>
+      <ul>
+        <li>Python 3.11+</li>
+        <li>Discord Bot Token（Discord Developer Portal で作成）</li>
+        <li><strong>claude CLI</strong>（会話の主役。ローカルにインストールし、ログイン済みであること）</li>
+      </ul>
+      <p>会話は claude CLI が主導し、金額を動かす処理だけを Python の MCP wallet tool（<code>app/mcp_wallet.py</code>）が担当します。<strong>外部の生成AI APIキーは不要です。</strong></p>
+
+      <h4>依存パッケージ（<code>requirements.txt</code>）</h4>
+      <ul>
+        <li><code>discord.py</code></li>
+        <li><code>fastapi</code> / <code>uvicorn</code>（Webダッシュボード）</li>
+        <li><code>python-dotenv</code></li>
+        <li><code>httpx</code></li>
+        <li><code>jinja2</code>（テンプレートエンジン）</li>
+        <li><code>python-multipart</code>（フォーム送信の受け取り）</li>
+      </ul>
+
+      <h3 id="claude-cli">0. claude CLI を用意する</h3>
+      <p>会話処理には claude CLI が必要です。インストールしてログインし、コマンドラインから会話できる状態にします。</p>
+      <pre><code># claude CLI をインストール（公式の手順に従う）
+which claude          # 例: /usr/local/bin/claude にあることを確認
+claude --version      # 動作確認</code></pre>
+      <p>Bot は既定で <code>/usr/local/bin/claude</code> を使います。別の場所にある場合は <code>.env</code> の <code>COMPASS_CLAUDE_BIN</code> で指定します。systemd 配下では PATH が最小限になりがちなので、絶対パス指定を推奨します。</p>
+      <div class="doc-note">
+        Bot は Anthropic の API キーを使いません。会話は Bot を動かすマシンの claude CLI をそのまま呼び出すため、<strong>導入した人自身の Claude アカウントで動きます</strong>。利用量もそのアカウントに紐づきます。
+      </div>
+
+      <h4 id="backup">⚠️ 会話履歴の保存先について（バックアップ対象に注意）</h4>
+      <div class="doc-note danger">
+        <p>子どもとの<strong>会話履歴の実体は、このリポジトリの中ではなく <code>~/.claude/projects/</code> 配下にあります</strong>。Bot が保持しているのは、そこを指す claude セッションID（<code>data/conversation_sessions.json</code>）だけです。</p>
+        <p>これは claude CLI にセッション管理を任せている設計上の帰結で、次の点に注意してください。</p>
+        <ul>
+          <li><strong><code>data/</code> だけをバックアップしても会話履歴は復元できません。</strong> バックアップを取るなら <code>~/.claude/projects/</code> も対象に含めてください。</li>
+          <li><strong><code>~/.claude/projects/</code> を削除すると、それまでの会話の流れが失われます。</strong> 残高や支出の記録（<code>data/</code> 配下の台帳）は消えませんが、AI が「これまで何を話してきたか」を思い出せなくなり、伴走の文脈が途切れます。</li>
+          <li>Bot を動かすユーザーを変えると、参照先のホームディレクトリが変わるため過去の会話は引き継がれません。systemd で常駐させる場合は、実行ユーザーを固定してください。</li>
+          <li>セッションIDには寿命（既定7日）があり、それを過ぎた発話では新しいセッションを張り直します。古すぎる文脈を引きずらないための仕様です。</li>
+        </ul>
+      </div>
+
+      <h3 id="install">1. 依存インストール</h3>
+      <pre><code>git clone &lt;このリポジトリ&gt;
+cd compass-bot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt</code></pre>
+
+      <h3>2. 環境変数設定（<code>.env</code>）</h3>
+      <pre><code>cp .env.example .env</code></pre>
+      <pre><code>DISCORD_BOT_TOKEN=xxxxxxxx
+# COMPASS_CLAUDE_BIN=/usr/local/bin/claude   # claude CLI が別の場所にあるときだけ設定</code></pre>
+      <p>Discord Bot Token は <a href="https://discord.com/developers/applications" target="_blank" rel="noopener">Discord Developer Portal</a> で Bot を作成し、<code>MESSAGE CONTENT INTENT</code> を有効にして取得します。作成した Bot を対象サーバーへ招待してください。</p>
+
+      <h3>3. MCP wallet 設定（<code>config/wallet_mcp.json</code>）</h3>
+      <p>claude CLI が財布操作ツールを呼べるよう、MCP サーバのパスを実環境へ合わせます。<strong>リポジトリのパス（<code>cwd</code>）と venv の python パスを自分の環境に書き換えてください。</strong></p>
+      <pre><code>{
+  "mcpServers": {
+    "wallet": {
+      "command": "/path/to/compass-bot/.venv/bin/python",
+      "args": ["-m", "app.mcp_wallet"],
+      "cwd": "/path/to/compass-bot"
+    }
+  }
+}</code></pre>
+
+      <h3>4. 設定ファイルを作る</h3>
+      <p>テンプレート（<code>*.example.json</code>）をコピーして実設定を作ります。実設定は個人情報を含むため <code>.gitignore</code> 済みで、リポジトリには入りません。</p>
+      <pre><code>cp settings/setting.example.json settings/setting.json
+# 子どもユーザーを追加
+cp settings/users/user.example.json settings/users/&lt;子どもの名前&gt;.json
+# 親ユーザーを追加
+cp settings/users/parents/parent.example.json settings/users/parents/&lt;親の名前&gt;.json</code></pre>
+
+      <h3>5. 起動</h3>
+      <h4>手動起動（開発時）</h4>
+      <pre><code>source .venv/bin/activate
+python3 -m app.bot</code></pre>
+      <p>Web ダッシュボードは Bot と同一プロセスで自動起動します（既定 port 8765）。</p>
+
+      <h4>systemd で常駐（本番）</h4>
+      <p><code>scripts/compass.service.example</code> をコピーし、パス・ユーザー名を自分の環境へ書き換えて <code>/etc/systemd/system/compass.service</code> に置きます。</p>
+      <pre><code>sudo cp scripts/compass.service.example /etc/systemd/system/compass.service
+sudo nano /etc/systemd/system/compass.service   # WorkingDirectory / ExecStart / User を実環境へ
+sudo systemctl daemon-reload
+sudo systemctl enable --now compass.service
+sudo systemctl status compass.service</code></pre>
+      <div class="doc-note danger">
+        <strong>重要</strong>: コード変更を本番へ反映するには、コミットだけでなく <code>sudo systemctl restart compass.service</code> が必要です（実行中プロセスは古いコードのまま動き続けます）。
+      </div>
+
+      <h3 id="publish">6. Webダッシュボードを公開する</h3>
+      <p>Web ダッシュボードは Bot と同じプロセスで <strong><code>127.0.0.1:8765</code>（ローカルのみ）</strong> で待ち受けます。外部のブラウザからアクセスするには、Web サーバー（Apache / Nginx）をリバースプロキシとして前段に置き、<code>https://&lt;あなたのドメイン&gt;/compass-bot/</code> を <code>127.0.0.1:8765</code> へ転送します。</p>
+      <p>ローカル bind のままにするのは、アプリを直接インターネットへ晒さず、HTTPS 終端・アクセス制御を Web サーバー側に任せるためです。</p>
+
+      <h4>Apache の例</h4>
+      <pre><code># https の VirtualHost 内
+ProxyPreserveHost On
+ProxyPass        /compass-bot/ http://127.0.0.1:8765/compass-bot/
+ProxyPassReverse /compass-bot/ http://127.0.0.1:8765/compass-bot/</code></pre>
+      <pre><code>sudo a2enmod proxy proxy_http
+sudo systemctl reload apache2</code></pre>
+      <p>同梱の <code>.htaccess</code> は、ソースコード・設定・データファイルへの直接アクセスを拒否します。ドキュメントルート配下にアプリを置く構成では、この <code>.htaccess</code> が効くようにしてください（<code>AllowOverride All</code>）。</p>
+
+      <h4>Nginx の例</h4>
+      <pre><code>location /compass-bot/ {
+    proxy_pass http://127.0.0.1:8765/compass-bot/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+
+      <h4>HTTPS</h4>
+      <div class="doc-note warn">
+        ログインとパスワード設定を扱うため、<strong>公開時は必ず HTTPS にしてください</strong>（<a href="https://letsencrypt.org/" target="_blank" rel="noopener">Let's Encrypt</a> などで証明書を取得）。設定できたら <code>settings/setting.json</code> の <code>web_base_url</code> を公開 URL に合わせます。
+      </div>
+    </section>
+
+    <!-- ============ ユーザーの追加 ============ -->
+    <section id="users">
+      <h2>👤 ユーザーの追加</h2>
+      <p>Compass Bot は「子ども（一般ユーザー）」と「親（管理者）」の2種類のユーザーを扱います。</p>
+      <div class="doc-note">
+        <strong>推奨の流れ</strong>: 最初の親を1人だけ手作業で JSON 作成 → Bot と Web を起動 → その親で Web ダッシュボードにログイン → <strong>あとは全員ブラウザの「＋ 子どもを追加」「＋ 親を追加」から追加</strong>します。2人目以降は JSON を手で書く必要はありません。
+      </div>
+
+      <h3>最初の親を1人だけ用意する（唯一の手作業）</h3>
+      <p>Web にログインできる管理者が1人も居ない状態からのブートストラップだけは、JSON を手で作ります。</p>
+      <pre><code>cp settings/users/parents/parent.example.json settings/users/parents/おとうさん.json</code></pre>
+      <pre><code>{
+  "name": "おとうさん",
+  "discord_user_id": 222222222222222222
+}</code></pre>
+      <ul>
+        <li><code>discord_user_id</code>: Discord で開発者モードを有効にし、ユーザーを右クリック →「IDをコピー」で取得（17〜19桁）。</li>
+        <li><code>parents/</code> に置くだけで管理者になります。</li>
+        <li>作成後、Bot を起動し、この親で Web ダッシュボードの登録フローを済ませればログインできます。</li>
+      </ul>
+
+      <h3>ブラウザから追加する（2人目以降・推奨）</h3>
+      <p>ログイン後、「全ユーザー一覧」の上にある <strong>「＋ 子どもを追加」「＋ 親を追加」</strong> から、名前・Discord ID などを入力して追加します。既存ユーザーの編集も同じ画面の「設定」から行えます。</p>
+      <ul>
+        <li><strong>子どもを追加</strong>しても再起動は不要です（すぐ会話できます）。</li>
+        <li><strong>親を追加</strong>した場合は、反映のため <code>sudo systemctl restart compass.service</code> が必要です。</li>
+        <li>名前や Discord ID が既存と重複する場合は、その場でエラー表示されます。</li>
+      </ul>
+
+      <h3>（参考）子どもの JSON を手で作る</h3>
+      <p>通常はブラウザからの追加で十分です。手で書きたい場合は <code>settings/users/&lt;名前&gt;.json</code> を作ります（ファイル名は任意。<code>name</code> フィールドが実際のキーになります）。</p>
+      <pre><code>{
+  "name": "たろう",
+  "discord_user_id": 111111111111111111,
+  "age": 12,
+  "gender": "male",
+  "bot_personality": "sibling",
+  "fixed_allowance": 700,
+  "temporary_max": 3000,
+  "fixed_increase_cap": 100,
+  "penalty_cap": 100,
+  "keywords": {
+    "investment": ["検定", "英語", "参考書"],
+    "fun": ["漫画", "ゲーム"],
+    "danger": ["高額ガチャ", "課金"]
+  }
+}</code></pre>
+      <dl class="doc-dl">
+        <dt><code>name</code></dt>
+        <dd>子どもの名前。Discord の会話・残高・ログのキーになる。<strong>他のユーザーと重複させない。</strong></dd>
+        <dt><code>discord_user_id</code></dt>
+        <dd>その子の Discord ユーザーID（17〜19桁の数値）。開発者モードを有効にし、ユーザーを右クリック →「IDをコピー」で取得。</dd>
+        <dt><code>age</code></dt>
+        <dd>年齢。会話の言葉づかい（漢字の量・文の長さ）を年齢に合わせる。</dd>
+        <dt><code>gender</code></dt>
+        <dd><code>male</code> / <code>female</code> / <code>unspecified</code>。</dd>
+        <dt><code>bot_personality</code></dt>
+        <dd>会話の口調。<code>sibling</code>（年上のきょうだい・既定）/ <code>friend</code> / <code>teacher</code> / <code>parent</code>。</dd>
+        <dt><code>fixed_allowance</code></dt>
+        <dd>毎月の固定お小遣い（円）。</dd>
+        <dt><code>temporary_max</code></dt>
+        <dd>1回の臨時査定で提案できる上限（円）。</dd>
+        <dt><code>fixed_increase_cap</code> / <code>penalty_cap</code></dt>
+        <dd>固定増額の上限 / 記録漏れ時の調整上限（円）。</dd>
+        <dt><code>keywords</code></dt>
+        <dd>査定時に用途を判断するための語。投資的 / 娯楽 / 危険の3分類。</dd>
+      </dl>
+      <p>親を手作業で足す場合は <code>settings/users/parents/&lt;名前&gt;.json</code> に <code>name</code> と <code>discord_user_id</code> の2つを書くだけです。</p>
+
+      <div class="doc-note warn">
+        <strong>親の追加・変更・削除は再起動が必要</strong>: 親の判定は Bot 起動時に一度だけ読み込みます。反映するには <code>sudo systemctl restart compass.service</code> してください。子どもユーザーは毎回読み直すため再起動は不要です。
+      </div>
+      <div class="doc-note danger">
+        <strong>重要な前提: 親IDと子IDは重複させない</strong><br>
+        同じ Discord ユーザーIDを親と子の両方に登録しないでください。Bot は Discord ID で本人を判定するため、重複するとルーティングが壊れます（親の発話が弾かれる等）。動作確認用に自分を子として試したい場合は、テスト専用の別ユーザーを用意してください。
+      </div>
+    </section>
+
+    <!-- ============ 設定ファイル ============ -->
+    <section id="settings">
+      <h2>⚙️ 設定ファイル</h2>
+
+      <h3><code>settings/setting.json</code></h3>
+      <ul>
+        <li><code>web_base_url</code>: WebダッシュボードのベースURL</li>
+        <li><code>allow_channel_ids</code>: Botが反応するチャンネルID配列</li>
+        <li><code>assess_keyword</code>: 査定抽出判定キーワード</li>
+        <li><code>force_assess_test_keyword</code>: 動作確認用キーワード</li>
+      </ul>
+
+      <h4><code>chat</code>: 会話モード</h4>
+      <ul>
+        <li><code>natural_chat_enabled</code>, <code>require_mention</code></li>
+        <li><code>natural_chat_enabled=true</code> でも、他ユーザー宛ての <code>@...</code> メンションを含む発言は無視します。反応対象はメンションなし、または <code>@compass-bot</code> / Discord の Bot 宛てメンションのみです。</li>
+      </ul>
+
+      <h4><code>allowance_reminder</code>: 支給前リマインド</h4>
+      <ul>
+        <li><code>enabled</code>, <code>channel_id</code>, <code>payday_day</code>, <code>notify_time</code>（<code>HH:MM</code>）</li>
+        <li><code>notify_offset</code>: カンマ区切り文字列または配列で複数日指定可（例: <code>"-7day,-1day,0day"</code>）。<code>0day</code> は支給日当日を意味します。</li>
+      </ul>
+
+      <h4><code>wallet_audit</code>: 月次残高監査</h4>
+      <ul>
+        <li><code>enabled</code>, <code>check_day</code>, <code>check_time</code>, <code>penalty_rate</code></li>
+        <li>送信先は <code>allow_channel_ids</code> を使用（<code>channel_id</code> 設定は不要・無視されます）。</li>
+      </ul>
+
+      <h4><code>child_income_report</code>: 子どもの自己申告入金の上限</h4>
+      <ul>
+        <li><code>max_amount</code>: 1回の自己申告で反映できる上限額（円）。既定 5000。0 以下で上限なし。</li>
+        <li>上限を超えた場合は残高を変えず、おうちの人に <code>残高調整</code> で記録してもらう案内を返します。</li>
+      </ul>
+
+      <h4><code>low_balance_alert</code>: 低残高アラート</h4>
+      <ul>
+        <li><code>enabled</code>: true で有効化</li>
+        <li><code>threshold</code>: 残高がこの値を下回ったときに通知（円）</li>
+        <li><code>channel_id</code>: 通知先チャンネルID</li>
+      </ul>
+
+      <h4><code>monthly_summary</code>: 月次サマリーレポート</h4>
+      <ul>
+        <li><code>enabled</code>: true で有効化</li>
+        <li><code>channel_id</code>: 送信先チャンネルID</li>
+        <li><code>send_time</code>: 送信時刻（<code>HH:MM</code>、毎月1日に実行）</li>
+      </ul>
+
+      <h4><code>pocket_journal_reminder</code>: 週次支出記録リマインド</h4>
+      <ul>
+        <li><code>enabled</code>: true で有効化</li>
+        <li><code>day_of_week</code>: 送信曜日（0=月曜〜6=日曜、Python <code>weekday()</code> 準拠）</li>
+        <li><code>notify_time</code>: 送信時刻（<code>HH:MM</code>）</li>
+        <li>過去7日間に支出記録がないユーザーにのみ送信します。</li>
+      </ul>
+
+      <h4><code>proactive_child_nudge</code>: 能動的な子ども伴走</h4>
+      <ul>
+        <li><code>enabled</code>: true で有効化</li>
+        <li><code>notify_time</code>: 毎日確認する時刻（<code>HH:MM</code>）。Bot の定期ループは約10分間隔で、時刻ぴったりの1分判定ではなく、予定時刻を過ぎた後に未処理なら実行します。</li>
+        <li><code>no_record_days</code>: 支出記録が何日空いたら声をかけるか</li>
+        <li><code>challenge_stale_days</code>: 子どもチャレンジ未反応を何日で声かけ対象にするか</li>
+        <li><code>growth_plan_review_days_before</code>: 成長行動プラン確認日の何日前から声をかけるか</li>
+        <li><code>min_days_between_nudges</code>: 同じ子どもへ連投しないための最低間隔</li>
+        <li><code>max_per_run</code>: 1回のスキャンで送る最大人数</li>
+      </ul>
+
+      <h3><code>settings/system.json</code></h3>
+      <ul>
+        <li><code>currency</code></li>
+        <li><code>log_dir</code></li>
+        <li><code>default_reply_format</code></li>
+      </ul>
+
+      <h3>環境変数（任意調整）</h3>
+      <div class="doc-table-wrap">
+        <table>
+          <thead><tr><th>変数</th><th>既定</th><th>用途</th></tr></thead>
+          <tbody>
+            <tr><td><code>COMPASS_CLAUDE_BIN</code></td><td><code>/usr/local/bin/claude</code></td><td>claude CLI 実行ファイルのパス</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>金額の安全弁（自己申告入金の回数／日次／月次上限、査定の各上限）は環境変数ではなく <code>settings/setting.json</code> と各ユーザー設定で管理します。</p>
+    </section>
+
+    <!-- ============ ログ ============ -->
+    <section id="logs">
+      <h2>📂 ログと保存データ</h2>
+      <p><code>settings/system.json</code> の <code>log_dir</code> 配下に JSONL で保存されます。</p>
+      <dl class="doc-dl">
+        <dt><code>{name}_events.jsonl</code></dt>
+        <dd>査定イベント（入力・返信・査定金額）</dd>
+        <dt><code>{name}_allowance_amounts.jsonl</code></dt>
+        <dd>査定金額ログ（<code>fixed</code>, <code>temporary</code>, <code>total</code>）</dd>
+        <dt><code>{name}_wallet_ledger.jsonl</code></dt>
+        <dd>残高の増減台帳</dd>
+        <dt><code>{name}_pocket_journal.jsonl</code></dt>
+        <dd>お小遣い帳（支出記録）。<code>amount</code> フィールドは任意（省略可）</dd>
+        <dt><code>runtime_diagnostics.jsonl</code></dt>
+        <dd>実運用診断ログ（会話処理の分岐や違和感の記録）</dd>
+        <dt><code>data/</code></dt>
+        <dd>残高・監査・リマインド・会話セッションなどの実行時状態</dd>
+      </dl>
+      <p>これらは実行時に自動生成され、リポジトリには含まれません。</p>
+      <div class="doc-note warn">
+        会話履歴そのものはここには入りません。<a href="#backup">会話履歴の保存先</a>を参照してください。
+      </div>
+    </section>
+
+    <!-- ============ 注意点 ============ -->
+    <section id="notes">
+      <h2>📌 注意点</h2>
+      <ul>
+        <li><code>chat.require_mention=true</code> の場合はメンション必須です。</li>
+        <li><code>chat.require_mention=false</code> の自然会話モードでも、他ユーザー宛てメンションを含む発言には反応しません。</li>
+        <li><code>allow_channel_ids</code> を設定している場合、対象チャンネル以外では反応しません。</li>
+        <li>個人情報を含む実設定（<code>settings/setting.json</code>, <code>settings/users/*.json</code>, <code>settings/users/parents/*.json</code>）は <code>.gitignore</code> で除外し、テンプレート（<code>*.example.json</code>）のみ共有します。</li>
+      </ul>
+    </section>
+
+  </div>
+</div>
+
+{% endblock %}
