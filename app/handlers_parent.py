@@ -263,6 +263,122 @@ async def maybe_handle_parent_broadcast_guide(message: discord.Message, content:
     return True
 
 
+async def maybe_handle_safety_setup_check(message: discord.Message, content: str) -> bool:
+    """「安全設定チェック」で、危険信号の通知先が正しいかを実際に送信して確かめる（親のみ）。
+
+    設定ミスは仕様やコードでは防げない。「親だけが見えるはずのチャンネル」が実は子にも
+    見えている、という取り違えは、実際に送ってみて初めて分かる。
+    自傷やいじめの通知が子に見えてしまう事故を、運用開始前に発見できるようにする。
+
+    やること。
+      ① 危険信号の通知先チャンネルを解決し、そこへ「確認用メッセージ」を送る。
+      ② そのチャンネルに誰が入れるか（子が見えていないか）を親自身に目視確認してもらう。
+      ③ 子ども用チャンネルにも確認用メッセージを送り、どの子のチャンネルかを取り違えていないか見せる。
+    実際に送るのが要点で、設定値を表示するだけでは「見えるかどうか」は分からない。
+
+    Args:
+        message: 親からのメッセージ。
+        content: 生の本文。
+
+    Returns:
+        bool: このコマンドとして処理したら True。
+    """
+    if not _is_parent(message.author.id):
+        return False
+    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
+    body = mention_body if mention_body is not None else (content or "")
+    normalized = _normalize_japanese_command(body)
+    if not ("安全設定チェック" in normalized or "あんぜんせっていちぇっく" in normalized):
+        return False
+
+    from app.config import get_safety_alert_setting, get_allowance_reminder_setting, load_all_users
+
+    safety_conf = get_safety_alert_setting() or {}
+    parent_conf = get_allowance_reminder_setting() or {}
+    # 実際に使われる宛先を、本番と同じ解決順で求める（表示だけの確認にしない）
+    target_id = safety_conf.get("channel_id") or parent_conf.get("channel_id")
+    lines = ["**安全設定チェックを実行したよ。**", ""]
+
+    if not safety_conf.get("enabled", True):
+        lines.append("⚠️ `safety_alert.enabled` が false だよ。危険信号の通知は送られないよ。")
+    if safety_conf.get("channel_id"):
+        lines.append(f"・危険信号の通知先: 専用設定のチャンネル（ID {safety_conf['channel_id']}）")
+    elif target_id:
+        lines.append(f"・危険信号の通知先: 査定と同じ親チャンネル（ID {target_id}）へフォールバック中")
+        lines.append("　→ 分けたいときは `safety_alert.channel_id` を設定してね。")
+    else:
+        lines.append("❌ 通知先が未設定だよ。危険信号を検知しても**どこにも通知できない**。")
+        lines.append("　→ `safety_alert.channel_id` か `allowance_reminder.channel_id` を設定してね。")
+
+    # ① 通知先へ実際に送る。届くかどうかは送ってみないと分からない
+    delivered = False
+    if target_id:
+        try:
+            ch = _client.get_channel(int(target_id))
+            if ch is None:
+                ch = await _client.fetch_channel(int(target_id))
+            await ch.send(
+                "🔔 **【安全設定チェック】ここは危険信号の通知先です**\n"
+                "お子さんの安全に関わる連絡（いじめ・つらい気持ちの訴えなど）は、このチャンネルに届きます。\n"
+                "**このメッセージがお子さんから見えていないか、必ず確認してください。**\n"
+                "見えている場合は、チャンネルの権限設定を見直すか、"
+                "`safety_alert.channel_id` に大人だけのチャンネルを指定してください。\n"
+                "※ 家庭内の虐待が疑われる内容は、この経路では通知しません（お子さんへ公的窓口を案内します）。"
+            )
+            delivered = True
+        except Exception as e:
+            lines.append(f"❌ 通知先への送信に失敗したよ: {type(e).__name__}")
+            lines.append("　→ チャンネルIDが正しいか、Botに送信権限があるか確認してね。")
+
+    if delivered:
+        lines.append("✅ 通知先へ確認用メッセージを送ったよ。**子どもに見えていないか確認してね。**")
+
+    # ③ 子ども用チャンネルにも送り、どの子のチャンネルかの取り違えを見つける。
+    #    宛先解決は査定 F/B と同じ _resolve_child_channels_strict を使う（入口ごとに解決方法を変えない）。
+    #    候補が複数ある子（共有チャンネル）は送らず警告する。他の子に見える事故を防ぐため。
+    sent_children = []
+    try:
+        channels, counts = await _resolve_child_channels_strict()
+    except Exception as e:
+        channels, counts = {}, {}
+        lines.append(f"⚠️ 子ども用チャンネルの解決に失敗したよ: {type(e).__name__}")
+    for user in load_all_users():
+        name = str(user.get("name", ""))
+        if not name:
+            continue
+        n = counts.get(name, 0)
+        if n == 0:
+            lines.append(f"⚠️ {name} さんのチャンネルが見つからないよ（発言がないと判定できないことがあるよ）。")
+            continue
+        if n > 1:
+            lines.append(
+                f"⚠️ {name} さんのチャンネル候補が {n} 件あるよ。"
+                "1つのチャンネルに複数の子がいると、通知が他の子に見えてしまうよ。"
+            )
+            continue
+        ch = channels.get(name)
+        if ch is None:
+            continue
+        try:
+            await ch.send(
+                f"🔔 **【安全設定チェック】ここは {name} さん用のチャンネルです**\n"
+                "名前が合っているか、おうちの人に教えてね。"
+            )
+            sent_children.append(name)
+        except Exception as e:
+            lines.append(f"⚠️ {name} さんのチャンネルへ送れなかったよ: {type(e).__name__}")
+
+    if sent_children:
+        lines.append(
+            f"✅ 子ども用チャンネルへも確認用メッセージを送ったよ（{', '.join(sent_children)}）。\n"
+            "　**表示された名前がそのチャンネルの子と合っているか確認してね。**"
+        )
+    lines.append("")
+    lines.append("設定を直したら、Botを再起動してからもう一度このコマンドを実行してね。")
+    await message.channel.send("\n".join(lines))
+    return True
+
+
 async def maybe_handle_parent_usage_single(message: discord.Message, content: str) -> bool:
     """「使い方の説明」コマンドでコマンドを送ったチャンネル1つだけに使い方を送信する（親のみ）。
     「使い方の説明と初期設定」（全チャンネル一斉）より後に判定すること。"""

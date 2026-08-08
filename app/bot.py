@@ -692,6 +692,11 @@ async def _on_message_impl(message: discord.Message):
     if await handlers_parent.maybe_handle_parent_broadcast_guide(message, content):
         return
 
+    # 「安全設定チェック」は通知先の設定ミスを実際に送って確かめる（N-11.16）。
+    # 設定ミスはコードでは防げず、送ってみて初めて「子に見えている」が分かる。
+    if await handlers_parent.maybe_handle_safety_setup_check(message, content):
+        return
+
     # 「使い方の説明」は単体チャンネルへの送信（一斉送信より後に判定する）
     if await handlers_parent.maybe_handle_parent_usage_single(message, content):
         return
