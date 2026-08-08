@@ -1097,6 +1097,10 @@ def approve_proposal(name: str, operation_key: str = "", expected_proposal_id: s
         # その提案は新しい提案に置き換わっている。古い額を支給しない（親には置き換わった旨を伝える）。
         cur_pid = str(req.get("proposal_id", "")).strip()
         exp_pid = str(expected_proposal_id or "").strip()
+        # pending が proposal_id を持つのに expected が空だと、どの提案を承認したいのか特定できず、
+        # 新しい提案 B を古い操作で誤支給する穴になる（codex 再現）。id 付き pending は expected 必須にする。
+        if cur_pid and not exp_pid:
+            return f"{target} の査定は、通知に載っている ID を添えて承認してね（例: 査定承認 {target} {cur_pid}）。"
         if exp_pid and cur_pid and exp_pid != cur_pid:
             return f"{target} の査定はそのあと新しい内容に変わったよ。最新の内容を確認してから承認してね。"
 
@@ -1223,6 +1227,9 @@ def reject_proposal(name: str, note: str = "", parent_intent: str = "", expected
             return f"「{target}」の承認待ちの査定は無いよ。"
         cur_pid = str(req.get("proposal_id", "")).strip()
         exp_pid = str(expected_proposal_id or "").strip()
+        # id 付き pending は expected 必須（新しい提案を古い操作で誤って却下しないため・codex 再現）
+        if cur_pid and not exp_pid:
+            return f"{target} の査定は、通知に載っている ID を添えて見送りを決めてね（例: 査定却下 {target} {cur_pid} 一言）。"
         if exp_pid and cur_pid and exp_pid != cur_pid:
             return f"{target} の査定はそのあと新しい内容に変わったよ。最新の内容を確認してから見送りを決めてね。"
         total = int(req.get("total", 0))

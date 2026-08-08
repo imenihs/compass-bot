@@ -1174,11 +1174,22 @@ _OPENER_FALLBACK = {
 
 
 def _normalize_for_leak_check(text: str) -> str:
-    """漏洩チェック用に NFKC 正規化し空白・記号を除く（逐語一致の突合を安定させる）。"""
+    """漏洩チェック用に NFKC 正規化し、空白・記号・約物を全て除く（逐語一致の突合を安定させる）。
+
+    決まった記号セットだけ除くと、列挙外の記号（別種の約物・全角半角の差）で正規化結果が食い違い、
+    逐語一致を見逃す（codex 再現）。よって Unicode カテゴリで、空白（Z*）・記号（S*）・区切り（P*）・
+    制御（C*）を一律に除去し、文字・数字だけを残す。
+    """
     import unicodedata as _ud
-    import re as _re_lk
     t = _ud.normalize("NFKC", text or "")
-    return _re_lk.sub(r"[\s　、。．，！？!?・「」『』（）()\-—…]", "", t)
+    out = []
+    for ch in t:
+        cat = _ud.category(ch)
+        # Z=区切り空白, S=記号, P=約物, C=制御 を捨てる。L(文字)・N(数字)・M(結合)だけ残す
+        if cat[0] in ("Z", "S", "P", "C"):
+            continue
+        out.append(ch)
+    return "".join(out)
 
 
 def _opener_leaks_raw_note(opener: str, raw_note: str) -> bool:
@@ -1255,16 +1266,23 @@ async def generate_assessment_feedback(channel, user_conf: dict, payload: dict) 
     fallback = _OPENER_FALLBACK.get(kind, _OPENER_FALLBACK["reject"])
     system_prompt = _build_opener_system_prompt(user_conf)
     async with _lock_for(user_name):
-        # 子の現在の claude session を取得（無ければ新規採番）
+        # 子の現在の claude session を取得（無ければ新規採番）。read 失敗は fail-closed で扱う（codex 再現）：
+        # read に失敗したら「既存 session が無い」と誤認して新規採番＝上書きしてはいけない。session に一切触れず
+        # fallback だけ送る（既存ポインタ喪失・session 破損を避ける側を優先）。
         store = deps.session_store()
+        read_failed = False
+        sess = None
         try:
             sess = await store.get_session(user_name)
-        except Exception:
-            sess = None
+        except Exception as e:
+            read_failed = True
+            _diag("assessment_feedback_session_read_error", {"child": user_name, "error": f"{type(e).__name__}: {e}"})
+        if read_failed:
+            return await reply.send_reply(channel, fallback, user_name=user_name, kind=SESSION_KIND)
         cur_sid = None
         if isinstance(sess, dict):
             cur_sid = (sess.get("data") or {}).get("claude_session_id")
-        # fork 元があれば resume+fork、無ければ新規 session-id を事前採番
+        # fork 元があれば resume+fork、無ければ（read 成功で session 無し＝新規児童）新規 session-id を事前採番
         import uuid as _uuid
         new_sid = None if cur_sid else _uuid.uuid4().hex
         try:

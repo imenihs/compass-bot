@@ -754,6 +754,37 @@ def _split_child_name(rest: str) -> tuple[str, str]:
     return "", r
 
 
+async def _resolve_child_channels_strict() -> tuple[dict, dict]:
+    """子ごとに送信先チャンネルと候補数を返す。候補が1つの子だけ確実に送れる（誤送信防止）。
+
+    reminder の `_child_channels` は先着で1つに畳むため複数候補を検知できない。ここでは
+    `_channel_users` を全チャンネルに適用して子ごとの候補チャンネルを集め、数を数える。
+    呼び出し側は「候補数==1」の子だけへ送る。
+
+    Returns:
+        tuple[dict, dict]: ({name: 代表チャンネル}, {name: 候補数})。解決不能時は空。
+    """
+    channel_by_name: dict = {}
+    count_by_name: dict = {}
+    try:
+        rs = _reminder_service
+        users = rs.load_all_users()
+        user_by_discord_id = {int(u["discord_user_id"]): u for u in users if u.get("discord_user_id")}
+        for channel_id in rs.allow_channel_ids:
+            channel = rs.client.get_channel(channel_id)
+            if channel is None:
+                channel = await rs.client.fetch_channel(channel_id)
+            for user_conf in rs._channel_users(channel, users, user_by_discord_id):
+                nm = str(user_conf.get("name", "")).strip()
+                if not nm:
+                    continue
+                count_by_name[nm] = count_by_name.get(nm, 0) + 1
+                channel_by_name.setdefault(nm, channel)
+    except Exception:
+        return {}, {}
+    return channel_by_name, count_by_name
+
+
 async def _drive_assessment_feedback() -> None:
     """承認/却下で積まれた子 F/B（opener）を取り出し、各子のチャンネルへ opener を生成・送信する。
 
@@ -770,15 +801,16 @@ async def _drive_assessment_feedback() -> None:
         feedbacks = []
     if not feedbacks:
         return
-    # 子チャンネルを既存機構で解決（メンバー照合→チャンネル名一意一致・複数候補は送らない）
-    try:
-        channels = await _reminder_service._child_channels()
-    except Exception:
-        channels = {}
+    # 子チャンネルを解決する。誤送信防止のため「その子が属すチャンネルがちょうど1つ」のときだけ送る。
+    # _child_channels は先着で1つに畳むため（複数候補でも1つ返す）、ここで候補数を独立に数えて2つ以上なら送らない（codex 再現の修正）。
+    child_channel, child_candidate_count = await _resolve_child_channels_strict()
     for fb in feedbacks:
         child = str(fb.get("name", "")).strip()
         conf = find_child_user_by_name(child)
-        channel = channels.get(child)
+        channel = child_channel.get(child)
+        # 候補が2つ以上ある子は、どのチャンネルへ送るか一意でないため送らない（別の子の目に触れる誤送信を防ぐ）
+        if child_candidate_count.get(child, 0) != 1:
+            channel = None
         if conf is None or channel is None:
             # 子チャンネルが特定できないときは送らない（別の子へ誤送信しない）。診断へ残す
             try:
