@@ -635,3 +635,37 @@ def get_assessment_guardrail_setting() -> dict:
         "monthly_total_max": monthly_total_max,
         "daily_count_max": daily_count_max,
     }
+
+
+def get_safety_alert_setting() -> dict:
+    """
+    子の心身の安全に関わる危険信号の通知設定を返す（N-11.16）。
+
+    査定通知（allowance_reminder.channel_id）に相乗りさせず専用キーを持つ。理由は2つ。
+    ① 査定と安全は緊急度も宛先も異なる。査定通知を止めたい家庭でも安全通知は止めてはならない。
+    ② 虐待の示唆は「親へ通知しない」という別経路が要るため、宛先の設計自体が査定と違う。
+
+    虐待に関する通知先をここに持たないのは意図的である。加害者は同居の実親であることが多く、
+    親チャンネルへ流すと加害者への情報還流になるため、子には外部の公的窓口を直接渡す（下記定数）。
+
+    Returns:
+        dict: {
+            "enabled": bool,       # 危険信号の通知を行うか（既定 True。安全機能は既定で有効）
+            "channel_id": int|None,# 通知先チャンネル。未設定なら通知できず診断へ記録する
+        }
+    """
+    setting = load_setting()
+    conf = setting.get("safety_alert", {}) if isinstance(setting, dict) else {}
+    if not isinstance(conf, dict):
+        conf = {}
+
+    # 安全機能は既定で有効にする。明示的に false と書かれた時だけ無効
+    enabled = conf.get("enabled")
+    enabled = True if enabled is None else bool(enabled)
+
+    # 通知先。未設定（None）でも会話は止めず、送信時に診断へ残して silent drop を避ける
+    channel_id = _safe_int(conf.get("channel_id"), None)
+    if channel_id is not None and channel_id <= 0:
+        channel_id = None
+
+    return {"enabled": enabled, "channel_id": channel_id}

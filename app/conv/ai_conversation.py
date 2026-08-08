@@ -30,6 +30,7 @@ import json
 import os
 import re
 import signal
+import uuid
 from pathlib import Path
 
 from app import storage
@@ -1201,6 +1202,86 @@ def _opener_leaks_raw_note(opener: str, raw_note: str) -> bool:
         if n[i:i + win] in o:
             return True
     return False
+
+
+async def judge_safety(user_conf: dict, input_text: str) -> dict | None:
+    """子の発話に危険信号があるかを AI に意味で判定させ、Python の床と統合して返す（N-11.16）。
+
+    会話本体のターンとは**独立した spawn** で判定する。理由は3つ。
+    ① 会話がタイムアウト・失敗しても安全判定は必ず行う（安全を会話の成否に依存させない）。
+    ② 会話用 session を汚さない（判定の問答が子との文脈に混ざらない）。
+    ③ tool を禁止した状態で回せる（判定が残高を動かす事故を構造的に防ぐ）。
+
+    Python の床（safety.detect）は完全一致しか見えず方言・遠回しな表現で素通りするため、
+    意味判断は AI が主として担う。統合規則は safety.merge_judgments に置く。
+    AI 判定が失敗しても Python の床の結果は必ず返す（fail-safe。安全側は落とさない）。
+
+    Args:
+        user_conf: 対象児童の設定 dict（年齢を判断材料に使う）。
+        input_text: 子の発話。
+
+    Returns:
+        dict | None: 統合した判定結果。危険信号が無ければ None。
+    """
+    from app import safety
+
+    # Python の床は AI の成否に関わらず必ず取る
+    py_result = safety.detect(input_text)
+
+    child_name = str(user_conf.get("name", ""))
+    age = user_conf.get("age")
+    prompt = safety.build_ai_judge_prompt(input_text, age if isinstance(age, int) else None)
+    ai_result = None
+    try:
+        # 判定専用の system prompt。会話の人格を持ち込まず、判定だけをさせる
+        judge_system = (
+            "あなたは子どもの安全を見守る専門家として、発話の危険信号だけを判定する。"
+            "子どもへ話しかけない。JSON だけを返す。"
+        )
+        # tool を全面禁止して判定させる（残高を動かす事故を構造的に防ぐ）。
+        # 新規セッションで回すため session_id は渡さない（会話文脈を汚さない）。
+        returncode, stdout, stderr = await _spawn_claude(
+            prompt, None, judge_system, child_name,
+            disable_tools=True, new_session_id=str(uuid.uuid4()),
+        )
+        ok, result, _sid = _parse_output(stdout)
+        if ok and result:
+            ai_result = _parse_safety_json(result)
+    except Exception as e:
+        # AI 判定の失敗で安全機能を止めない。Python の床だけで続行する
+        _diag("safety_ai_judge_error", {"child": child_name, "error": f"{type(e).__name__}: {e}"})
+
+    merged = safety.merge_judgments(py_result, ai_result)
+    if merged:
+        _diag("safety_signal_detected", {
+            "child": child_name,
+            "category": merged.get("category"),
+            "urgency": merged.get("urgency"),
+            "notify_parent": merged.get("notify_parent"),
+            "detected_by": merged.get("detected_by"),
+            "ai_judged": ai_result is not None,
+        })
+    return merged
+
+
+def _parse_safety_json(text: str) -> dict | None:
+    """AI の判定応答から JSON を取り出す。前後に説明が混じっても拾えるようにする。
+
+    判定は JSON だけを返すよう指示しているが、モデルが前置きを付けることがあるため、
+    最初の `{` から最後の `}` までを切り出して解釈する。解釈できなければ None を返し、
+    呼び出し側は Python の床だけで続行する（安全側は落とさない）。
+    """
+    s = (text or "").strip()
+    i, j = s.find("{"), s.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        data = json.loads(s[i:j + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
 
 
 def _build_opener_system_prompt(user_conf: dict) -> str:
