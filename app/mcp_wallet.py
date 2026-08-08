@@ -1323,6 +1323,17 @@ def _do_parent_grant(args: dict) -> str:
     amount = _parse_amount(args.get("amount"))
     if amount is None:
         return f"金額が正しくないよ（1〜{MAX_AMOUNT}円で、はっきりした金額を教えてね）。"
+    # 1回あたりの上限を検証する（N-11.17 前提・2026/08/09）。
+    # 従来は 1〜MAX_AMOUNT（100万円）しか見ておらず、査定経路のようなガードレールが一切無かった。
+    # 親は管理者だが、桁の打ち間違い（5000→50000）や AI が値を取り違えた場合の歯止めが要る。
+    # 上限超過は実行せず、親に金額の確認を促す（勝手に丸めない・N-11.14 の方針を踏襲）。
+    single_max = int(config.get_parent_operation_setting()["single_max"])
+    if abs(amount) > single_max:
+        return (
+            f"1回に動かせる金額は {single_max}円までにしているよ（今回は {abs(amount)}円）。\n"
+            "桁の打ち間違いを防ぐためのしくみだよ。金額を確かめて、もう一度お願いね。\n"
+            "本当に大きい金額を動かすときは、何回かに分けてね。"
+        )
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
         return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
@@ -1353,8 +1364,15 @@ def _do_parent_adjust_balance(args: dict) -> str:
         return "増やす/減らす金額が正しくないよ（例: +500 や -300 のように教えてね）。"
     if delta == 0:
         return "0円だと残高は変わらないよ。"
-    if abs(delta) > MAX_AMOUNT:
-        return f"一度に調整できるのは {MAX_AMOUNT}円までだよ。"
+    # 1回あたりの上限を検証する（N-11.17 前提・2026/08/09）。
+    # 従来は MAX_AMOUNT（100万円）しか見ておらず、桁の打ち間違いや AI の取り違えに歯止めが無かった。
+    single_max = int(config.get_parent_operation_setting()["single_max"])
+    if abs(delta) > single_max:
+        return (
+            f"1回に動かせる金額は {single_max}円までにしているよ（今回は {abs(delta)}円）。\n"
+            "桁の打ち間違いを防ぐためのしくみだよ。金額を確かめて、もう一度お願いね。\n"
+            "本当に大きい金額を動かすときは、何回かに分けてね。"
+        )
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
         return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"

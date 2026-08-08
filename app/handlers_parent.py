@@ -137,6 +137,29 @@ def _log_parent_handler_error(message: discord.Message, event: str, error: Excep
         print(f"[parent_handler_diagnostics] log error: {type(log_error).__name__}: {log_error}")
 
 
+def _parent_op_key(message: discord.Message, action: str, target: str) -> str:
+    """親のテキストコマンド用の冪等キーを作る。
+
+    Discord のメッセージ ID はメッセージごとに一意なので、同じメッセージが再配信されても
+    同じキーになり二重適用されない。親が意図して2回打った場合は別 ID になるため通る
+    （「同じ操作の再送」だけを弾き、「本当に2回やりたい」は妨げない）。
+
+    親テキスト経路はこれまで operation_key を渡しておらず、Discord の再送や親の連打で
+    そのまま二重支給になっていた（有識者の反証で判明・2026/08/09）。AI 経路は
+    _scoped_op_key で冪等化済みだったため、経路によって安全性が食い違っていた。
+
+    Args:
+        message: 親のメッセージ。
+        action: 操作種別（allowance_manual_grant 等）。
+        target: 対象児の名前。
+
+    Returns:
+        str: 冪等キー。
+    """
+    mid = int(getattr(message, "id", 0) or 0)
+    return f"{target}:{action}:msg{mid}"
+
+
 def _command_body(content: str) -> str:
     """メンションあり/なしの親コマンド本文を返す"""
     mention_body = extract_input_from_mention((content or "").strip(), _client.user)
@@ -586,6 +609,7 @@ async def maybe_handle_manual_grant(message: discord.Message, content: str) -> b
         action="allowance_manual_grant",
         note="manual_grant_by_parent",
         extra={"granted_by": str(message.author.id)},
+        operation_key=_parent_op_key(message, "allowance_manual_grant", target_name),
     )
     await message.channel.send(
         f"{target_name}に支給したよ。"
@@ -631,6 +655,7 @@ async def maybe_handle_balance_adjustment(message: discord.Message, content: str
         action="balance_adjustment",
         note="manual_adjustment_by_parent",
         extra={"adjusted_by": str(message.author.id)},
+        operation_key=_parent_op_key(message, "balance_adjustment", target_name),
     )
     direction = "加算" if delta >= 0 else "減算"
     await message.channel.send(
@@ -782,6 +807,7 @@ async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> boo
             action="allowance_monthly_auto_grant",
             note="bulk_grant_by_parent",
             extra={"granted_by": str(message.author.id)},
+            operation_key=_parent_op_key(message, "allowance_monthly_auto_grant", name),
         )
         lines.append(f"・{name}: +{amount}円 → {new_balance}円")
         # 支給により目標が達成された場合は祝福メッセージを送る

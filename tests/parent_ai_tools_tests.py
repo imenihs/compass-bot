@@ -75,8 +75,22 @@ def _run():
         # 金額不正(推測させない: 金額が無ければ拒否)
         r = mcp._do_parent_grant({"name": "たろう", "amount": None, "operation_key": "pg4"})
         _check("grant_bad_amount_rejected", "金額が正しくない" in r and bal("たろう") == 1300, r)
+        # 1回あたりの上限(桁の打ち間違い・AIの取り違えを止める)。勝手に丸めず拒否する
+        from app import config as _cfg
+        smax = int(_cfg.get_parent_operation_setting()["single_max"])
+        r = mcp._do_parent_grant({"name": "たろう", "amount": smax * 10, "operation_key": "pg5"})
+        _check("grant_over_single_max_rejected",
+               ("までにしている" in r or "上限" in r) and bal("たろう") == 1300, r)
+        # 上限内は通る(正当な操作を妨げない)
+        r = mcp._do_parent_grant({"name": "たろう", "amount": 100, "operation_key": "pg6"})
+        _check("grant_within_single_max_applied", bal("たろう") == 1400, r)
 
         # --- parent_adjust_balance: 符号付き調整 ---
+        # 調整にも1回上限がかかる(残高を動かさないこと)
+        _before_hana = bal("はな")
+        r = mcp._do_parent_adjust_balance({"name": "はな", "delta": -(smax * 10), "operation_key": "pa0"})
+        _check("adjust_over_single_max_rejected",
+               ("までにしている" in r or "上限" in r) and bal("はな") == _before_hana, r)
         r = mcp._do_parent_adjust_balance({"name": "はな", "delta": -500, "operation_key": "pa1"})
         _check("adjust_minus_applied", bal("はな") == 1500 and "減らした" in r, r)
         r = mcp._do_parent_adjust_balance({"name": "はな", "delta": 200, "operation_key": "pa2"})
@@ -97,7 +111,7 @@ def _run():
         importlib.reload(mcp)
         mcp._wallet = w
         r = mcp._do_parent_grant({"name": "たろう", "amount": 9999, "operation_key": "pgX"})
-        _check("grant_rejected_without_parent_mode", "親のチャンネルからのみ" in r and bal("たろう") == 1300, r)
+        _check("grant_rejected_without_parent_mode", "親のチャンネルからのみ" in r and bal("たろう") == 1400, r)
         r = mcp._do_parent_adjust_balance({"name": "はな", "delta": 9999, "operation_key": "paX"})
         _check("adjust_rejected_without_parent_mode", "親のチャンネルからのみ" in r and bal("はな") == 1700, r)
 

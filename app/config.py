@@ -637,6 +637,33 @@ def get_assessment_guardrail_setting() -> dict:
     }
 
 
+def get_parent_operation_setting() -> dict:
+    """親が直接行う支給・残高調整の上限設定を返す（N-11.17 の前提）。
+
+    親経路の tool（parent_grant / parent_adjust_balance）は、これまで
+    「1〜MAX_WALLET_INPUT_AMOUNT（100万円）」しか検証しておらず、査定経路のような
+    ガードレールを一切通していなかった。親は管理者だが、桁の打ち間違い（5000→50000）や
+    AI が値を取り違えた場合に歯止めが無く、実残高が大きく動く。
+
+    親の正当な操作を妨げない範囲で「明らかな桁違い」を止めるための上限を持つ。
+    上限を超える場合は拒否し、親に金額の確認を促す（実行しない）。
+
+    Returns:
+        dict: {
+            "single_max": int,  # 1回の支給・調整の上限（円）
+        }
+    """
+    setting = load_setting()
+    conf = setting.get("parent_operation", {}) if isinstance(setting, dict) else {}
+    if not isinstance(conf, dict):
+        conf = {}
+    # 既定 50000円。お年玉・まとめ支給を想定しても十分で、桁違い（数十万）は止まる
+    single_max = _safe_int(conf.get("single_max"), 50000)
+    if single_max is None or single_max <= 0:
+        single_max = 50000
+    return {"single_max": single_max}
+
+
 def get_safety_alert_setting() -> dict:
     """
     子の心身の安全に関わる危険信号の通知設定を返す（N-11.16）。
