@@ -129,6 +129,15 @@ _thinking_sent_message_keys: set[tuple[str, int]] = set()
 
 wallet_service = WalletService()
 
+
+def _safe_get_balance(name: str):
+    """子どもの残高を安全に取得する。失敗時は None（通知の材料用途で、取得失敗でも通知本体は止めない）。"""
+    try:
+        return wallet_service.get_balance(str(name or "").strip())
+    except Exception:
+        return None
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
@@ -780,44 +789,61 @@ async def _on_message_impl(message: discord.Message):
     await handle_conversation(message.channel, user_conf, input_block)
     _mark_thinking_sent(message, True)
 
-    # 査定提案が出ていたら親へ通知する。propose_allowance は残高を動かさず pending を積むだけで、
-    # 親が承認して初めて支給される。mcp_wallet は Discord を叩けないため、ここで未通知の提案を
-    # 検知して発話チャンネルへ知らせる（承認/却下コマンドの書式も必ず添える）。通知漏れで支給が
-    # 放置され子の頑張りが宙に浮くのを防ぐ。
-    # 親を確実に呼ぶため、通知本文へ親IDメンションを付ける（親がチャンネル非常駐でも届く）。
-    # 送信に成功した提案だけを notified にマークする。送信が失敗した提案は notified が立たず、
-    # 次の発話ターンで再び未通知として拾われ再通知される（見逃し・一時エラーの救済）。
+    # 査定提案が出ていたら「親チャンネルのみ」へ通知する（是正設計①・N-11.14）。
+    # 以前は発話チャンネル（＝子のチャンネル）へ送っており、提案額・理由・承認/却下コマンド等の
+    # 親の判断材料が子に丸見えになっていた。査定依頼は親の意思決定であり、その材料は子に見せない。
+    # 親チャンネル（allowance_reminder.channel_id）へ、器は定型・中身（理由）は propose 時に AI が汲んだ意図を載せる。
+    # proposal_id を承認/却下コマンドへ付け、古い通知からの二重支給を防ぐ（expected_proposal_id）。
     try:
         from app import mcp_wallet
-        # 今発話した子の提案だけを、その子のチャンネル(=発話チャンネル)へ通知する。全児童分を返すと
-        # 別の子の査定理由が無関係な子のチャンネルへ漏れる越境表示になるため、対象児を発話者に限定する。
         speaker_name = str(user_conf.get("name", "")).strip()
         proposals = mcp_wallet.take_unnotified_proposals(only_name=speaker_name)
         if proposals:
-            parent_mention = " ".join(f"<@{pid}>" for pid in sorted(get_parent_ids())) or "おうちの人"
-            notified_names = []
-            for proposal in proposals:
-                child = str(proposal.get("name", ""))
-                total = int(proposal.get("total", 0))
-                reason = str(proposal.get("reason", ""))
-                try:
-                    await message.channel.send(
-                        f"🔔 {parent_mention} {child} さんの査定の提案が来ています。\n"
-                        f"- 提案額: {total}円\n- 理由: {reason}\n"
-                        f"承認するには `査定承認 {child}`、見送るには `査定却下 {child}` と送ってください。"
-                    )
-                    # 送信できた分だけ通知済みにする（この後まとめてマーク）
-                    notified_names.append(child)
-                except Exception as send_error:
-                    # 個別送信の失敗は notified を立てず、次ターンで再通知させる
-                    _log_runtime_event(
-                        system_conf, message, user_conf, input_block,
-                        "assessment_notify_send_error",
-                        {"child": child, "error": f"{type(send_error).__name__}: {send_error}"},
-                    )
-            # 送信に成功した提案だけ通知済みへ（送信前にマークしないことで永久ロストを防ぐ）
-            if notified_names:
-                mcp_wallet.mark_proposals_notified(notified_names)
+            parent_channel_id = (ALLOWANCE_REMINDER or {}).get("channel_id")
+            parent_channel = None
+            if parent_channel_id:
+                parent_channel = client.get_channel(int(parent_channel_id))
+                if parent_channel is None:
+                    parent_channel = await client.fetch_channel(int(parent_channel_id))
+            if parent_channel is None:
+                # 親チャンネル未設定なら即時通知できない。既存の定期再通知（親チャンネル宛て）が保険で拾う。
+                # 設定漏れを後から検知できるよう診断へ warn を残す（子の頑張りを宙に浮かせない）。
+                _log_runtime_event(
+                    system_conf, message, user_conf, input_block,
+                    "assessment_immediate_notify_channel_unset",
+                    {"pending": [str(p.get("name", "")) for p in proposals]},
+                )
+            else:
+                parent_mention = " ".join(f"<@{pid}>" for pid in sorted(get_parent_ids())) or "おうちの人"
+                notified = []  # (name, proposal_id) 単位で通知済みにする（別提案の取り違え防止・codex #5）
+                for proposal in proposals:
+                    child = str(proposal.get("name", ""))
+                    pid = str(proposal.get("proposal_id", ""))
+                    total = int(proposal.get("total", 0))
+                    reason = str(proposal.get("reason", ""))
+                    purchase = proposal.get("purchase_amount")
+                    balance = _safe_get_balance(child)
+                    lines = [
+                        f"🔔 {parent_mention} {child} さんの査定の提案です。",
+                        f"- 提案額: {total}円",
+                    ]
+                    if purchase:
+                        lines.append(f"- 買いたい物の値段: {int(purchase)}円")
+                    if balance is not None:
+                        lines.append(f"- 今の残高: {balance}円")
+                    lines.append(f"- 理由: {reason}")
+                    lines.append(f"承認: `査定承認 {child} {pid}` / 見送り: `査定却下 {child} {pid} <一言>`")
+                    try:
+                        await parent_channel.send("\n".join(lines))
+                        notified.append((child, pid))
+                    except Exception as send_error:
+                        _log_runtime_event(
+                            system_conf, message, user_conf, input_block,
+                            "assessment_notify_send_error",
+                            {"child": child, "error": f"{type(send_error).__name__}: {send_error}"},
+                        )
+                if notified:
+                    mcp_wallet.mark_proposals_notified(notified)
     except Exception as e:
         # 通知処理全体の失敗で応答経路を壊さない。診断ログにだけ残す
         _log_runtime_event(

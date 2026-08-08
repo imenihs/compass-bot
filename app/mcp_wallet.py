@@ -973,24 +973,43 @@ def take_unnotified_proposals(only_name: str | None = None) -> list[dict]:
     return pending_to_notify
 
 
-def mark_proposals_notified(names: list[str]) -> None:
-    """指定した子の pending 提案を通知済みにする。bot が親へ送信できた分だけ呼ぶ。
+def mark_proposals_notified(items: list) -> None:
+    """通知に成功した提案を通知済みにする。bot が親へ送信できた分だけ呼ぶ。
 
     take_unnotified_proposals と分離することで、Discord 送信が失敗した提案は notified が立たず、
     次回また未通知として拾われ再通知される（見逃し・送信失敗の救済）。
 
+    (name, proposal_id) のタプルで受ける（codex #5・別提案の取り違え防止）：A を送信中に B へ pending が
+    上書きされた後にこれが走っても、「送った提案の proposal_id == 現 pending の proposal_id」のときだけ
+    notified を立てる。proposal_id を持たない古いデータとの後方互換のため、str（名前のみ）も受け付ける。
+
     Args:
-        names: 通知に成功した子ども名の一覧。
+        items: 通知に成功した (子ども名, proposal_id) タプル、または名前文字列の一覧。
     """
-    if not names:
+    if not items:
         return
-    targets = {(n or "").strip() for n in names}
+    # (name -> notified 済みにしてよい proposal_id 集合) に正規化。名前のみ指定は proposal_id 不問（後方互換）。
+    by_name: dict[str, set] = {}
+    name_only: set = set()
+    for it in items:
+        if isinstance(it, (tuple, list)) and len(it) == 2:
+            nm, pid = str(it[0] or "").strip(), str(it[1] or "").strip()
+            if pid:
+                by_name.setdefault(nm, set()).add(pid)
+            else:
+                name_only.add(nm)
+        else:
+            name_only.add(str(it or "").strip())
     store = _payout_store()
     with _payout_locked():
         doc = store._load_doc(store.payout_requests_path, "requests")
         changed = False
         for name, req in doc["requests"].items():
-            if name in targets and isinstance(req, dict) and req.get("status") == "pending" and not req.get("notified"):
+            if not (isinstance(req, dict) and req.get("status") == "pending" and not req.get("notified")):
+                continue
+            cur_pid = str(req.get("proposal_id", "")).strip()
+            # proposal_id 指定があれば一致時のみ。名前のみ指定は無条件（後方互換）
+            if name in name_only or (name in by_name and cur_pid in by_name[name]):
                 req["notified"] = True
                 changed = True
         if changed:
