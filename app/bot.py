@@ -147,6 +147,56 @@ def _safe_get_balance(name: str):
         return None
 
 
+def _load_safety_history(child_name: str, days: int = 30) -> list:
+    """診断ログから、その子の過去の危険信号検知を読み出す（長期シグナルの材料）。
+
+    検知の記録は既に runtime_diagnostics.jsonl へ出ているため、新たな蓄積先を作らず再利用する。
+    読み取り失敗で通知本体を止めない（材料が無ければ長期シグナル無しとして続行する）。
+
+    Args:
+        child_name: 対象児童。
+        days: さかのぼる日数。
+
+    Returns:
+        list: [{"ts_sec": float, "category": str, "urgency": str}, ...]
+    """
+    import time as _t
+    from datetime import datetime as _dt
+
+    out = []
+    try:
+        system_conf = load_system()
+        path = get_log_dir(system_conf) / "runtime_diagnostics.jsonl"
+        if not path.exists():
+            return out
+        cutoff = _t.time() - days * 86400
+        name = str(child_name or "")
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "safety_signal_detected" not in line and "safety_alert_sent" not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if str(d.get("selected_user") or "") != name:
+                continue
+            det = d.get("details") or {}
+            cat = str(det.get("category") or "")
+            if not cat:
+                continue
+            try:
+                ts = _dt.fromisoformat(str(d.get("ts") or "")).timestamp()
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            out.append({"ts_sec": ts, "category": cat, "urgency": str(det.get("urgency") or "")})
+    except Exception:
+        # 材料が読めなくても通知は止めない
+        return out
+    return out
+
+
 async def _handle_safety_signal(system_conf, message, user_conf, input_block, judgment: dict) -> None:
     """危険信号を検知したときの送信を担う（N-11.16）。
 
@@ -242,6 +292,18 @@ async def _handle_safety_signal(system_conf, message, user_conf, input_block, ju
                 system_conf, message, user_conf, input_block,
                 "safety_notice_send_failed", {"error": f"{type(e).__name__}: {e}"},
             )
+
+    # 長期の傾向を判定へ添える。1ターンだけでは「数週間かけて悪化している」が見えないため、
+    # 過去の検知履歴を集計して通知に載せる（親が緊急性を測る材料になる）。
+    try:
+        judgment["long_term"] = safety.summarize_long_term_signals(
+            _load_safety_history(child_name), _time.time(),
+        )
+    except Exception as e:
+        _log_runtime_event(
+            system_conf, message, user_conf, input_block,
+            "safety_long_term_failed", {"error": f"{type(e).__name__}: {e}"},
+        )
 
     # 子へ「伝えてもいいかな」と先に尋ねる（事後報告にしない）。
     # ただし返事は待たない。沈黙・離脱でも通知は確定させる（怖くて逃げた子ほど通知されない逆相関の防止）。
@@ -836,10 +898,40 @@ async def _on_message_impl(message: discord.Message):
                 f"`{proxy_name}` はユーザー設定に見つからなかったよ。`settings/users/*.json` の `name` を確認してね。"
             )
             return
-    # 安全判定はここで**前倒しに起動**する（N-11.16）。
+    elif is_parent(message.author.id):
+        # 親が子ども用チャンネルで自然言語入力した場合は、そのチャンネルの子を対象にする
+        channel_child_conf = _find_channel_child_user_conf(message)
+        if channel_child_conf is not None:
+            user_conf = channel_child_conf
+            selected_user_source = "parent_channel_context"
+        else:
+            # 親が子チャンネル外（親専用チャンネル等）で自然文を送った → 親AI会話へ流す。
+            # AI が親の意図を判断して親用 tool（支給・調整・承認等）を呼ぶ。金額・対象は AI に推測させず、
+            # 親が明示した値だけを tool に渡す設計（mcp_wallet 側で PARENT_MODE・対象児実在・金額検証・冪等）。
+            # 明示コマンド（maybe_handle_*）は既に上で処理済みなので、ここに来るのはコマンド以外の自然文。
+            from app.conv.ai_conversation import handle_parent_conversation
+            from app.config import load_all_users
+            child_names = [str(u.get("name", "")) for u in load_all_users() if u.get("name")]
+            await handle_parent_conversation(message.channel, message.author.id, input_block, child_names)
+            _mark_thinking_sent(message, True)
+            # 親 AI 会話で承認/却下された場合、mcp_wallet が feedback_pending へ積む。bot 側で取り出して
+            # 子へ opener を届ける（入口差を作らない・テキストコマンドと同じ driver）。
+            try:
+                await handlers_parent._drive_assessment_feedback()
+            except Exception as e:
+                _log_runtime_event(
+                    system_conf, message, None, input_block,
+                    "assessment_feedback_drive_error", {"error": f"{type(e).__name__}: {e}"},
+                )
+            return
+
+    # 安全判定は、対象児（user_conf）が確定した直後に起動する（N-11.16）。
     # 以前は _on_message_impl の最下流にあり、手前の 30 箇所以上の return
     # （空入力・未登録・親専用コマンドの誤ヒット等）を通った発話が一切判定されなかった。
-    # 仕様上、安全は【処理の優先順位】1) に属し査定・観察より優先するため、実装も最上流へ置く。
+    # 仕様上、安全は【処理の優先順位】1) に属し査定・観察より優先するため、できるだけ手前へ置く。
+    # ただし user_conf の解決（proxy / 親のチャンネル文脈）を行う if/elif 連鎖より前には置けない。
+    # 一度この連鎖の途中へ挿入して elif を分断し、親が子チャンネルで会話できなくなる回帰を出した
+    # （親子同一 ID の環境で parent_channel_context が効かなくなった）。連鎖の直後が正しい位置。
     # 会話の成否に依存しない独立 spawn なので、この時点で起動して差し支えない。
     # タスク自身が判定から通知までを完結させる。呼び出し側が await しなくても通知が出る形にする。
     # 上流で起動しても、手前の return（空入力・未登録・コマンド誤ヒット等）で await されなければ
@@ -888,33 +980,6 @@ async def _on_message_impl(message: discord.Message):
                 system_conf, message, user_conf, input_block,
                 "safety_judge_spawn_failed", {"error": f"{type(e).__name__}: {e}"},
             )
-
-    elif is_parent(message.author.id):
-        # 親が子ども用チャンネルで自然言語入力した場合は、そのチャンネルの子を対象にする
-        channel_child_conf = _find_channel_child_user_conf(message)
-        if channel_child_conf is not None:
-            user_conf = channel_child_conf
-            selected_user_source = "parent_channel_context"
-        else:
-            # 親が子チャンネル外（親専用チャンネル等）で自然文を送った → 親AI会話へ流す。
-            # AI が親の意図を判断して親用 tool（支給・調整・承認等）を呼ぶ。金額・対象は AI に推測させず、
-            # 親が明示した値だけを tool に渡す設計（mcp_wallet 側で PARENT_MODE・対象児実在・金額検証・冪等）。
-            # 明示コマンド（maybe_handle_*）は既に上で処理済みなので、ここに来るのはコマンド以外の自然文。
-            from app.conv.ai_conversation import handle_parent_conversation
-            from app.config import load_all_users
-            child_names = [str(u.get("name", "")) for u in load_all_users() if u.get("name")]
-            await handle_parent_conversation(message.channel, message.author.id, input_block, child_names)
-            _mark_thinking_sent(message, True)
-            # 親 AI 会話で承認/却下された場合、mcp_wallet が feedback_pending へ積む。bot 側で取り出して
-            # 子へ opener を届ける（入口差を作らない・テキストコマンドと同じ driver）。
-            try:
-                await handlers_parent._drive_assessment_feedback()
-            except Exception as e:
-                _log_runtime_event(
-                    system_conf, message, None, input_block,
-                    "assessment_feedback_drive_error", {"error": f"{type(e).__name__}: {e}"},
-                )
-            return
 
     if user_conf is None:
         await message.channel.send("設定にあなたのDiscord IDが登録されてないみたい。親に `settings/users/*.json` を追加してもらってね。")
