@@ -756,7 +756,8 @@ class _ProcessNeverStarted(Exception):
 
 
 async def _spawn_claude(prompt: str, session_id: str | None, system_prompt: str, child_name: str,
-                        parent_mode: bool = False):
+                        parent_mode: bool = False, disable_tools: bool = False,
+                        fork_session: bool = False, new_session_id: str | None = None):
     """claude CLI を subprocess 起動して (returncode, stdout, stderr) を返す。失敗時は例外。
 
     子どもの発話は `--` セパレータの後の位置引数として渡す。`-p <発話>` 方式だと、`--` で
@@ -790,15 +791,24 @@ async def _spawn_claude(prompt: str, session_id: str | None, system_prompt: str,
         CLAUDE_BIN, "--print",
         "--output-format", "json",
         "--append-system-prompt", system_prompt,
-        "--mcp-config", str(WALLET_MCP_CONFIG),
-        "--allowedTools", ",".join(allowed_tools),
     ]
+    # 査定 F/B の opener 生成は tool を一切呼ばせない（確定済み外部イベントの通知であり、
+    # 通常の「確定入金は tool で記録」ルールで record_income して二重加算するのを防ぐ・N-11.14 blocker #2）。
+    # disable_tools のときは MCP を渡さず allowedTools も付けない（wallet tool が使えない spawn）。
+    if not disable_tools:
+        args += ["--mcp-config", str(WALLET_MCP_CONFIG), "--allowedTools", ",".join(allowed_tools)]
     # モデル指定は server env のみ由来。空なら渡さず CLI 既定にする（不在モデルで全会話停止を防ぐ）
     if CLAUDE_MODEL:
         args += ["--model", CLAUDE_MODEL]
+    # 新規セッションは ID を事前採番する（fail-closed・失敗時に既存ポインタを壊さない・N-11.14 #4）
+    if new_session_id:
+        args += ["--session-id", new_session_id]
     # 継続セッションがあれば resume する。会話文脈を保つ要
     if session_id:
         args += ["--resume", session_id]
+    # opener 生成は子 session から分岐する。post-filter 通過時だけ新 session を採用し、弾いても元 session を汚さない（N-11.14 #3）
+    if fork_session:
+        args += ["--fork-session"]
     # end-of-options セパレータの後に発話を置く。以降はフラグとして解釈されない
     args += ["--", prompt]
     child_env = dict(os.environ)
@@ -1154,3 +1164,133 @@ async def _handle_conversation_locked(channel, user_conf: dict, input_text: str,
 
     # 6. 唯一の出口から送信する（会話ログ記録＋分割を集約）
     return await reply.send_reply(channel, result, user_name=user_name, kind=SESSION_KIND)
+
+
+# 査定 F/B（opener）の失敗時フォールバック。proposal の理由・note・金額を一切含まないコンパイル時定数。
+_OPENER_FALLBACK = {
+    "approve": "査定のお願い、おうちの人が OK してくれたよ。",
+    "reject": "査定のお願い、今回は見送りになったよ。また相談しよう。",
+}
+
+
+def _normalize_for_leak_check(text: str) -> str:
+    """漏洩チェック用に NFKC 正規化し空白・記号を除く（逐語一致の突合を安定させる）。"""
+    import unicodedata as _ud
+    import re as _re_lk
+    t = _ud.normalize("NFKC", text or "")
+    return _re_lk.sub(r"[\s　、。．，！？!?・「」『』（）()\-—…]", "", t)
+
+
+def _opener_leaks_raw_note(opener: str, raw_note: str) -> bool:
+    """opener に raw_note の逐語断片が混じっていないか（出力レベル invariant・N-11.14 #2）。
+
+    NFKC 正規化・記号除去後、raw_note の連続 min(全長, 4) 文字以上が opener に現れたら漏洩とみなす。
+    1〜3 文字のごく短い note は偶発一致が多く実害小のため逐語チェック対象外（producer chokepoint で守る）。
+    """
+    n = _normalize_for_leak_check(raw_note)
+    o = _normalize_for_leak_check(opener)
+    if len(n) < 4:
+        return False
+    win = min(len(n), 4)
+    # raw_note の連続 win 文字窓のいずれかが opener に含まれれば逐語漏洩
+    for i in range(0, len(n) - win + 1):
+        if n[i:i + win] in o:
+            return True
+    return False
+
+
+def _build_opener_system_prompt(user_conf: dict) -> str:
+    """opener 生成専用の system prompt。会話の芯（_build_system_prompt）に、確定済み外部イベントの
+    通知であること・tool を呼ばないこと・観察質問をしないこと・生の理由を出さないことを足す。
+    """
+    base = _build_system_prompt(user_conf)
+    return base + (
+        "\n【いまは査定の結果を子に伝える“口火(opener)”を1つだけ作る（とても大切）】\n"
+        "- これは、おうちの人がもう決めた結果（承認/見送り）の通知だ。tool は絶対に呼ばない（記録し直さない）。"
+        "『増えた/記録する』の tool 操作は禁止。実際の残高はもう Python 側で確定済み。\n"
+        "- 深追いの教育や質問攻めをしない。結果と、親がどんな先を見て決めたか（渡された意図）を“景色”として短く置くだけ。"
+        "子が返事をしたら、そこから本来の観察の会話が始まる。ここでは口火に徹する。\n"
+        "- 却下でも突きつけない・教え込まない。親の生の言葉はそのまま出さない（渡された意図を、子に届く言い方に翻訳する）。\n"
+        "- 承認なら素直に祝い、「なぜ OK だったか」の入口を一言だけ添える（掘り下げは返事のあと）。\n"
+    )
+
+
+async def generate_assessment_feedback(channel, user_conf: dict, payload: dict) -> str | None:
+    """査定の承認/却下の結果を、子 session 上の1 claude ターンとして opener 生成し送信する。
+
+    opener は子 session から `--fork-session` で分岐して生成し、post-filter（raw_note 逐語）を通過した
+    ときだけ新 session ID を採用する（弾き・失敗時は元 session を汚さない）。tool 無効 spawn で二重加算を防ぐ。
+    全体を `_lock_for(child)` で直列化し、子の同時発話ターンとの session 競合を防ぐ。生成失敗時は定数 fallback。
+
+    Args:
+        channel: 送信先の子チャンネル。
+        user_conf: 対象児童の設定 dict。
+        payload: take_pending_feedback が返す1件（kind/proposal_id/金額系/parent_intent/raw_note）。
+
+    Returns:
+        str | None: 送った opener 文字列。子チャンネルが無い等で送れなければ None。
+    """
+    from app.conv import reply, session as _session_mod, deps
+    user_name = str(user_conf.get("name", "")).strip()
+    kind = str(payload.get("kind", "")).strip()
+    parent_intent = str(payload.get("parent_intent", "")).strip()
+    raw_note = str(payload.get("raw_note", "")).strip()
+    # opener 指示（user 相当プロンプト）。raw_note は入れない（producer chokepoint）。parent_intent だけ渡す。
+    if kind == "approve":
+        grant = int(payload.get("grant", 0)); after = payload.get("after")
+        achieved = [a for a in (payload.get("achieved") or []) if a]
+        instr = (
+            f"【査定の結果を子に伝える口火を作って】結果: 承認（おうちの人が OK した）。支給額: {grant}円。"
+            + (f"今の残高: {after}円。" if after is not None else "")
+            + (f"達成した目標: {', '.join(achieved)}。" if achieved else "")
+            + (f"おうちの人の意図（景色として翻訳して伝える・生のまま出さない）: {parent_intent}。" if parent_intent else "")
+            + "承認を素直に祝い、なぜ OK だったかの入口を一言だけ添えて。"
+        )
+    else:
+        instr = (
+            "【査定の結果を子に伝える口火を作って】結果: 見送り（おうちの人が今回は承認しなかった）。残高は変わっていない。"
+            + (f"おうちの人の意図（景色として翻訳して伝える・生のまま出さない）: {parent_intent}。" if parent_intent else "")
+            + "突きつけず、親がどんな先を見て見送ったかを景色として短く置いて。子の返事から次の相談が始まる。"
+        )
+    fallback = _OPENER_FALLBACK.get(kind, _OPENER_FALLBACK["reject"])
+    system_prompt = _build_opener_system_prompt(user_conf)
+    async with _lock_for(user_name):
+        # 子の現在の claude session を取得（無ければ新規採番）
+        store = deps.session_store()
+        try:
+            sess = await store.get_session(user_name)
+        except Exception:
+            sess = None
+        cur_sid = None
+        if isinstance(sess, dict):
+            cur_sid = (sess.get("data") or {}).get("claude_session_id")
+        # fork 元があれば resume+fork、無ければ新規 session-id を事前採番
+        import uuid as _uuid
+        new_sid = None if cur_sid else _uuid.uuid4().hex
+        try:
+            returncode, stdout, stderr = await _spawn_claude(
+                instr, cur_sid, system_prompt, user_name,
+                parent_mode=False, disable_tools=True,
+                fork_session=bool(cur_sid), new_session_id=new_sid,
+            )
+            ok, opener, gen_sid = _parse_output(stdout)
+        except Exception as e:
+            _diag("assessment_feedback_gen_error", {"child": user_name, "error": f"{type(e).__name__}: {e}"})
+            ok, opener, gen_sid = False, "", None
+        # post-filter: 生成失敗 or 逐語漏洩なら fallback（元 session を汚さない＝新 session を採用しない）
+        if not ok or not opener or (raw_note and _opener_leaks_raw_note(opener, raw_note)):
+            if raw_note and opener and _opener_leaks_raw_note(opener, raw_note):
+                _diag("assessment_feedback_leak_blocked", {"child": user_name})
+            return await reply.send_reply(channel, fallback, user_name=user_name, kind=SESSION_KIND)
+        # 通過: 分岐で生まれた新 session ID を子の会話 session として採用する（opener が本物の文脈になる）
+        adopt_sid = gen_sid or new_sid
+        if adopt_sid:
+            try:
+                await store.open_session(
+                    user_name, SESSION_KIND,
+                    data={"claude_session_id": adopt_sid},
+                    ttl_minutes=SESSION_ID_TTL_MINUTES,
+                )
+            except Exception as e:
+                _diag("assessment_feedback_session_write_error", {"child": user_name, "error": f"{type(e).__name__}: {e}"})
+        return await reply.send_reply(channel, opener, user_name=user_name, kind=SESSION_KIND)
