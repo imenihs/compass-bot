@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import signal
 from pathlib import Path
 
@@ -690,59 +691,48 @@ def _parse_output(stdout_text: str) -> tuple[bool, str, str | None]:
     result = str(data.get("result") or "")
     if not result:
         return False, "", session_id
-    # claude が判断の思考（英語のつぶやき）を応答冒頭に出すことがある（例「thPersistent. Don't propose...」）。
-    # prompt で抑制しているが完全でないため、出力側でも冒頭の英語思考ブロックを除去し、子に見せない多層防御。
-    result = _strip_thinking_prefix(result)
-    if not result.strip():
-        # 思考だけで日本語本文が無い異常。応答に使わない
-        return False, "", session_id
+    # 思考混入の検知のみ行い、応答は一切加工しない（2026/08/09 方針転換）。
+    # 旧実装は正規表現で思考を除去していたが、(1)実機の漏れ方（先頭が日本語）を検出できず素通りさせ、
+    # (2)除去の結果 result が空になると失敗扱いになり「もう一度話しかけて」を連発する二次被害を出した。
+    # 原因は CLI 2.1.179 の既知バグ（thinking が text ブロックへ混入）であり 2.1.226 で解消を確認したため、
+    # 出口での加工をやめ、再発を即座に把握するための検知だけを残す。弾かない・切らない・失敗にしない。
+    _detect_thinking_leak(result)
     return True, result, session_id
 
 
-def _strip_thinking_prefix(text: str) -> str:
-    """応答冒頭に紛れた英語の思考ブロックを除去する（子に判断過程を見せないため）。
+# 思考混入の目印。実機で漏れた11件は全て「th + 大文字始まりの英文」という完全に一致した規則を持つ
+# （生データを1文字ずつ検証済み。th は純粋な ASCII でありタグの残骸ではない）。
+_THINKING_LEAK_TH_RE = re.compile(r"^th[A-Z]")
+# 英文が2語以上つづく形。思考は英語で走るため、応答冒頭に英文が連続するのは混入の兆候
+_THINKING_LEAK_ENG_RE = re.compile(r"[A-Za-z][A-Za-z',\-]+\s+[A-Za-z]{2,}")
 
-    claude が判断の思考を応答冒頭に出すことがある。2つの形に対応する:
-      (A) 英語主体の前置き＋日本語本文（例「thPersistent. Don't propose...パソコンほしい…」）
-      (B) 日本語も混じった思考文＋本文（例「深追い is dangerous. Don't say ...Kind.うーん、…」）
-    いずれも「英文（英単語が複数語つづきピリオドで区切られる文）」が思考の目印。先頭から、英文を含む
-    思考的な文を削り、本当の応答（英文を含まない自然な日本語）から返す。日本語だけの正常応答や、文中に
-    英単語が1語まざる程度（例「good なもの」）は誤除去しない。
+
+def _detect_thinking_leak(text: str) -> bool:
+    """応答に思考が混入していないか検知し、見つけたら診断ログへ記録する（応答は加工しない）。
+
+    子に内部の判断過程が見えると、対等に観察するというコーチングの芯（docs/コーチング.md）が崩れる。
+    ただし出口で除去する方式は、実機の漏れ方を検出できず素通りさせた一方、除去が効きすぎると
+    本文が空になり会話を止めるという二次被害を出した。よって「弾かず・切らず・失敗にせず、記録だけする」。
+    検知が出たら CLI/モデルの更新で再発した合図であり、環境側で対処する。
+
+    Args:
+        text: claude が返した応答文（加工前）。
+
+    Returns:
+        bool: 思考混入を検知したら True（呼び出し側は応答をそのまま使ってよい）。
     """
-    import re as _re
-    s = text.strip()
-    if not s:
-        return text
-    # th で始まるのは claude の思考漏れの明確なシグナル（thPersistent / thPotential...）。この場合は
-    # 100% 思考なので、最初の日本語会話文（ひらがな/カタカナ/漢字が主体の部分）まで大胆に飛ばす。
-    # 思考は英語・記号（/ , . 等）で書かれるので、日本語文字が現れる最初の位置から本文とみなす。
-    if _re.match(r"^th[A-Z]", s):
-        m_jp = _re.search(r"[ぁ-んァ-ヶ一-龠]", s)
-        if m_jp:
-            body = s[m_jp.start():].lstrip("　 、。.！？!?\n\"'")
-            if body:
-                return body
-        # 日本語が全く無い＝思考のみ。応答に使えないので空にして呼び出し側で失敗扱いにさせる
-        return ""
-    # 誤除去を避けるため、除去するのは「応答冒頭に英語の思考が2文以上つづく明確なブロック」だけに絞る。
-    # 思考文＝英単語が2語以上つづきピリオドで終わる英文。先頭からこの英文が連続する範囲だけを剥がし、
-    # 最初の日本語文（ひらがな/カタカナ/漢字を含む）から返す。1〜2語だけの英文残骸や、正常応答の途中に
-    # 混じる短い英文（「That is great.」等）は、先頭ブロックでなければ触らない。prompt 抑制を主、これは補助。
-    # 先頭が th で始まる典型的な思考漏れ（thPersistent...）は t の直後から見る。
-    work = _re.sub(r"^th(?=[A-Z])", "", s)
-    # 先頭から連続する英文思考(…word word. …word word. ...)を貪欲に剥がす
-    m = _re.match(r"^(?:\s*[A-Za-z][A-Za-z0-9'’,\-\s]*?[A-Za-z]{2,}[A-Za-z0-9'’,\-\s]*?[.!?]\s*){1,}", work)
-    if not m:
-        return text  # 冒頭に英文思考ブロックが無い＝正常。触らない
-    cut = m.end()
-    prefix = work[:cut]
-    body = work[cut:].lstrip("　 、。.！？!?\n\"'")
-    # プレフィックスが英語主体（日本語をほぼ含まない）で、本文に日本語があるときだけ除去を確定する
-    if _re.search(r"[ぁ-んァ-ヶ一-龠]", prefix):
-        return text  # プレフィックスに日本語が混じる＝正常応答の可能性。触らない
-    if _re.search(r"[ぁ-んァ-ヶ一-龠]", body):
-        return body
-    return text
+    head = text.lstrip()[:200]
+    mark = ""
+    if _THINKING_LEAK_TH_RE.match(head):
+        mark = "th_prefix"
+    elif len(_THINKING_LEAK_ENG_RE.findall(head)) >= 2:
+        # 冒頭200文字に英文が2つ以上。日本語会話では通常起きない
+        mark = "english_reasoning"
+    if not mark:
+        return False
+    # 応答そのものは子に届く。ここで止めると会話が壊れるため、記録に徹する
+    _diag("thinking_leak_detected", {"mark": mark, "head": head[:150]})
+    return True
 
 
 class _ProcessNeverStarted(Exception):
