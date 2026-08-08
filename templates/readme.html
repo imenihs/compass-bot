@@ -86,6 +86,7 @@
     <a href="#about">このBotについて</a>
     <a href="#principles" class="sub">設計原則</a>
     <a href="#features">できること</a>
+    <a href="#safety">子の安全を守るしくみ</a>
     <a href="#child-commands">子ども向けの使い方</a>
     <a href="#parent-commands">親向けの使い方</a>
     <a href="#dashboard">Webダッシュボード</a>
@@ -183,6 +184,65 @@
         <li>エラー時は内部の原因を利用者に見せず、やさしい案内を返します。</li>
         <li>子どもへの声かけは、他人や兄弟との比較・人格否定・強い叱責をしません。</li>
       </ul>
+      <p>子の心身の安全に関わる危険信号の検知については、<a href="#safety">子の安全を守るしくみ</a>を参照してください。</p>
+    </section>
+
+    <!-- ============ 子の安全 ============ -->
+    <section id="safety">
+      <h2>🛡️ 子の安全を守るしくみ</h2>
+      <p class="doc-intro">会話のなかに、自傷・いじめ・虐待・性的搾取・闇バイトといった<strong>子の心身の安全に関わる危険信号</strong>が出たときの動きです。お金の機能とは独立して動きます。</p>
+
+      <h3>設計の考え方</h3>
+      <p>お金の安全（二重支給・越境）は、AI の判断に委ねず Python 側で必ず検証しています。それより重い「子の心身の安全」を AI 任せにするのは一貫性を欠くため、<strong>決定論的な検知を Python 側に「床」として持ち</strong>、AI はその上乗せ（微妙なケースの拾い上げ・会話での寄り添い）を担当します。</p>
+      <p>相談窓口の電話番号は、AI に生成させず定数で保持しています。自殺予防の文脈で番号を間違えることは最悪の失敗になるためです。</p>
+
+      <div class="doc-note danger">
+        <strong>最重要: 家庭内の虐待の疑いは、親チャンネルへ通知しません。</strong><br>
+        児童虐待の加害者は同居の実親であることが多く、親へ流すと<strong>加害者への情報還流</strong>となり、口封じ・報復・エスカレーションを招きます。この場合は親を介さず、子ども本人へ直接、公的窓口（児童相談所 虐待対応ダイヤル 189、チャイルドライン等）を案内します。運用者は診断ログで把握できます。
+      </div>
+
+      <h3>通知の振り分け</h3>
+      <div class="doc-table-wrap">
+        <table>
+          <thead><tr><th>検知した内容</th><th>子どもへ</th><th>親チャンネルへ</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>虐待・ネグレクト</strong><br><span style="font-size:0.85em;color:#777;">家族からの暴力・暴言、食事や入浴をさせてもらえない等</span></td>
+              <td>公的窓口を案内</td>
+              <td><strong>送らない</strong></td>
+            </tr>
+            <tr>
+              <td><strong>性的搾取・グルーミング</strong></td>
+              <td>公的窓口を案内</td>
+              <td><strong>送らない</strong></td>
+            </tr>
+            <tr>
+              <td><strong>いじめ・暴力被害</strong><br><span style="font-size:0.85em;color:#777;">家族<strong>以外</strong>からの暴力・無視・晒し・恐喝</span></td>
+              <td>寄り添う応答</td>
+              <td>通知する</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>加害者が<strong>家族なら虐待、家族以外ならいじめ</strong>として扱います。ここを取り違えると、虐待の告白が親へ流れる最悪の事故になるため、判定は Python の検知と AI の判定の両方で行い、<strong>どちらか一方でも「虐待」と判断すれば親へは通知しません</strong>（判別できない場合も、親へ送らない側に倒します）。</p>
+
+      <h3>親チャンネルへ通知するときの文面</h3>
+      <ul>
+        <li>要約 → 背景 → 原文 の順で伝えます。</li>
+        <li>第三者の実名は伏せます。</li>
+        <li>同じ内容の重複通知は集約します。</li>
+      </ul>
+
+      <h3>通知先の設定を確かめる</h3>
+      <p>通知先の設定ミスは、子どもに見えてはいけないものが見えてしまう事故に直結します。実際にメッセージを送って確認できます（親のみ）。</p>
+      <div class="cmd-block">
+        <pre><code>安全設定チェック</code></pre>
+      </div>
+      <p>危険信号の通知先と、各子どもチャンネルへ確認用メッセージを実際に送信し、<strong>子どもに見えていないかを目視で確かめる</strong>よう促します。共有チャンネルなど宛先を一意に解決できない子には送らず、警告を返します。</p>
+      <div class="doc-note warn">
+        設定は <code>settings/setting.json</code> の <code>safety_alert</code> で行います。<code>channel_id</code> 未設定なら <code>allowance_reminder.channel_id</code> へフォールバックします。査定通知と分けたい場合は専用チャンネルIDを設定してください。<br>
+        <code>enabled: false</code> で通知を止められますが、安全機能のため既定は <code>true</code> です。止める場合は、子どもの異変に気づく別の手段があることを確認してください。
+      </div>
     </section>
 
     <!-- ============ 子ども向けコマンド ============ -->
@@ -377,6 +437,12 @@
       <div class="cmd-block">
         <div class="cmd-desc">ユーザーからの申請を承認して仮パスワードを発行する。承認すると Discord に仮パスワードが通知される。</div>
         <pre><code>web承認 たろう</code></pre>
+      </div>
+
+      <h3>27. 安全設定チェック</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">危険信号の通知先が正しいか、実際にメッセージを送って確かめる。詳細は<a href="#safety">子の安全を守るしくみ</a>を参照。</div>
+        <pre><code>安全設定チェック</code></pre>
       </div>
     </section>
 
@@ -644,10 +710,44 @@ sudo systemctl reload apache2</code></pre>
         <li><code>natural_chat_enabled=true</code> でも、他ユーザー宛ての <code>@...</code> メンションを含む発言は無視します。反応対象はメンションなし、または <code>@compass-bot</code> / Discord の Bot 宛てメンションのみです。</li>
       </ul>
 
-      <h4><code>allowance_reminder</code>: 支給前リマインド</h4>
+      <h4><code>allowance_reminder</code>: 支給前リマインド・査定通知</h4>
       <ul>
-        <li><code>enabled</code>, <code>channel_id</code>, <code>payday_day</code>, <code>notify_time</code>（<code>HH:MM</code>）</li>
+        <li><code>enabled</code>, <code>payday_day</code>, <code>notify_time</code>（<code>HH:MM</code>）</li>
+        <li><code>channel_id</code>: 親向けチャンネル。<strong>査定提案の通知先</strong>でもあります（子には見せず、この親チャンネルのみへ即時通知＋定期再通知）。未設定だと即時通知も定期再通知も出ないため、査定機能を使うなら必ず設定してください。</li>
         <li><code>notify_offset</code>: カンマ区切り文字列または配列で複数日指定可（例: <code>"-7day,-1day,0day"</code>）。<code>0day</code> は支給日当日を意味します。</li>
+        <li><code>auto_grant_on_payday</code>: 支給日に固定お小遣いを自動支給するか。</li>
+        <li><code>pending_reminder_min_days</code>: 同一の承認待ち集合を再通知する最小間隔（日）。連投を避けます。</li>
+      </ul>
+
+      <h4><code>safety_alert</code>: 危険信号の通知（子の安全）</h4>
+      <ul>
+        <li><code>enabled</code>: 既定 <code>true</code>。安全機能のため、止める場合は子どもの異変に気づく別の手段があることを確認してください。</li>
+        <li><code>channel_id</code>: 通知先チャンネルID。未設定なら <code>allowance_reminder.channel_id</code> へフォールバックします。査定通知と分けたい場合は専用チャンネルを設定してください。</li>
+      </ul>
+      <div class="doc-note danger">
+        <strong>家庭内の虐待の疑いは、ここに設定したチャンネルへ通知しません。</strong>加害者が同居の親であることが多く、情報還流になるためです。詳細は<a href="#safety">子の安全を守るしくみ</a>を参照してください。
+      </div>
+
+      <h4><code>assessment_guardrail</code>: 査定の安全弁</h4>
+      <ul>
+        <li><code>temporary_max</code>: 1回の臨時査定で提案できる上限（円）</li>
+        <li><code>monthly_total_max</code>: 1ヶ月あたりの査定合計の上限（円）</li>
+        <li><code>daily_count_max</code>: 1日あたりの査定回数の上限</li>
+      </ul>
+
+      <h4><code>conversation_session</code> / <code>conversation_log</code>: 会話の保持</h4>
+      <ul>
+        <li><code>conversation_session.expiry_minutes</code>: 会話セッションの idle 窓（分）。既定 30。</li>
+        <li><code>conversation_log.retention_days</code>: 会話ログの保持日数。既定 90。</li>
+        <li><code>conversation_log.max_lines</code>: 会話ログの最大行数。既定 2000。</li>
+      </ul>
+      <div class="doc-note">
+        ここで設定するのは Bot 側が持つ会話ログです。AI が参照する会話履歴の実体は別の場所にあります（<a href="#backup">会話履歴の保存先</a>）。
+      </div>
+
+      <h4><code>bot_personality</code>: 会話の口調（全体既定）</h4>
+      <ul>
+        <li>ユーザー個別の <code>bot_personality</code> が未設定のときに使われます。</li>
       </ul>
 
       <h4><code>wallet_audit</code>: 月次残高監査</h4>
