@@ -341,6 +341,141 @@ def merge_judgments(py_result: dict | None, ai_result: dict | None) -> dict | No
     }
 
 
+# カテゴリの日本語表示。親への通知で「何が起きているか」を一目で伝える
+_CATEGORY_LABEL = {
+    "self_harm": "自分を傷つけたい気持ち・つらさの訴え",
+    "bullying": "いじめ・暴力被害の訴え",
+    "grooming": "性的な誘い・見知らぬ人からの接触",
+    "illegal_work": "違法な稼ぎ方への関心",
+    "eating": "食事や体型に関する気になる訴え",
+    "substance": "喫煙・飲酒・薬物への関心",
+    "abuse": "家庭内の安全に関わる訴え",
+}
+
+_URGENCY_LABEL = {
+    "urgent": "【緊急】すぐに確認してください",
+    "high": "【重要】早めに確認してください",
+    "medium": "【参考】気に留めておいてください",
+}
+
+# 第三者の実名らしき箇所を伏せるためのパターン。
+# 原文をそのまま親へ渡すと加害児童の実名が残り、親が学校へ乗り込む等、子が最も恐れる展開を招く。
+_NAME_LIKE = re.compile(
+    r"([一-龥ぁ-んァ-ヶA-Za-z]{1,6})(くん|君|ちゃん|さん|先輩|後輩)"
+)
+
+
+def redact_third_party(text: str) -> str:
+    """原文から第三者の実名らしき箇所を伏せる（親へ渡す前の加工）。
+
+    「○○くんに殴られた」の実名が親チャンネルに残ると、親が相手の家庭や学校へ直接動き、
+    子が最も恐れる展開（事が大きくなる・報復される）を招く。関係性は残しつつ名前だけ伏せる。
+
+    Args:
+        text: 子の発話原文。
+
+    Returns:
+        str: 実名を伏せた文字列。
+    """
+    return _NAME_LIKE.sub(lambda m: f"（同じくらいの子）{m.group(2)}", text or "")
+
+
+def build_parent_notification(child_name: str, judgment: dict, raw_text: str,
+                              child_consent: str = "unknown") -> str:
+    """親チャンネルへ送る通知文を組み立てる（①要約 → ②背景 → ③原文の順）。
+
+    要約と背景を先に置くのは、親が**重要度と緊急性を誤判断しない**ようにするため。
+    原文を添えるのは、要約だけでは親が緊急性を測れず、AI の要約バイアスで深刻度が落ちるため。
+    ただし原文は当該発言に限定し、第三者の実名は伏せる。
+
+    性的な話題は原文を載せず性質の記述に留める。原文直送は子を辱め、
+    「恥じさせない」という会話側の方針と正面から矛盾するためである。
+
+    Args:
+        child_name: 対象児童の名前。
+        judgment: merge_judgments の結果。
+        raw_text: 子の発話原文。
+        child_consent: 子の同意状況。"agreed"（伝えていいと言った）/
+            "refused"（知らせたくないと言った）/"unknown"（確認できていない）。
+
+    Returns:
+        str: 親チャンネルへ送る本文。
+    """
+    category = judgment.get("category", "")
+    urgency = judgment.get("urgency", "high")
+    header = _URGENCY_LABEL.get(urgency, _URGENCY_LABEL["high"])
+    label = _CATEGORY_LABEL.get(category, "気になる訴え")
+
+    lines = [
+        f"{header}",
+        f"**{child_name} さんとの会話で、{label}がありました。**",
+        "",
+        "**■ どういう状況か**",
+        f"{judgment.get('ai_reason') or '会話の中に気になる内容がありました。'}",
+    ]
+
+    # 確信度が低いときは、親が過剰に反応しないよう正直に添える
+    conf = judgment.get("confidence")
+    if isinstance(conf, (int, float)) and conf < 0.7:
+        lines.append("※ AI の判断としては確信が高くありません。言葉のあやの可能性もあります。")
+
+    # 子の同意状況。「知らせたくない」と言っている場合は必ず伝え、親が問い詰めないよう促す
+    lines.append("")
+    lines.append("**■ 本人の意向**")
+    if child_consent == "agreed":
+        lines.append("本人は「おうちの人に伝えていい」と言っています。")
+    elif child_consent == "refused":
+        lines.append(
+            "**本人は「知らせたくない」と言っています。** それでも安全に関わるためお伝えしています。\n"
+            "いきなり問い詰めると、次から話してくれなくなります。"
+            "本人が話し出すのを待つか、「何かあったら聞くよ」と伝えるだけに留めてください。"
+        )
+    else:
+        lines.append(
+            "本人への確認は取れていません（返事がない・会話が途切れた等）。\n"
+            "いきなり問い詰めず、様子を見ながら声をかけてください。"
+        )
+
+    # 原文。性的な話題は載せず性質の記述に留める（子を辱めない）
+    lines.append("")
+    lines.append("**■ 本人の言葉**")
+    if category == "grooming":
+        lines.append("（内容の性質上、原文は載せていません。性的な誘いや接触に関する内容でした）")
+    else:
+        safe = redact_third_party(raw_text or "").strip()
+        # 原文は当該発言のみ。長すぎる場合は先頭のみ載せる（会話全体を貼らない）
+        if len(safe) > 200:
+            safe = safe[:200] + "…"
+        lines.append(f"> {safe}" if safe else "（記録できませんでした）")
+
+    return "\n".join(lines)
+
+
+def build_child_hotline_message(judgment: dict) -> str:
+    """虐待の疑いがある場合に、子へ直接渡す外部窓口の案内を組み立てる。
+
+    親チャンネルへは送らないため、この案内が子にとって唯一の外部への導線になる。
+    「おうちの人に言う」を提案せず、子が親を介さず単独で到達できる窓口だけを渡す。
+
+    Args:
+        judgment: merge_judgments の結果。
+
+    Returns:
+        str: 子へ送る案内文。
+    """
+    urgent = judgment.get("urgency") == "urgent"
+    body = hotlines_for(judgment.get("hotline_key") or "abuse", urgent=urgent)
+    return (
+        "話してくれてありがとう。それ、ひとりで抱えるにはしんどいことだと思う。\n"
+        "ここで話したことを、そのままおうちの人に伝えることはしないよ。\n\n"
+        "もしよかったら、こういうところにも話してみてほしいんだ。"
+        "きみの味方になってくれる人たちだよ。\n"
+        f"{body}\n\n"
+        "学校の先生や保健室の先生、親戚の人でもいい。"
+        "話せそうな人、だれか思いつくかな？"
+    )
+
+
 def hotlines_for(hotline_key: str | None, urgent: bool = False) -> str:
     """子へ渡す公的窓口の案内文を組み立てる（LLM に番号を生成させないための定数経由）。
 
