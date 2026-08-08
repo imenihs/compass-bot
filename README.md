@@ -77,7 +77,6 @@ python3 -m app.bot
 ## 使い方ガイド（詳細版）
 
 **ドキュメントの正本は Web の使い方ガイドです。** Bot を起動した状態で、ブラウザから開けます。
-リポジトリ直下の [readme.html](readme.html) を開くと、ガイドへのリンクをまとめてあります。
 
 ```
 http://<ホスト>:8765/compass-bot/readme
