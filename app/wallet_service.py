@@ -453,7 +453,19 @@ class WalletService:
 
     def add_savings_goal(self, user_name: str, title: str, target_amount: int) -> tuple[bool, str]:
         """貯金目標を追加する。同名タイトルが既存なら金額を更新する。
-        上限(MAX_SAVINGS_GOALS)超過の場合は (False, エラーメッセージ) を返す。"""
+        上限(MAX_SAVINGS_GOALS)超過の場合は (False, エラーメッセージ) を返す。
+
+        wallet_state.json は update_balance と共有するため、load→変更→save を flock で保護する
+        （2026/08/09 追加）。保護が無いと、目標の追加と残高更新が同時に走ったときに
+        後から save した側が相手の変更を丸ごと消す（ロストアップデート）。
+        update_balance では潰してあった穴が、目標系のメソッドにだけ残っていた。
+        """
+        lock_path = self.wallet_state_path.with_suffix(self.wallet_state_path.suffix + ".lock")
+        with self._lock, _interprocess_lock(lock_path):
+            return self._add_savings_goal_locked(user_name, title, target_amount)
+
+    def _add_savings_goal_locked(self, user_name: str, title: str, target_amount: int) -> tuple[bool, str]:
+        """add_savings_goal の本体。呼び出し側がロックを保持している前提。"""
         state = self._load_wallet_state()
         users = state.setdefault("users", {})
         u = users.setdefault(user_name, {})
@@ -481,7 +493,16 @@ class WalletService:
         return True, "added"
 
     def remove_savings_goal(self, user_name: str, title: str) -> bool:
-        """指定タイトルの目標を削除する。見つかれば True を返す。"""
+        """指定タイトルの目標を削除する。見つかれば True を返す。
+
+        add_savings_goal と同じ理由で flock 内で行う（ロストアップデート防止）。
+        """
+        lock_path = self.wallet_state_path.with_suffix(self.wallet_state_path.suffix + ".lock")
+        with self._lock, _interprocess_lock(lock_path):
+            return self._remove_savings_goal_locked(user_name, title)
+
+    def _remove_savings_goal_locked(self, user_name: str, title: str) -> bool:
+        """remove_savings_goal の本体。呼び出し側がロックを保持している前提。"""
         state = self._load_wallet_state()
         users = state.get("users", {})
         u = users.get(user_name, {})
@@ -497,7 +518,16 @@ class WalletService:
         return True
 
     def clear_all_savings_goals(self, user_name: str) -> None:
-        """全貯金目標を削除する。"""
+        """全貯金目標を削除する。
+
+        add_savings_goal と同じ理由で flock 内で行う（ロストアップデート防止）。
+        """
+        lock_path = self.wallet_state_path.with_suffix(self.wallet_state_path.suffix + ".lock")
+        with self._lock, _interprocess_lock(lock_path):
+            self._clear_all_savings_goals_locked(user_name)
+
+    def _clear_all_savings_goals_locked(self, user_name: str) -> None:
+        """clear_all_savings_goals の本体。呼び出し側がロックを保持している前提。"""
         state = self._load_wallet_state()
         users = state.get("users", {})
         if user_name in users:
