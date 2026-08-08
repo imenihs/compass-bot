@@ -774,16 +774,21 @@ async def _resolve_child_channels_strict() -> tuple[dict, dict]:
             channel = rs.client.get_channel(channel_id)
             if channel is None:
                 channel = await rs.client.fetch_channel(channel_id)
-            members = list(rs._channel_users(channel, users, user_by_discord_id))
-            # 共有チャンネル（そのチャンネルに子が2人以上）へは opener を送らない。送ると他の子の目に触れる（codex 再現）。
-            # このチャンネルは、そこにいる子全員にとって「候補にカウントするが送信先には採らない」ため count だけ増やす。
-            is_private = len(members) == 1
-            for user_conf in members:
+            # opener の送信先は「実メンバーで専用と確認できたチャンネル」に限る（codex 最終指摘）。
+            # _channel_users はメンバーキャッシュが空のときチャンネル名一致で補完するが、名前一致は
+            # 「そのチャンネルに他の子がいない」を保証しない（共有チャンネルへ誤送信し得る）。よって
+            # ここではメンバーキャッシュから直接、そのチャンネルにいる登録児童を数える（名前補完は使わない）。
+            member_ids = {
+                int(getattr(m, "id", 0)) for m in getattr(channel, "members", []) if getattr(m, "id", None)
+            }
+            member_users = [user_by_discord_id[mid] for mid in member_ids if mid in user_by_discord_id]
+            is_private = len(member_users) == 1  # メンバー実体で子が1人だけ＝専用チャンネル
+            for user_conf in member_users:
                 nm = str(user_conf.get("name", "")).strip()
                 if not nm:
                     continue
                 count_by_name[nm] = count_by_name.get(nm, 0) + 1
-                # その子専用チャンネル（1人だけ）のときだけ送信先候補にする
+                # その子専用チャンネル（実メンバーで1人だけ）のときだけ送信先候補にする
                 if is_private:
                     channel_by_name.setdefault(nm, channel)
     except Exception:
