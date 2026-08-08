@@ -436,31 +436,12 @@ class WalletService:
             f.write("\n")
         tmp_path.replace(self.wallet_audit_state_path)
 
-    def apply_penalty(self, user_conf: dict, system_conf: dict, diff: int, wallet_audit_conf: dict) -> int:
-        penalty = int(abs(diff) * float(wallet_audit_conf.get("penalty_rate", 1.0)))
-        cap = user_conf.get("penalty_cap")
-        if cap in ("", None):
-            cap = None
-        if cap is None:
-            cap = int(user_conf.get("fixed_allowance", 0))
-        if cap is not None:
-            penalty = min(penalty, int(cap))
-        if penalty <= 0:
-            return 0
-        # update_balance の戻り値（tuple）は使用しない（達成通知はペナルティ時不要）
-        self.update_balance(
-            user_conf=user_conf,
-            system_conf=system_conf,
-            delta=-penalty,
-            action="penalty",
-            note="wallet_mismatch",
-            extra={"mismatch": int(diff)},
-        )
-        return penalty
-
-    # ------------------------------------------------------------------
-    # 貯金目標 CRUD（複数対応）
-    # ------------------------------------------------------------------
+    # apply_penalty は削除した（2026/08/09）。
+    # 残高不一致に対して子の残高を減額する処理だったが、呼び出し元がゼロの到達不能コードであった。
+    # 現行の運用は「罰でなく記録の抜けを一緒に確認する」であり（実装仕様: 支出感想・残高不一致の
+    # あるべき扱い）、減額は行わない。到達不能なまま残すと、将来誰かが「使える機能」と誤認して
+    # 呼び出し、子の残高を黙って減らす事故になりうる。仕様と実装の乖離源にもなるため削除する。
+    # 復活させる場合は、段階的な影響・文言・親への通知を仕様から設計し直すこと。
 
     def get_savings_goals(self, user_name: str) -> list[dict]:
         """全貯金目標をリストで返す。未設定なら空リスト。"""
