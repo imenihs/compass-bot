@@ -774,12 +774,18 @@ async def _resolve_child_channels_strict() -> tuple[dict, dict]:
             channel = rs.client.get_channel(channel_id)
             if channel is None:
                 channel = await rs.client.fetch_channel(channel_id)
-            for user_conf in rs._channel_users(channel, users, user_by_discord_id):
+            members = list(rs._channel_users(channel, users, user_by_discord_id))
+            # 共有チャンネル（そのチャンネルに子が2人以上）へは opener を送らない。送ると他の子の目に触れる（codex 再現）。
+            # このチャンネルは、そこにいる子全員にとって「候補にカウントするが送信先には採らない」ため count だけ増やす。
+            is_private = len(members) == 1
+            for user_conf in members:
                 nm = str(user_conf.get("name", "")).strip()
                 if not nm:
                     continue
                 count_by_name[nm] = count_by_name.get(nm, 0) + 1
-                channel_by_name.setdefault(nm, channel)
+                # その子専用チャンネル（1人だけ）のときだけ送信先候補にする
+                if is_private:
+                    channel_by_name.setdefault(nm, channel)
     except Exception:
         return {}, {}
     return channel_by_name, count_by_name

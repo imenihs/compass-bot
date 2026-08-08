@@ -794,9 +794,12 @@ async def _spawn_claude(prompt: str, session_id: str | None, system_prompt: str,
     ]
     # 査定 F/B の opener 生成は tool を一切呼ばせない（確定済み外部イベントの通知であり、
     # 通常の「確定入金は tool で記録」ルールで record_income して二重加算するのを防ぐ・N-11.14 blocker #2）。
-    # disable_tools のときは MCP を渡さず allowedTools も付けない（wallet tool が使えない spawn）。
     if not disable_tools:
         args += ["--mcp-config", str(WALLET_MCP_CONFIG), "--allowedTools", ",".join(allowed_tools)]
+    else:
+        # --mcp-config を外すだけでは、--resume した子 session が元々持つ MCP 設定・許可 tool を引き継ぎ得る（codex 再現）。
+        # --strict-mcp-config で --mcp-config 由来以外の MCP を全て無視し、さらに wallet tool を明示的に禁止して二重防御する。
+        args += ["--strict-mcp-config", "--disallowedTools", ",".join(ALLOWED_WALLET_TOOLS + ALLOWED_PARENT_TOOLS)]
     # モデル指定は server env のみ由来。空なら渡さず CLI 既定にする（不在モデルで全会話停止を防ぐ）
     if CLAUDE_MODEL:
         args += ["--model", CLAUDE_MODEL]
