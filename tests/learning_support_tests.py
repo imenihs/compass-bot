@@ -75,12 +75,12 @@ def test_followup_policy_endpoint_writes_valid_policy_and_rejects_harmful_note()
     old_load_all_users = server.load_all_users
     old_update_user_field = server.update_user_field
 
-    async def fake_current_user(_token: str | None) -> str:
+    async def fake_current_user(_token: str | None, _dash: str | None = None) -> str:
         return "parent"
 
     try:
         server._get_current_user = fake_current_user
-        server._is_admin = lambda username: username == "parent"
+        server._is_admin = lambda username, _dash=None: username == "parent"
         server.load_all_users = lambda: [{"name": "はな"}]
 
         def fake_update_user_field(name: str, field: str, value) -> bool:
@@ -315,7 +315,7 @@ def test_user_settings_endpoint_updates_child_settings() -> None:
     old_load_all_parents = server.load_all_parents
     old_find_user_json_path_by_name = server.find_user_json_path_by_name
 
-    async def fake_current_user(_token: str | None) -> str:
+    async def fake_current_user(_token: str | None, _dash: str | None = None) -> str:
         return "parent"
 
     with tempfile.TemporaryDirectory(prefix="compass-user-settings-") as d:
@@ -341,7 +341,7 @@ def test_user_settings_endpoint_updates_child_settings() -> None:
         )
         try:
             server._get_current_user = fake_current_user
-            server._is_admin = lambda username: username == "parent"
+            server._is_admin = lambda username, _dash=None: username == "parent"
             server.load_all_users = lambda: [{"name": "はな", "discord_user_id": 101}]
             server.load_all_parents = lambda: []
             server.find_user_json_path_by_name = lambda name: user_path if name == "はな" else None
@@ -394,7 +394,7 @@ def test_user_order_endpoint_saves_normalized_dashboard_order() -> None:
     old_load_all_parents = server.load_all_parents
     old_setting_path = server.SETTING_PATH
 
-    async def fake_current_user(_token: str | None) -> str:
+    async def fake_current_user(_token: str | None, _dash: str | None = None) -> str:
         return "parent"
 
     with tempfile.TemporaryDirectory(prefix="compass-user-order-") as d:
@@ -403,7 +403,7 @@ def test_user_order_endpoint_saves_normalized_dashboard_order() -> None:
         setting_path.write_text(json.dumps({"web_base_url": "https://example.test"}, indent=2), encoding="utf-8")
         try:
             server._get_current_user = fake_current_user
-            server._is_admin = lambda username: username == "parent"
+            server._is_admin = lambda username, _dash=None: username == "parent"
             server.load_all_users = lambda: [
                 {"name": "はな", "discord_user_id": 101},
                 {"name": "みらい", "discord_user_id": 102},
@@ -437,7 +437,7 @@ def test_user_settings_endpoint_updates_parent_settings() -> None:
     old_load_all_parents = server.load_all_parents
     old_parents_dir = server.PARENTS_DIR
 
-    async def fake_current_user(_token: str | None) -> str:
+    async def fake_current_user(_token: str | None, _dash: str | None = None) -> str:
         return "parent"
 
     with tempfile.TemporaryDirectory(prefix="compass-parent-settings-") as d:
@@ -449,7 +449,7 @@ def test_user_settings_endpoint_updates_parent_settings() -> None:
         )
         try:
             server._get_current_user = fake_current_user
-            server._is_admin = lambda username: username == "parent"
+            server._is_admin = lambda username, _dash=None: username == "parent"
             server.load_all_users = lambda: []
             server.load_all_parents = lambda: [{"name": "親", "discord_user_id": 202}]
             server.PARENTS_DIR = root
@@ -484,14 +484,14 @@ def test_learning_card_and_growth_plan_endpoints_write_isolated_state() -> None:
     old_state_dir = server.LEARNING_SUPPORT_STATE_DIR
     old_plan_dir = server.GROWTH_PLANS_DIR
 
-    async def fake_current_user(_token: str | None) -> str:
+    async def fake_current_user(_token: str | None, _dash: str | None = None) -> str:
         return "parent"
 
     with tempfile.TemporaryDirectory(prefix="compass-web-state-") as d:
         root = Path(d)
         try:
             server._get_current_user = fake_current_user
-            server._is_admin = lambda username: username == "parent"
+            server._is_admin = lambda username, _dash=None: username == "parent"
             server.load_all_users = lambda: [{"name": "はな"}]
             server.LEARNING_SUPPORT_STATE_DIR = root / "learning_support_state"
             server.GROWTH_PLANS_DIR = root / "growth_plans"
@@ -554,14 +554,14 @@ def test_child_challenge_feedback_and_template_do_not_expose_parent_policy() -> 
     old_state_dir = server.LEARNING_SUPPORT_STATE_DIR
     old_build_learning_insights = server.build_learning_insights
 
-    async def fake_current_user(_token: str | None) -> str:
+    async def fake_current_user(_token: str | None, _dash: str | None = None) -> str:
         return "はな"
 
     with tempfile.TemporaryDirectory(prefix="compass-child-state-") as d:
         root = Path(d)
         try:
             server._get_current_user = fake_current_user
-            server._is_admin = lambda username: False
+            server._is_admin = lambda username, _dash=None: False
             server.load_all_users = lambda: [{"name": "はな"}]
             server.LEARNING_SUPPORT_STATE_DIR = root / "learning_support_state"
 
@@ -713,11 +713,11 @@ def test_web_adjust_rejects_invalid_direction_without_balance_change() -> None:
         old_find_user_by_name = server.find_user_by_name
         old_load_system = server.load_system
         try:
-            async def fake_current_user(_token: str | None) -> str:
+            async def fake_current_user(_token: str | None, _dash: str | None = None) -> str:
                 return "parent"
 
             server._get_current_user = fake_current_user
-            server._is_admin = lambda username: username == "parent"
+            server._is_admin = lambda username, _dash=None: username == "parent"
             server._wallet_service = wallet
             server.find_user_by_name = lambda name: {"name": name} if name == "はな" else None
             server.load_system = lambda: {"log_dir": str(root / "logs")}

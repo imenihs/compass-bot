@@ -18,6 +18,7 @@ from fastapi import Cookie, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from app import dashboard_token
 from app import web_auth
 from app.config import (
     CHILDREN_DIR,
@@ -177,16 +178,88 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 # ---------- ユーティリティ ----------
 
-async def _get_current_user(session_token: Optional[str]) -> Optional[str]:
-    """セッショントークンからログイン中のユーザー名を取得する。未ログインは None を返す"""
+# ダッシュボード用の Cookie 名。従来のセッション（session_token）とは別にする。
+# 同名にすると、移行期間中に旧セッションが UUID として解決されず全員ログアウトになる
+DASH_COOKIE = "dash_token"
+
+
+def _user_name_from_key(user_key: str) -> Optional[str]:
+    """user_key（child:test 等）から表示名を引く。
+
+    トークンは設定ファイル名を持つ（名前変更で壊れないため）。
+    残高や設定は name をキーにしているので、ここで名前へ変換する。
+
+    Args:
+        user_key: dashboard_token.build_user_key() が作ったキー。
+
+    Returns:
+        Optional[str]: 利用者の name。見つからなければ None。
+    """
+    role, stem = dashboard_token.split_user_key(user_key)
+    if not stem:
+        return None
+    base = PARENTS_DIR if role == dashboard_token.ROLE_PARENT else CHILDREN_DIR
+    path = base / f"{stem}.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return str(json.load(f).get("name") or "").strip() or None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+async def _get_current_user(session_token: Optional[str],
+                            dash_token: Optional[str] = None) -> Optional[str]:
+    """ログイン中のユーザー名を取得する。未ログインは None を返す。
+
+    **移行期間中は UUID と従来セッションの両方を受ける**（二段階移行の前半）。
+    先に UUID を見て、無ければ従来のセッションへ落とす。
+    先にパスワード方式を廃止すると、UUID が行き渡る前に誰も入れなくなるため、
+    全員が UUID で入れることを確認してから旧経路を落とす。
+
+    Args:
+        session_token: 従来のセッション Cookie。
+        dash_token: UUID の Cookie（DASH_COOKIE）。
+
+    Returns:
+        Optional[str]: 利用者の name。
+    """
+    if dash_token:
+        resolved = dashboard_token.resolve(dash_token)
+        if resolved:
+            name = _user_name_from_key(resolved.get("user_key", ""))
+            if name:
+                return name
     if not session_token:
         return None
     return await web_auth.get_session_user(session_token)
 
 
-def _is_admin(username: str) -> bool:
-    """ユーザー名が管理者（setting.json の parent_ids に登録済み）か確認する。
-    Web ユーザーの is_admin フラグとの二段階判定で安全性を高める"""
+def _role_of_dash_token(dash_token: Optional[str]) -> Optional[str]:
+    """UUID Cookie から役割（child / parent）を返す。無効なら None。"""
+    if not dash_token:
+        return None
+    resolved = dashboard_token.resolve(dash_token)
+    return resolved.get("role") if resolved else None
+
+
+def _is_admin(username: str, dash_token: Optional[str] = None) -> bool:
+    """管理者（親）かを判定する。
+
+    **UUID の role を先に見る**（移行後はこちらが正）。
+    無ければ従来の web_users.json の is_admin フラグへ落とす。
+
+    Args:
+        username: 利用者の name。
+        dash_token: UUID の Cookie。
+
+    Returns:
+        bool: 親なら True。
+    """
+    role = _role_of_dash_token(dash_token)
+    if role:
+        return role == dashboard_token.ROLE_PARENT
     # web_users.json の is_admin フラグで確認する（parent との紐付けは承認時に設定）
     users_data = web_auth._read_json(web_auth.WEB_USERS_PATH)
     user = users_data.get(username, {})
@@ -1493,14 +1566,16 @@ async def post_register(request: Request, username: str = Form(...)):
 
 
 @app.get("/compass-bot/readme", response_class=HTMLResponse)
-async def get_readme(request: Request, session_token: Optional[str] = Cookie(default=None)):
+async def get_readme(request: Request,
+                     session_token: Optional[str] = Cookie(default=None),
+                     dash_token: Optional[str] = Cookie(default=None)):
     """使い方ガイド（詳細版ドキュメントの正本）を表示する。
 
     導入手順を読む時点ではまだログインできないため、認証を要求しない。
     公開情報のみを載せる前提のページであり、残高等の実データは一切扱わない。
     ログイン済みならヘッダーにユーザー名を出すため、セッションがあれば解決だけしておく。
     """
-    username = await _get_current_user(session_token)
+    username = await _get_current_user(session_token, dash_token)
     return templates.TemplateResponse("readme.html", {
         "request": request,
         "username": username,
@@ -1644,15 +1719,52 @@ async def post_set_password(
 
 # ---------- ダッシュボード ----------
 
+@app.get("/compass-bot/d/{token}")
+async def enter_by_token(token: str):
+    """UUID 付き URL の入口。**Cookie を置いて UUID 無しの URL へ逃がす**。
+
+    UUID を URL に残し続けると、次の経路から漏れる。
+      ・Apache のアクセスログ（CustomLog combined は URL を丸ごと記録する。最も確実）
+      ・ブラウザ履歴 / ブックマーク
+      ・スクリーンショットのアドレスバー
+      ・Referer ヘッダ
+    初回だけ UUID を受け取り、以後は Cookie で通すことで**まとめて塞げる**。
+    UX は変わらない（ブックマークは UUID 無しの URL になる）。
+
+    未登録・失効したトークンは 403（社長指示「未承認のUUIDははじく」）。
+
+    Args:
+        token: 発行された UUID。
+
+    Returns:
+        RedirectResponse: ダッシュボードへ 303。無効なら 403。
+    """
+    resolved = dashboard_token.resolve(token)
+    if not resolved:
+        return HTMLResponse("<h1>このURLは使えません</h1>"
+                            "<p>おうちの人に新しいURLをもらってね。</p>", status_code=403)
+
+    dest = ("/compass-bot/child" if resolved.get("role") == dashboard_token.ROLE_CHILD
+            else "/compass-bot/dashboard")
+    response = RedirectResponse(url=dest, status_code=303)
+    # 期限を長く取る。子に再入力させないことが UUID 方式の目的
+    response.set_cookie(
+        DASH_COOKIE, token,
+        max_age=365 * 24 * 3600, httponly=True, secure=True, samesite="lax",
+    )
+    return response
+
+
 @app.get("/compass-bot/dashboard", response_class=HTMLResponse)
 async def get_dashboard(
     request: Request,
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     msg: str = "",
     error: str = "",
 ):
     """ダッシュボードページを表示する。未ログインはログインページへリダイレクトする"""
-    username = await _get_current_user(session_token)
+    username = await _get_current_user(session_token, dash_token)
     if not username:
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
@@ -1741,11 +1853,12 @@ async def get_dashboard(
 async def admin_approve(
     request: Request,
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     username: str = Form(...),
 ):
     """管理者がWeb申請を承認する。Webフォームからの操作用エンドポイント"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     username = username.strip()
@@ -1779,11 +1892,12 @@ def _op_redirect(msg: str = "", error: str = "") -> RedirectResponse:
 @app.post("/compass-bot/op/user_order")
 async def op_user_order(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     user_order: str = Form(default="[]"),
 ):
     """管理者がダッシュボードのユーザー表示順を保存する。"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     try:
@@ -1802,12 +1916,13 @@ async def op_user_order(
 @app.post("/compass-bot/op/grant")
 async def op_grant(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     target: str = Form(...),
     amount: str = Form(...),
 ):
     """親が特定ユーザーへ手動支給する"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     # 金額を整数に変換する（カンマ・円記号を除去）
@@ -1840,12 +1955,13 @@ async def op_grant(
 @app.post("/compass-bot/op/fixed_allowance")
 async def op_fixed_allowance(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     target: str = Form(...),
     amount: str = Form(...),
 ):
     """親がユーザーの月額固定お小遣いを変更する"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     try:
@@ -1873,6 +1989,7 @@ async def op_fixed_allowance(
 @app.post("/compass-bot/op/user_settings")
 async def op_user_settings(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     user_type: str = Form(default="child"),
     original_name: str = Form(...),
     name: str = Form(...),
@@ -1889,8 +2006,8 @@ async def op_user_settings(
     keywords_danger: str = Form(default=""),
 ):
     """管理者が子ども・親ユーザーの設定JSONをWebから編集する。"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     scope = str(user_type or "child").strip()
@@ -2007,6 +2124,7 @@ def _new_settings_path_for_scope(user_type: str, name: str) -> Path | None:
 @app.post("/compass-bot/op/user_create")
 async def op_user_create(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     user_type: str = Form(default="child"),
     name: str = Form(...),
     discord_user_id: str = Form(...),
@@ -2027,9 +2145,9 @@ async def op_user_create(
     手作業での JSON 作成を不要にし、最初の1人以外はブラウザだけでユーザーを増やせるようにする。
     親を新規追加した場合は is_parent の凍結解除のため Bot 再起動が必要（画面にも案内する）。
     """
-    current_user = await _get_current_user(session_token)
+    current_user = await _get_current_user(session_token, dash_token)
     # 管理者のみ。未認証・非管理者はログインへ戻す
-    if not current_user or not _is_admin(current_user):
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     scope = str(user_type or "child").strip()
@@ -2110,6 +2228,7 @@ async def op_user_create(
 @app.post("/compass-bot/op/followup_policy")
 async def op_followup_policy(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     target: str = Form(...),
     enabled: str = Form(default=""),
     focus_area: str = Form(default="record_habit"),
@@ -2118,8 +2237,8 @@ async def op_followup_policy(
     parent_note: str = Form(default=""),
 ):
     """親がユーザー別のAIフォロー方針を保存する"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     target_name = target.strip()
@@ -2168,6 +2287,7 @@ async def op_followup_policy(
 @app.post("/compass-bot/op/followup_note")
 async def op_followup_note(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     target: str = Form(...),
     parent_followup_note: str = Form(default=""),
 ):
@@ -2191,6 +2311,7 @@ async def op_followup_note(
 @app.post("/compass-bot/op/learning_card_feedback")
 async def op_learning_card_feedback(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     target: str = Form(...),
     card_id: str = Form(...),
     feedback: str = Form(...),
@@ -2199,8 +2320,8 @@ async def op_learning_card_feedback(
     child_action: str = Form(default=""),
 ):
     """親が今週の会話カードへの反応を保存する"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     target_name = target.strip()
@@ -2248,17 +2369,18 @@ async def op_learning_card_feedback(
 @app.post("/compass-bot/op/child_challenge_feedback")
 async def op_child_challenge_feedback(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     challenge_id: str = Form(...),
     feedback: str = Form(...),
     target: str = Form(default=""),
     child_action: str = Form(default=""),
 ):
     """子どものチャレンジ反応を保存する。親メモや内部方針はレスポンスに含めない"""
-    current_user = await _get_current_user(session_token)
+    current_user = await _get_current_user(session_token, dash_token)
     if not current_user:
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
-    is_admin = _is_admin(current_user)
+    is_admin = _is_admin(current_user, dash_token)
     target_value = _short_text(target, 120)
     target_name = target_value if is_admin and target_value else current_user
     if target_value and target_value != current_user and not is_admin:
@@ -2298,6 +2420,7 @@ async def op_child_challenge_feedback(
 @app.post("/compass-bot/op/growth_plan")
 async def op_growth_plan(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     target: str = Form(...),
     plan_id: str = Form(default=""),
     action: str = Form(default="save"),
@@ -2311,8 +2434,8 @@ async def op_growth_plan(
     notes: str = Form(default=""),
 ):
     """親が成長行動プランを作成・更新・終了する"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     target_name = target.strip()
@@ -2387,13 +2510,14 @@ async def op_growth_plan(
 @app.post("/compass-bot/op/adjust")
 async def op_adjust(
     session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
     target: str = Form(...),
     amount: str = Form(...),
     direction: str = Form(...),  # "plus" or "minus"
 ):
     """親が残高を手動調整する（加算・減算）"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
     try:
@@ -2433,9 +2557,10 @@ async def op_adjust(
 @app.get("/", response_class=HTMLResponse)
 @app.get("/compass-bot", response_class=HTMLResponse)
 @app.get("/compass-bot/", response_class=HTMLResponse)
-async def index(session_token: Optional[str] = Cookie(default=None)):
+async def index(session_token: Optional[str] = Cookie(default=None),
+                dash_token: Optional[str] = Cookie(default=None)):
     """ルートアクセス: ログイン済みならダッシュボード、未ログインはログインページへ"""
-    username = await _get_current_user(session_token)
+    username = await _get_current_user(session_token, dash_token)
     if username:
         return RedirectResponse(url="/compass-bot/dashboard", status_code=303)
     return RedirectResponse(url="/compass-bot/login", status_code=303)
