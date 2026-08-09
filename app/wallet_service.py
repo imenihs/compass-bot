@@ -748,16 +748,26 @@ class WalletService:
         if not isinstance(goals, list):
             goals = []
 
-        # 同名タイトルが既存なら金額だけ更新して返す
+        # 同名タイトルが既存なら金額だけ更新して返す。
+        # **active なものだけを見る**（2026/08/10）。
+        # cancelled/done まで拾うと、桁を間違えて取り消した目標と同じ名前で
+        # 登録し直したとき、cancelled のまま金額だけ書き換わり、
+        # 親には「登録しました」と出るのに子は一生返済できない状態になる
+        # （cancel_goal を作った動機そのものが成立しなくなる）。
         for g in goals:
-            if g.get("title") == title:
+            if g.get("title") == title and str(g.get("status", "active")) == "active":
                 g["target_amount"] = int(target_amount)
                 u["savings_goals"] = goals
                 self._save_wallet_state(state)
                 return True, "updated"
 
-        # 上限チェック
-        if len(goals) >= MAX_SAVINGS_GOALS:
+        # 上限チェック。**active なものだけ数える**（2026/08/10）。
+        # cancelled/done も数えると、取消や達成を繰り返すうちに枠が埋まり切り、
+        # 有効な目標が0件でも新しく作れなくなる。
+        # 設計書も「active なものは最大5件」と定めている。
+        active_goals = [g for g in goals
+                        if isinstance(g, dict) and str(g.get("status", "active")) == "active"]
+        if len(active_goals) >= MAX_SAVINGS_GOALS:
             return False, f"目標は最大{MAX_SAVINGS_GOALS}件までだよ。まず不要な目標を削除してね。"
 
         # id は既存の最大値 + 1 で採番する（削除後の再利用は行わない）

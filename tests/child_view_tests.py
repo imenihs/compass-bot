@@ -162,6 +162,19 @@ def _test_goals_use_accumulated():
     _check("goal_done_status", goals[1]["status"] == "done", goals[1])
     _check("goal_pct_capped", goals[1]["pct"] == 100, goals[1])
 
+    # 取り消した目標は子に見せない。
+    # 親が桁を間違えて取り消したものが「あと30,000円」として残り続けると、
+    # 返せない目標を子に見せ続けることになる
+    with_cancelled = cv.build_goals([
+        {"id": 1, "kind": "advance", "title": "取消した分",
+         "target_amount": 300000, "accumulated": 0, "status": "cancelled"},
+        {"id": 2, "kind": "advance", "title": "正しい分",
+         "target_amount": 30000, "accumulated": 500, "status": "active"},
+    ])
+    titles = [g["title"] for g in with_cancelled]
+    _check("cancelled_is_hidden", "取消した分" not in titles, titles)
+    _check("active_is_shown", "正しい分" in titles, titles)
+
     # 壊れたデータでも落ちない
     broken = cv.build_goals([None, "ごみ", {"target_amount": "×"}])
     _check("goals_survive_broken", isinstance(broken, list), broken)

@@ -163,6 +163,11 @@ def build_goals(goals: list[dict]) -> list[dict]:
     for g in goals if isinstance(goals, list) else []:
         if not isinstance(g, dict):
             continue
+        # 取り消したものは子に見せない（2026/08/10）。
+        # 親が桁を間違えて取り消した目標が「あと30,000円」として
+        # 子の画面に残り続けると、返せない目標を見せ続けることになる
+        if str(g.get("status", "active")) == "cancelled":
+            continue
         try:
             target = int(g.get("target_amount", 0) or 0)
             accumulated = int(g.get("accumulated", 0) or 0)

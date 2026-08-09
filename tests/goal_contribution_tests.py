@@ -363,6 +363,78 @@ def _test_advance_registration_and_cancel():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_cancel_then_recreate():
+    """取り消した目標と同じ名前で登録し直せること。
+
+    同名一致を status で絞っていなかったため、cancelled のまま金額だけ
+    書き換わり、親には「登録しました」と出るのに **子は一生返済できない**
+    状態になっていた（cancel_goal を作った動機そのものが成立しない）。
+
+    また上限を `len(goals)` で数えていたため、取消や達成を繰り返すと
+    **有効な目標が0件でも新規作成できなくなる**状態だった。
+    """
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        ws, _ = _setup(tmp, [], balance=5000)
+
+        # 桁を間違えて登録 → 取消 → 正しい額で登録し直す
+        ws.add_savings_goal("たろう", "じてんしゃ", 300000, kind="advance")
+        ws.cancel_goal("たろう", 1)
+        ok, result = ws.add_savings_goal("たろう", "じてんしゃ", 30000, kind="advance")
+        _check("recreate_creates_new", ok and result == "added", (ok, result))
+
+        goals = ws.get_savings_goals("たろう")
+        active = [g for g in goals if g.get("status") == "active"]
+        _check("recreate_has_active_goal", len(active) == 1, goals)
+        _check("recreate_uses_correct_amount",
+               active and active[0].get("target_amount") == 30000, active)
+        _check("recreate_keeps_cancelled_record",
+               any(g.get("status") == "cancelled" for g in goals), goals)
+
+        # 取り消した目標へは積めない（子が返せない目標に返済させない）
+        cancelled_id = [g["id"] for g in goals if g.get("status") == "cancelled"][0]
+        try:
+            ws.contribute_to_goal({"name": "たろう"}, {}, cancelled_id, 100, "x1",
+                                  aux_dedup_window_sec=120)
+            _check("cannot_contribute_to_cancelled", False, "例外が出なかった")
+        except ValueError as e:
+            _check("cannot_contribute_to_cancelled", True, str(e))
+
+        # 新しいほうへは積める
+        applied, _bal, _goal, _closed = ws.contribute_to_goal(
+            {"name": "たろう"}, {}, active[0]["id"], 500, "x2", aux_dedup_window_sec=120)
+        _check("can_contribute_to_recreated", applied == 500, applied)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_limit_counts_only_active():
+    """上限は active なものだけ数えること。
+
+    cancelled/done も数えると、取消や達成を繰り返すうちに枠が埋まり切り、
+    有効な目標が0件でも新しく作れなくなる。
+    """
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        ws, _ = _setup(tmp, [], balance=5000)
+
+        # 5件作って全部取り消す
+        for i in range(5):
+            ws.add_savings_goal("たろう", f"目標{i}", 1000)
+        for g in ws.get_savings_goals("たろう"):
+            ws.cancel_goal("たろう", g["id"])
+
+        active = [g for g in ws.get_savings_goals("たろう")
+                  if g.get("status") == "active"]
+        _check("all_cancelled", len(active) == 0, active)
+
+        # 有効が0件なので、まだ作れるはず
+        ok, result = ws.add_savings_goal("たろう", "新しい目標", 1000)
+        _check("can_add_when_all_cancelled", ok and result == "added", (ok, result))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     _test_normal_contribution()
     _test_idempotent_resend()
@@ -372,6 +444,8 @@ def main():
     _test_migration_three_cases()
     _test_tool_layer()
     _test_advance_registration_and_cancel()
+    _test_cancel_then_recreate()
+    _test_limit_counts_only_active()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
