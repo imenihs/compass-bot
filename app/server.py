@@ -1,6 +1,7 @@
 """
 Compass Bot Webダッシュボード + ヘルスチェック FastAPI サーバー。
-認証フロー: 申請 → Discord通知 → 親がweb承認 → 仮PW発行 → 本PW設定 → ダッシュボード
+認証フロー: Discord で URL再発行 → UUID付きURL → Cookie → ダッシュボード
+（パスワード方式は 2026/08/10 に廃止。docs/設計_UUID認証方式.md）
 """
 
 import datetime
@@ -1524,57 +1525,6 @@ def _build_user_stats(name: str, system_conf: dict, user_conf: Optional[dict] = 
 
 # ---------- 認証ルート ----------
 
-@app.get("/compass-bot/register", response_class=HTMLResponse)
-async def get_register(request: Request):
-    """アクセス申請ページを表示する"""
-    return templates.TemplateResponse("register.html", {
-        "request": request,
-        "username": None,
-        "error": None,
-        "success": None,
-    })
-
-
-@app.post("/compass-bot/register", response_class=HTMLResponse)
-async def post_register(request: Request, username: str = Form(...)):
-    """アクセス申請を受け付けてDiscordに通知する"""
-    username = username.strip()
-    if not username:
-        return templates.TemplateResponse("register.html", {
-            "request": request,
-            "username": None,
-            "error": "ユーザー名を入力してください。",
-            "success": None,
-        })
-
-    # すでに登録済みのユーザーは申請不要
-    if await web_auth.user_exists(username):
-        return templates.TemplateResponse("register.html", {
-            "request": request,
-            "username": None,
-            "error": f"「{username}」はすでに登録済みです。ログインしてください。",
-            "success": None,
-        })
-
-    # 申請を登録する
-    app_id = await web_auth.create_application(username)
-
-    # Discord に承認依頼を通知する
-    msg = (
-        f"🌐 **Webダッシュボード アクセス申請**\n"
-        f"ユーザー名: **{username}**\n"
-        f"承認するには Discord で `web承認 {username}` と送信してください。"
-    )
-    await _notify_discord(msg)
-
-    return templates.TemplateResponse("register.html", {
-        "request": request,
-        "username": None,
-        "error": None,
-        "success": f"申請を受け付けました（ID: {app_id}）。管理者の承認をお待ちください。",
-    })
-
-
 @app.get("/compass-bot/readme", response_class=HTMLResponse)
 async def get_readme(request: Request,
                      session_token: Optional[str] = Cookie(default=None),
@@ -1594,35 +1544,29 @@ async def get_readme(request: Request,
 
 @app.get("/compass-bot/login", response_class=HTMLResponse)
 async def get_login(request: Request):
-    """ログインページを表示する"""
-    return templates.TemplateResponse("login.html", {
-        "request": request,
-        "username": None,
-        "error": None,
-    })
+    """入り方の案内を出す（パスワード方式は廃止した・2026/08/10）。
 
+    以前はここでログインさせていたが、UUID 付き URL 方式へ移したため
+    パスワードの入力欄は無くなった。未認証でここへ来た人には
+    「Discord で URL再発行 と送ってね」と案内する。
 
-@app.post("/compass-bot/login", response_class=HTMLResponse)
-async def post_login(
-    request: Request,
-    username: str = Form(...),
-    password: str = Form(...),
-):
-    """ログイン認証を行い、成功時はセッションを発行してダッシュボードへリダイレクトする"""
-    username = username.strip()
-    ok = await web_auth.verify_password(username, password)
-    if not ok:
-        return templates.TemplateResponse("login.html", {
-            "request": request,
-            "username": None,
-            "error": "ユーザー名またはパスワードが正しくありません。",
-        })
-    # セッションを発行する
-    token = await web_auth.create_session(username)
-    response = RedirectResponse(url="/compass-bot/dashboard", status_code=303)
-    # httponly=True でJavaScriptからの読み取りを防ぐ
-    response.set_cookie("session_token", token, httponly=True, samesite="lax", max_age=7*24*3600)
-    return response
+    15箇所のリダイレクト先になっているため、**エンドポイント自体は残す**。
+    消すと未認証時の遷移先が無くなる。
+    """
+    return HTMLResponse(
+        "<!doctype html><html lang='ja'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>ダッシュボードの入り方</title>"
+        "<style>body{background:#12141c;color:#e8eaf2;font-family:system-ui,sans-serif;"
+        "padding:24px;line-height:1.8}code{background:#1b1e29;padding:2px 8px;"
+        "border-radius:6px}</style></head><body>"
+        "<h1>ダッシュボードの入り方</h1>"
+        "<p>このページからは入れないよ。<strong>自分専用のURL</strong>を使ってね。</p>"
+        "<p>URLが分からない・なくしたときは、Discord で <code>URL再発行</code> と送ると"
+        "新しいURLが届くよ。</p>"
+        "<p>子はじぶんのチャンネルで、おうちの人は親チャンネルで送ってね。</p>"
+        "</body></html>"
+    )
 
 
 @app.get("/compass-bot/logout")
@@ -1634,100 +1578,6 @@ async def logout(session_token: Optional[str] = Cookie(default=None)):
     response.delete_cookie("session_token")
     return response
 
-
-@app.get("/compass-bot/set_password", response_class=HTMLResponse)
-async def get_set_password(request: Request, username: Optional[str] = None):
-    """仮パスワード入力ページを表示する"""
-    return templates.TemplateResponse("set_password.html", {
-        "request": request,
-        "step": "temp",
-        "username": None,
-        "username_hint": username,
-        "token": None,
-        "error": None,
-    })
-
-
-@app.post("/compass-bot/set_password", response_class=HTMLResponse)
-async def post_set_password(
-    request: Request,
-    step: str = Form(...),
-    username: str = Form(default=""),
-    temp_password: str = Form(default=""),
-    password: str = Form(default=""),
-    password_confirm: str = Form(default=""),
-    token: str = Form(default=""),
-):
-    """仮PW検証（step=temp）と本PW設定（step=set）の2段階フォーム処理を行う"""
-    username = username.strip()
-
-    if step == "temp":
-        # 仮パスワードを検証する
-        ok = await web_auth.consume_temp_password(username, temp_password.strip())
-        if not ok:
-            return templates.TemplateResponse("set_password.html", {
-                "request": request,
-                "step": "temp",
-                "username": None,
-                "username_hint": username,
-                "token": None,
-                "error": "仮パスワードが正しくありません。",
-            })
-        # 仮PW確認済み → 本PW設定フォームへ（one-time token を発行してCSRF対策とする）
-        import secrets
-        set_token = secrets.token_urlsafe(16)
-        # 本PW設定待ち状態はweb_auth_state.json で管理済み（consume_temp_password で移行済み）
-        return templates.TemplateResponse("set_password.html", {
-            "request": request,
-            "step": "set",
-            "username": username,
-            "username_hint": None,
-            "token": set_token,
-            "error": None,
-        })
-
-    elif step == "set":
-        # パスワードの強度・一致チェックをする
-        if len(password) < 8:
-            return templates.TemplateResponse("set_password.html", {
-                "request": request,
-                "step": "set",
-                "username": username,
-                "username_hint": None,
-                "token": token,
-                "error": "パスワードは8文字以上にしてください。",
-            })
-        if password != password_confirm:
-            return templates.TemplateResponse("set_password.html", {
-                "request": request,
-                "step": "set",
-                "username": username,
-                "username_hint": None,
-                "token": token,
-                "error": "パスワードが一致しません。",
-            })
-        # パスワード設定完了 → pw_setting 状態であることを確認してから保存する
-        if not await web_auth.is_pw_setting_mode(username):
-            return templates.TemplateResponse("set_password.html", {
-                "request": request,
-                "step": "temp",
-                "username": None,
-                "username_hint": username,
-                "token": None,
-                "error": "セッションが無効です。仮パスワードから再入力してください。",
-            })
-        await web_auth.set_password(username, password)
-        # 設定完了後は自動ログインする
-        session_token = await web_auth.create_session(username)
-        response = RedirectResponse(url="/compass-bot/dashboard", status_code=303)
-        response.set_cookie("session_token", session_token, httponly=True, samesite="lax", max_age=7*24*3600)
-        return response
-
-    # 不正なステップ値は login に戻す
-    return RedirectResponse(url="/compass-bot/login", status_code=303)
-
-
-# ---------- ダッシュボード ----------
 
 @app.get("/compass-bot/d/{token}")
 async def enter_by_token(token: str):
@@ -1946,38 +1796,6 @@ async def get_dashboard(
 
 
 # ---------- 管理者操作 ----------
-
-@app.post("/compass-bot/admin/approve", response_class=HTMLResponse)
-async def admin_approve(
-    request: Request,
-    session_token: Optional[str] = Cookie(default=None),
-    dash_token: Optional[str] = Cookie(default=None),
-    username: str = Form(...),
-):
-    """管理者がWeb申請を承認する。Webフォームからの操作用エンドポイント"""
-    current_user = await _get_current_user(session_token, dash_token)
-    if not current_user or not _is_admin(current_user, dash_token):
-        return RedirectResponse(url="/compass-bot/login", status_code=303)
-
-    username = username.strip()
-    temp_pw = await web_auth.approve_application(username)
-    if temp_pw:
-        # Discord に仮パスワードを通知する
-        base_url = get_web_base_url()
-        msg = (
-            f"✅ **Webアクセスを承認しました**\n"
-            f"ユーザー: **{username}**\n"
-            f"仮パスワード: `{temp_pw}`\n"
-            f"下記URLからパスワードを設定してください:\n"
-            f"{base_url}/compass-bot/set_password?username={username}"
-        )
-        await _notify_discord(msg)
-
-    # ダッシュボードへ戻る
-    return RedirectResponse(url="/compass-bot/dashboard", status_code=303)
-
-
-# ---------- 親操作エンドポイント（Phase A） ----------
 
 def _op_redirect(msg: str = "", error: str = "") -> RedirectResponse:
     """操作後にダッシュボードへリダイレクトする。結果メッセージをクエリパラメータで渡す"""
