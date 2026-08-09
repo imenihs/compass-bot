@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_DIR = ROOT / "settings"
 USERS_DIR = SETTINGS_DIR / "users"
 # 親ユーザーは子供と分けて管理する
+CHILDREN_DIR = USERS_DIR / "children"
 PARENTS_DIR = USERS_DIR / "parents"
 SYSTEM_PATH = SETTINGS_DIR / "system.json"
 SETTING_PATH = SETTINGS_DIR / "setting.json"
@@ -61,9 +62,15 @@ def load_setting() -> dict:
     return _load_json(SETTING_PATH)
 
 def load_all_users() -> list[dict]:
-    """子供ユーザー一覧を返す。users/*.json を対象とし parents/ サブディレクトリは除外する"""
+    """子供ユーザー一覧を返す。users/children/*.json を対象とする。
+
+    以前は users/*.json 直下を子とし parents/ だけをサブディレクトリにしていたが、
+    親子で構成が非対称で分かりにくかったため children/ へ揃えた（2026/08/10）。
+    """
     users = []
-    for p in sorted(USERS_DIR.glob("*.json"), key=lambda path: path.name):
+    if not CHILDREN_DIR.exists():
+        return users
+    for p in sorted(CHILDREN_DIR.glob("*.json"), key=lambda path: path.name):
         # .example.json はサンプルファイルのため実ユーザーとして読み込まない
         if p.name.endswith(".example.json"):
             continue
@@ -433,12 +440,12 @@ def get_proactive_child_nudge_setting() -> dict:
 
 
 def find_user_json_path_by_name(name: str) -> Path | None:
-    """ユーザー名に対応する users/*.json のファイルパスを返す。見つからなければ None を返す"""
+    """ユーザー名に対応する users/children/*.json のファイルパスを返す。見つからなければ None を返す"""
     target = (name or "").strip()
     if not target:
         return None
     # 全ユーザーファイルを走査して name フィールドが一致するパスを返す
-    for p in USERS_DIR.glob("*.json"):
+    for p in CHILDREN_DIR.glob("*.json"):
         # .example.json はサンプルファイルのためスキップする
         if p.name.endswith(".example.json"):
             continue
@@ -588,7 +595,7 @@ def find_user_by_key(key: str) -> dict | None:
     if not key:
         return None
 
-    path = USERS_DIR / f"{key}.json"
+    path = CHILDREN_DIR / f"{key}.json"
     if not path.exists():
         return None
 

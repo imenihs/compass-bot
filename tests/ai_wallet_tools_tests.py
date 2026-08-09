@@ -23,14 +23,14 @@ from app import config
 
 def _setup(tmp: Path) -> None:
     """config のパスと WalletService/payout の保存先を隔離ディレクトリへ向ける。"""
-    (tmp / "settings" / "users").mkdir(parents=True, exist_ok=True)
+    (tmp / "settings" / "users" / "children").mkdir(parents=True, exist_ok=True)
     (tmp / "data").mkdir(parents=True, exist_ok=True)
     # 子ども1人（たろう、固定増額上限100円）と、別の子（はな）を用意する
-    (tmp / "settings" / "users" / "tarou.json").write_text(
+    (tmp / "settings" / "users" / "children" / "tarou.json").write_text(
         json.dumps({"name": "たろう", "age": 10, "discord_user_id": 111, "fixed_increase_cap": 100}, ensure_ascii=False),
         encoding="utf-8",
     )
-    (tmp / "settings" / "users" / "hana.json").write_text(
+    (tmp / "settings" / "users" / "children" / "hana.json").write_text(
         json.dumps({"name": "はな", "age": 8, "discord_user_id": 222, "fixed_increase_cap": 100}, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -52,6 +52,7 @@ def _setup(tmp: Path) -> None:
     # config のパスを差し替える
     config.SETTINGS_DIR = tmp / "settings"
     config.USERS_DIR = config.SETTINGS_DIR / "users"
+    config.CHILDREN_DIR = config.USERS_DIR / "children"
     config.PARENTS_DIR = config.USERS_DIR / "parents"
     config.SYSTEM_PATH = config.SETTINGS_DIR / "system.json"
     config.SETTING_PATH = config.SETTINGS_DIR / "setting.json"

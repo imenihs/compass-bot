@@ -20,8 +20,8 @@ from fastapi.templating import Jinja2Templates
 
 from app import web_auth
 from app.config import (
+    CHILDREN_DIR,
     PARENTS_DIR,
-    USERS_DIR,
     SETTING_PATH,
     get_allow_channel_ids,
     get_allowance_reminder_setting,
@@ -1995,7 +1995,7 @@ def _new_settings_path_for_scope(user_type: str, name: str) -> Path | None:
     Returns:
         Path | None: 作成先パス。同名ファイルが既にあれば None。
     """
-    base_dir = PARENTS_DIR if user_type == "parent" else USERS_DIR
+    base_dir = PARENTS_DIR if user_type == "parent" else CHILDREN_DIR
     path = base_dir / f"{name}.json"
     # 既存ファイルへの上書きを防ぐ。名前重複は別途 _name_exists_elsewhere でも弾くが、
     # ファイル名衝突（別名だが同一ファイル名になるケース）はここで最終的に止める
