@@ -435,6 +435,66 @@ def _test_limit_counts_only_active():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_full_scenario():
+    """実際の利用の流れを最初から最後までなぞる。
+
+    機能単位のテストだけでは足りないことが分かったため追加した。
+    「取消してから同名で登録し直す」という**組み合わせ**で壊れる不具合を
+    反証で指摘されたが、単体テストは両方PASSしていた。
+    単体では正しく動く機能でも、**利用者の動線でなぞると壊れる**ことがある。
+
+    流れ: 親が立て替えを登録 → 子が貯金目標も作る → 返済 → 貯金 →
+          返済開始後は取り消せない → 完済（過払いは丸める）→ 画面表示 → 履歴
+    """
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        ws, _ = _setup(tmp, [], balance=10000)
+        from app import child_view as cv
+        conf = {"name": "たろう"}
+
+        # 1) 親が立て替えを登録 / 2) 子が貯金目標も作る
+        ws.add_savings_goal("たろう", "パソコン代", 3000, kind="advance")
+        ws.add_savings_goal("たろう", "自転車", 5000)
+        goals = cv.build_goals(ws.get_savings_goals("たろう"))
+        _check("scenario_two_kinds_coexist",
+               {g["kind"] for g in goals} == {"advance", "saving"}, goals)
+
+        # 3) 返済 / 4) 貯金
+        ws.contribute_to_goal(conf, {}, 1, 1000, "s1", aux_dedup_window_sec=120)
+        ws.contribute_to_goal(conf, {}, 2, 2000, "s2", aux_dedup_window_sec=120)
+        _check("scenario_balance_after_two", ws.get_balance("たろう") == 7000,
+               ws.get_balance("たろう"))
+
+        # 5) 返済が始まった立て替えは取り消せない
+        ok, msg = ws.cancel_goal("たろう", 1)
+        _check("scenario_cannot_cancel_started", ok is False, msg)
+
+        # 6) 完済（残り2,000円に3,000円を渡すと丸められる）
+        applied, _bal, goal, closed = ws.contribute_to_goal(
+            conf, {}, 1, 3000, "s3", aux_dedup_window_sec=120)
+        _check("scenario_overpay_rounded", applied == 2000, applied)
+        _check("scenario_closed", closed is True and goal["status"] == "done", goal)
+
+        # 7) 画面表示（done は残る）
+        shown = cv.build_goals(ws.get_savings_goals("たろう"))
+        by_title = {g["title"]: g for g in shown}
+        _check("scenario_done_is_shown",
+               by_title.get("パソコン代", {}).get("status") == "done", shown)
+        _check("scenario_active_is_shown",
+               by_title.get("自転車", {}).get("status") == "active", shown)
+
+        # 8) 過去との比較（積立・返済の合計 = 1000 + 2000 + 2000）
+        history = cv.monthly_saved_history(tmp / "logs", "たろう")
+        _check("scenario_history_total",
+               history and history[-1]["amount"] == 5000, history)
+
+        # 残高の最終確認（10000 - 1000 - 2000 - 2000）
+        _check("scenario_final_balance", ws.get_balance("たろう") == 5000,
+               ws.get_balance("たろう"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     _test_normal_contribution()
     _test_idempotent_resend()
@@ -446,6 +506,7 @@ def main():
     _test_advance_registration_and_cancel()
     _test_cancel_then_recreate()
     _test_limit_counts_only_active()
+    _test_full_scenario()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
