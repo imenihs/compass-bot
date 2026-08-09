@@ -1,0 +1,254 @@
+{# 子ども向けダッシュボード（docs/設計_子ダッシュボードと立て替え返済.md 2節）
+
+   レイアウトは社長提示のとおり:
+     左にカレンダー（日ごとの入出金） / 右に貯蓄・返済グラフ
+     ラインで区切って、その下にシミュレータ
+
+   守ること:
+     ・**他の子の情報は一切出さない**（兄弟比較を持ち込まない）
+     ・**操作系は置かない**（閲覧専用。子が残高をいじれない）
+     ・比較するのは「過去の自分」だけ
+#}
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {# UUID が Referer で外へ出ないようにする。Cookie 方式と合わせて漏洩経路を塞ぐ #}
+  <meta name="referrer" content="no-referrer">
+  <title>{{ child_name }}のおこづかい</title>
+  <style>
+    :root {
+      --bg: #12141c; --card: #1b1e29; --line: #2a2e3d;
+      --text: #e8eaf2; --muted: #8b90a5;
+      --in: #7bc86c; --out: #e88b8b; --save: #6ea8fe; --advance: #f0b357;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+      font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    }
+    h1 { font-size: 1.3rem; margin: 0 0 4px; }
+    .balance { font-size: 2rem; font-weight: 700; margin: 0 0 16px; }
+    .balance small { font-size: .9rem; color: var(--muted); font-weight: 400; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card); border: 1px solid var(--line);
+      border-radius: 12px; padding: 14px;
+    }
+    .card h2 { font-size: 1rem; margin: 0 0 12px; color: var(--muted); font-weight: 600; }
+
+    /* カレンダー */
+    .cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .cal-head a {
+      color: var(--text); text-decoration: none; background: #262a38;
+      border-radius: 8px; padding: 4px 10px; font-size: .85rem;
+    }
+    table.cal { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    table.cal th {
+      font-size: .75rem; color: var(--muted); font-weight: 500; padding: 4px 0;
+    }
+    table.cal td {
+      height: 62px; vertical-align: top; border: 1px solid var(--line);
+      border-radius: 6px; padding: 3px 4px; font-size: .72rem;
+    }
+    td.empty { border-color: transparent; }
+    .day-num { color: var(--muted); font-size: .75rem; }
+    .amt-in { color: var(--in); display: block; }
+    .amt-out { color: var(--out); display: block; }
+
+    /* 目標バー */
+    .goal { margin-bottom: 14px; }
+    .goal-top { display: flex; justify-content: space-between; font-size: .85rem; margin-bottom: 5px; }
+    .bar { height: 10px; background: #262a38; border-radius: 999px; overflow: hidden; }
+    .bar > i { display: block; height: 100%; border-radius: 999px; }
+    .bar.saving > i { background: var(--save); }
+    .bar.advance > i { background: var(--advance); }
+    .goal-sub { font-size: .75rem; color: var(--muted); margin-top: 4px; }
+
+    /* 過去の自分との比較 */
+    .history { display: flex; align-items: flex-end; gap: 6px; height: 70px; margin-top: 6px; }
+    .history div { flex: 1; background: var(--save); border-radius: 4px 4px 0 0; min-height: 2px; }
+    .history-labels { display: flex; gap: 6px; font-size: .65rem; color: var(--muted); margin-top: 4px; }
+    .history-labels span { flex: 1; text-align: center; }
+
+    hr.sep { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
+
+    /* シミュレータ */
+    .sim label { display: block; font-size: .8rem; color: var(--muted); margin: 8px 0 3px; }
+    .sim input, .sim select {
+      width: 100%; padding: 8px; border-radius: 8px; border: 1px solid var(--line);
+      background: #12141c; color: var(--text); font-size: 1rem;
+    }
+    .sim-result {
+      margin-top: 12px; padding: 12px; background: #12141c;
+      border: 1px solid var(--line); border-radius: 8px; font-size: .9rem;
+    }
+    .sim-copy {
+      margin-top: 8px; width: 100%; padding: 10px; border-radius: 8px;
+      border: 0; background: var(--save); color: #0b1020; font-weight: 700; font-size: .9rem;
+    }
+    .note { color: var(--muted); font-size: .75rem; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>{{ child_name }}のおこづかい</h1>
+  <p class="balance">{{ "{:,}".format(balance) }}<small> 円</small></p>
+
+  <div class="grid">
+    {# ── 左: カレンダー ───────────────────────── #}
+    <section class="card">
+      <div class="cal-head">
+        <a href="?y={{ prev_year }}&m={{ prev_month }}">◀ 前月</a>
+        <strong>{{ calendar.year }}年{{ calendar.month }}月</strong>
+        <a href="?y={{ next_year }}&m={{ next_month }}">翌月 ▶</a>
+      </div>
+      <table class="cal">
+        <tr>
+          {% for w in ["日","月","火","水","木","金","土"] %}<th>{{ w }}</th>{% endfor %}
+        </tr>
+        {% for week in weeks %}
+        <tr>
+          {% for day in week %}
+            {% if day == 0 %}
+              <td class="empty"></td>
+            {% else %}
+              {% set cell = calendar.days.get(day) %}
+              <td>
+                <span class="day-num">{{ day }}</span>
+                {% if cell %}
+                  {% if cell["in"] %}<span class="amt-in">+{{ "{:,}".format(cell["in"]) }}</span>{% endif %}
+                  {% if cell["out"] %}<span class="amt-out">-{{ "{:,}".format(cell["out"]) }}</span>{% endif %}
+                {% endif %}
+              </td>
+            {% endif %}
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </table>
+      <p class="note">お金がうごいた日に、はいった額とつかった額が出るよ。</p>
+    </section>
+
+    {# ── 右: 貯蓄・返済グラフ ─────────────────── #}
+    <section class="card">
+      <h2>もくひょう</h2>
+      {% if goals %}
+        {% for g in goals %}
+        <div class="goal">
+          <div class="goal-top">
+            <span>{{ g.title }}{% if g.kind == "advance" %}（かえす分）{% endif %}</span>
+            <span>{{ g.pct }}%</span>
+          </div>
+          <div class="bar {{ g.kind }}"><i style="width: {{ g.pct }}%"></i></div>
+          <div class="goal-sub">
+            {% if g.status == "done" %}
+              ぜんぶ{{ g.verb }}よ！
+            {% else %}
+              {{ "{:,}".format(g.accumulated) }} / {{ "{:,}".format(g.target) }}円
+              （あと {{ "{:,}".format(g.remaining) }}円）
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      {% else %}
+        <p class="note">まだもくひょうがないよ。チャットで「〇〇をかいたい」と話してみてね。</p>
+      {% endif %}
+
+      {% if history %}
+      <h2 style="margin-top:18px">つづけてる？</h2>
+      <div class="history">
+        {% for h in history %}
+          <div style="height: {{ h.pct }}%" title="{{ h.ym }}: {{ h.amount }}円"></div>
+        {% endfor %}
+      </div>
+      <div class="history-labels">
+        {% for h in history %}<span>{{ h.ym[5:] }}月</span>{% endfor %}
+      </div>
+      <p class="note">
+        {# 比べるのは「過去の自分」だけ。ほかの子の金額は出さない #}
+        じぶんの先月とくらべてみよう。{{ history_comment }}
+      </p>
+      {% endif %}
+    </section>
+  </div>
+
+  <hr class="sep">
+
+  {# ── 下: シミュレータ ─────────────────────── #}
+  <section class="card sim">
+    <h2>どれくらいでとどく？</h2>
+    <label>もくひょうの金額（円）</label>
+    <input type="number" id="target" value="{{ goals[0].remaining if goals else 10000 }}" min="1">
+
+    <label>けいさんのしかた</label>
+    <select id="mode">
+      <option value="per">1回にためる金額から、なん回かかるか</option>
+      <option value="months">なか月でためるか から、1回いくらか</option>
+    </select>
+
+    <label id="lbl">1回にためる金額（円）</label>
+    <input type="number" id="value" value="500" min="1">
+
+    <div class="sim-result" id="result">—</div>
+    <button class="sim-copy" id="copy">この内よう をコピーする</button>
+    <p class="note">
+      コピーしてチャットにはると、目ひょうとして話せるよ。だいたいの目やすだからね。
+    </p>
+  </section>
+
+  <script>
+    // シミュレータは計算だけ。**残高には一切さわらない**（子の画面は閲覧専用）
+    const target = document.getElementById("target");
+    const mode = document.getElementById("mode");
+    const value = document.getElementById("value");
+    const lbl = document.getElementById("lbl");
+    const result = document.getElementById("result");
+    const copyBtn = document.getElementById("copy");
+    const payday = {{ payday_day }};
+
+    function calc() {
+      const t = Math.max(parseInt(target.value || "0", 10), 0);
+      const v = Math.max(parseInt(value.value || "0", 10), 0);
+      if (!t || !v) { result.textContent = "—"; return ""; }
+
+      if (mode.value === "per") {
+        lbl.textContent = "1回にためる金額（円）";
+        const times = Math.ceil(t / v);
+        const when = addMonths(times);
+        result.textContent =
+          `${v.toLocaleString()}円ずつなら ${times}回。だいたい ${when} ごろ。`;
+        return `毎月${v}円ずつ、${times}回で ${t}円ためる`;
+      }
+      lbl.textContent = "なん月でためる？（か月）";
+      const per = Math.ceil(t / v);
+      const when = addMonths(v);
+      result.textContent =
+        `${v}か月なら 1回 ${per.toLocaleString()}円。だいたい ${when} ごろ。`;
+      return `毎月${per}円ずつ、${v}回で ${t}円ためる`;
+    }
+
+    // 支給日(payday_day)を基準に、n回ぶん先の年月を出す。
+    // 月末(29〜31日)はその月の最終日へ丸める
+    function addMonths(n) {
+      const now = new Date();
+      const d = new Date(now.getFullYear(), now.getMonth() + n, 1);
+      const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+      const day = Math.min(payday, last);
+      return `${d.getFullYear()}年${d.getMonth() + 1}月${day}日`;
+    }
+
+    [target, value, mode].forEach(el => el.addEventListener("input", calc));
+    mode.addEventListener("change", calc);
+    copyBtn.addEventListener("click", () => {
+      const text = calc();
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => {
+        copyBtn.textContent = "コピーしたよ！チャットにはってね";
+        setTimeout(() => { copyBtn.textContent = "この内よう をコピーする"; }, 2500);
+      });
+    });
+    calc();
+  </script>
+</body>
+</html>

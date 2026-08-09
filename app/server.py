@@ -1755,6 +1755,94 @@ async def enter_by_token(token: str):
     return response
 
 
+@app.get("/compass-bot/child", response_class=HTMLResponse)
+async def get_child_dashboard(
+    request: Request,
+    dash_token: Optional[str] = Cookie(default=None),
+    y: int = 0,
+    m: int = 0,
+):
+    """子ども向けダッシュボード。**閲覧専用**。
+
+    守ること（docs/設計_子ダッシュボードと立て替え返済.md 3節）:
+      ・**セッションの名前で固定引きする**。`?name=` のようなクエリを受け付けない。
+        ここを開けた瞬間に「他の子を見られない」保証が壊れる
+      ・**他の子の情報を出さない**。`load_all_users()` を呼ばない
+      ・**操作系を置かない**。金額を動かす導線は無い
+
+    Args:
+        request: リクエスト。
+        dash_token: UUID の Cookie。
+        y: 表示する年（省略時は今月）。
+        m: 表示する月。
+
+    Returns:
+        HTMLResponse: 子の画面。トークンが無効なら 403。
+    """
+    resolved = dashboard_token.resolve(dash_token) if dash_token else None
+    if not resolved or resolved.get("role") != dashboard_token.ROLE_CHILD:
+        return HTMLResponse(
+            "<h1>このページは見られません</h1>"
+            "<p>おうちの人に新しいURLをもらってね。</p>", status_code=403)
+
+    # 名前は**トークンから引く**。クエリからは受け取らない
+    child_name = _user_name_from_key(resolved.get("user_key", ""))
+    if not child_name:
+        return HTMLResponse("<h1>登録が見つかりません</h1>", status_code=403)
+
+    from datetime import datetime
+
+    from app import child_view
+    from app.storage import JST
+
+    now = datetime.now(JST)
+    year = int(y) if y else now.year
+    month = int(m) if m else now.month
+    # 範囲外の月を渡されても落とさない（URL を手で書き換えられても安全側へ）
+    if not (1 <= month <= 12):
+        year, month = now.year, now.month
+
+    system_conf = load_system()
+    log_dir = get_log_dir(system_conf)
+    calendar_data = child_view.build_calendar(log_dir, child_name, year, month)
+
+    balance = _wallet_service.get_balance(child_name) if _wallet_service else 0
+    goals = child_view.build_goals(
+        _wallet_service.get_savings_goals(child_name) if _wallet_service else [])
+
+    # 過去の自分との比較（社長承認済みの制約4）。他の子の金額は一切扱わない
+    raw_history = child_view.monthly_saved_history(log_dir, child_name, months=6)
+    peak = max([h["amount"] for h in raw_history], default=0)
+    history = [{**h, "pct": int(h["amount"] / peak * 100) if peak else 0}
+               for h in raw_history]
+    history_comment = ""
+    if len(history) >= 2:
+        # 急かさない言い方にする（docs/コーチング.md の「観察が先」）
+        history_comment = ("先月よりふえてるね。" if history[-1]["amount"] > history[-2]["amount"]
+                           else "ゆっくりでも、つづけるのがだいじだよ。")
+
+    # カレンダーの週配列（日曜始まり）
+    import calendar as _cal
+    weeks = _cal.Calendar(firstweekday=6).monthdayscalendar(year, month)
+
+    prev_year, prev_month = (year, month - 1) if month > 1 else (year - 1, 12)
+    next_year, next_month = (year, month + 1) if month < 12 else (year + 1, 1)
+
+    return templates.TemplateResponse("child.html", {
+        "request": request,
+        "child_name": child_name,
+        "balance": balance,
+        "calendar": calendar_data,
+        "weeks": weeks,
+        "goals": goals,
+        "history": history,
+        "history_comment": history_comment,
+        "prev_year": prev_year, "prev_month": prev_month,
+        "next_year": next_year, "next_month": next_month,
+        "payday_day": int(get_allowance_reminder_setting().get("payday_day", 1)),
+    })
+
+
 @app.get("/compass-bot/dashboard", response_class=HTMLResponse)
 async def get_dashboard(
     request: Request,
