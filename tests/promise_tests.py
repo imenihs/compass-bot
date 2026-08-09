@@ -218,12 +218,96 @@ def _test_tool_layer_permissions():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_reminder_interval_and_safety():
+    """リマインドが別枠の間隔制御で動き、危険信号のある子には送らないこと。
+
+    既存の proactive nudge に相乗りすると、単一 nudge の early-return チェーンと
+    子ども単位の間隔制御を奪い合い「10ヶ月ほかの伴走が沈黙する」か
+    「督促が一度も届かない」のどちらかになる。別枠であることを固定する。
+    """
+    import asyncio as _asyncio
+    from datetime import datetime as _dt, timedelta as _td
+
+    from app.storage import JST as _JST
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        from app import promise_service as psvc
+        orig_cls = psvc.PromiseService
+
+        class _Scoped(orig_cls):
+            def __init__(self, data_dir=None):
+                super().__init__(data_dir=tmp)
+
+        psvc.PromiseService = _Scoped
+
+        class _Ch:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, m, **k):
+                self.sent.append(m)
+                return type("M", (), {"id": 1})()
+
+        async def _run():
+            from app.reminder_service import ReminderService
+            parent, child = _Ch(), _Ch()
+            rs = ReminderService(
+                client=type("C", (), {"get_channel": staticmethod(lambda c: parent)})(),
+                allowance_reminder_conf={"channel_id": 999}, wallet_audit_conf={},
+                load_all_users_fn=lambda: [{"name": "たろう"}],
+                wallet_service=None, allow_channel_ids={1},
+            )
+            rs._child_channels = lambda: _asyncio.sleep(0, result={"たろう": child})
+            _ok, pid, _ = _Scoped().create_draft("たろう", "返済", "毎月500円", 10)
+            _Scoped().approve(pid)
+            now = _dt.now(_JST)
+
+            # 危険信号がある子へは送らない（安全がナッジより上位）
+            rs._has_recent_safety_signal = lambda *a, **k: True
+            await rs.maybe_send_promise_reminders(now)
+            _check("reminder_skips_child_with_safety_signal", len(child.sent) == 0,
+                   f"child={len(child.sent)}")
+
+            # 通常時は親子どちらへも届く
+            parent.sent.clear(); child.sent.clear()
+            _Scoped().mark_reminded(pid, now - _td(days=30))  # 間隔をリセット
+            rs._has_recent_safety_signal = lambda *a, **k: False
+            await rs.maybe_send_promise_reminders(now)
+            _check("reminder_sends_to_parent_and_child",
+                   len(parent.sent) == 1 and len(child.sent) == 1,
+                   f"parent={len(parent.sent)} child={len(child.sent)}")
+            # 積み上がり表示であること（減点表示にしない）
+            _check("reminder_child_message_is_additive",
+                   "0/10" in child.sent[0] and "あと" not in child.sent[0], child.sent[0])
+
+            # 間隔内は再送しない（催促のしつこさを抑える）
+            await rs.maybe_send_promise_reminders(now + _td(hours=1))
+            _check("reminder_suppressed_within_interval",
+                   len(parent.sent) == 1 and len(child.sent) == 1,
+                   f"parent={len(parent.sent)} child={len(child.sent)}")
+
+            # 間隔を過ぎたら再送する
+            await rs.maybe_send_promise_reminders(now + _td(days=8))
+            _check("reminder_resumes_after_interval",
+                   len(parent.sent) == 2 and len(child.sent) == 2,
+                   f"parent={len(parent.sent)} child={len(child.sent)}")
+
+        try:
+            _asyncio.run(_run())
+        finally:
+            psvc.PromiseService = orig_cls
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     _test_approval_gates_tracking()
     _test_progress_and_completion()
     _test_limits_and_validation()
     _test_concurrent_progress_no_lost_update()
     _test_tool_layer_permissions()
+    _test_reminder_interval_and_safety()
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))

@@ -107,6 +107,10 @@ def _age_int(raw_age) -> int | None:
     return None
 
 
+# 約束のリマインド間隔（日）。既存ナッジとは別枠で独自に制御する
+PROMISE_REMIND_INTERVAL_DAYS = 7
+
+
 class ReminderService:
     def __init__(
         self,
@@ -920,6 +924,94 @@ class ReminderService:
         self._mark_schedule_run(state, run_state_key, now_dt)
         self._save_reminder_state(state)
 
+    async def maybe_send_promise_reminders(self, now: datetime | None = None) -> None:
+        """約束の進み具合を親チャンネルへ、続きの声かけを子へ送る（N-11.18）。
+
+        既存の proactive nudge とは**別枠**にする。あちらは単一の nudge を返す
+        early-return チェーンで、min_days_between_nudges が子ども単位で効くため、
+        相乗りすると「10ヶ月間ほかの伴走が沈黙する」か「督促が一度も届かない」の
+        どちらかになる。枠を奪い合わないよう独自の間隔制御を持つ。
+
+        親には進捗を渡し、子には短く声をかける。子への声かけは
+        「責める」のでなく「思い出す・続けられるように支える」姿勢で行う。
+        直近に危険信号を出した子へは送らない（安全がナッジより上位）。
+        """
+        from app.config import get_log_dir, load_system
+        from app.promise_service import STATUS_ACTIVE, PromiseService
+
+        now_dt = now or datetime.now(JST)
+        log_dir = get_log_dir(load_system())
+        ps = PromiseService()
+        actives = [p for p in ps.list_promises(status=STATUS_ACTIVE)]
+        if not actives:
+            return
+
+        # --- 親チャンネルへ進捗をまとめて送る ---
+        parent_channel_id = (self.allowance_reminder_conf or {}).get("channel_id")
+        due = [p for p in actives
+               if self._promise_reminder_due(p, now_dt, PROMISE_REMIND_INTERVAL_DAYS)]
+        if due and parent_channel_id:
+            lines = ["**お子さんとの約束の進み具合です。**", ""]
+            for p in due:
+                done, total = int(p.get("done_times", 0)), int(p.get("total_times", 0))
+                lines.append(
+                    f"・{p.get('child_name')}「{p.get('title')}」{done}/{total} 回\n"
+                    f"　　{p.get('detail')}"
+                )
+            lines.append("")
+            lines.append("進んだぶんがあれば教えてください。こちらで記録します。")
+            try:
+                channel = self.client.get_channel(int(parent_channel_id))
+                if channel is None:
+                    channel = await self.client.fetch_channel(int(parent_channel_id))
+                await channel.send("\n".join(lines))
+                for p in due:
+                    ps.mark_reminded(str(p.get("id", "")), now_dt)
+            except Exception as e:
+                self._log_reminder_delivery_error(
+                    "promise_parent_reminder", e, {"count": len(due)},
+                )
+
+        # --- 子へ短く声をかける（別枠・安全が上位） ---
+        channels_by_name = await self._child_channels()
+        for p in due:
+            child_name = str(p.get("child_name", ""))
+            channel = channels_by_name.get(child_name)
+            if channel is None:
+                continue
+            # つらさを訴えた子へ催促しない
+            if self._has_recent_safety_signal(log_dir, child_name, now_dt):
+                self._log_reminder_delivery_error(
+                    "promise_child_nudge_skipped_for_safety",
+                    RuntimeError("recent safety signal"), {"user_name": child_name},
+                )
+                continue
+            done, total = int(p.get("done_times", 0)), int(p.get("total_times", 0))
+            # 減点（あと何回）でなく積み上がり（何回できた）を前面に出す
+            msg = (
+                f"「{p.get('title')}」のこと、おぼえてるよ。いま {done}/{total} 回まで来たね。\n"
+                "どんな調子か、よかったら教えてね。むずかしいところがあったら、一緒に考えよう。"
+            )
+            try:
+                await channel.send(msg)
+            except Exception as e:
+                self._log_reminder_delivery_error(
+                    "promise_child_nudge", e, {"user_name": child_name},
+                )
+
+    def _promise_reminder_due(self, promise: dict, now: datetime, interval_days: int) -> bool:
+        """この約束にリマインドしてよい時期か（催促のしつこさを抑える）。"""
+        last = str(promise.get("last_reminded_at") or "")
+        if not last:
+            return True
+        try:
+            prev = datetime.fromisoformat(last)
+        except ValueError:
+            return True
+        if prev.tzinfo is None:
+            prev = prev.replace(tzinfo=now.tzinfo)
+        return (now - prev).total_seconds() >= interval_days * 86400
+
     async def maybe_send_pocket_journal_reminder(self) -> None:
         """週次支出記録リマインドを送信する。
         設定された曜日・時刻に、過去7日間の記録がないユーザーにのみ送信する。"""
@@ -1058,6 +1150,8 @@ class ReminderService:
                 ("pocket_journal_reminder", self.maybe_send_pocket_journal_reminder),
                 ("proactive_child_nudge", self.maybe_send_proactive_child_nudges),
                 ("assessment_pending_reminder", self.maybe_remind_pending_proposals),
+                # 約束のリマインド。既存ナッジとは別枠で独自の間隔制御を持つ（N-11.18）
+                ("promise_reminder", self.maybe_send_promise_reminders),
             ]
             for step_name, handler in steps:
                 await self._run_notification_step(step_name, handler)
