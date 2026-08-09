@@ -791,6 +791,55 @@ class ReminderService:
                     channels_by_name[name] = channel
         return channels_by_name
 
+    def _has_recent_safety_signal(self, log_dir: Path, user_name: str,
+                                  now: datetime, days: int = 3) -> bool:
+        """直近に危険信号（つらさ・いじめ・虐待の訴え等）が検知された子かを見る（N-11.16 連携）。
+
+        安全は【処理の優先順位】1) に属し、伴走ナッジより上位である。
+        つらさを訴えた子へ、翌朝スケジューラが一方的に「チャレンジどう？」「記録してね」と
+        送るのは害になる。ナッジ経路には安全判定が繋がっていなかったため、ここで結線する。
+
+        判定材料は既に runtime_diagnostics.jsonl へ出ている検知記録を再利用し、
+        新たな蓄積先を作らない。読み取りに失敗したときは「送らない」側へ倒す
+        （材料が読めないまま催促するより、送らないほうが害が小さい）。
+
+        Args:
+            log_dir: ログディレクトリ。
+            user_name: 対象児の名前。
+            now: 現在時刻。
+            days: さかのぼる日数。
+
+        Returns:
+            bool: 直近に危険信号があれば True（ナッジを送らない）。
+        """
+        path = log_dir / "runtime_diagnostics.jsonl"
+        try:
+            if not path.exists():
+                return False
+            cutoff = now.timestamp() - days * 86400
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "safety_signal_detected" not in line and "safety_alert_sent" not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if str(d.get("selected_user") or "") != user_name:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(str(d.get("ts") or "")).timestamp()
+                except Exception:
+                    continue
+                if ts >= cutoff:
+                    return True
+        except Exception as e:
+            # 材料が読めないときは安全側（送らない）へ倒す
+            self._log_reminder_delivery_error(
+                "safety_history_read_error", e, {"user_name": user_name},
+            )
+            return True
+        return False
+
     async def send_proactive_child_nudges(self, log_dir: Path, now: datetime | None = None) -> int:
         """対象の子どもへ能動的な伴走メッセージを送る。テストからも直接呼ぶ。"""
         now_dt = now or datetime.now(JST)
@@ -807,6 +856,15 @@ class ReminderService:
             if not user_name or channel is None:
                 continue
             if self._is_recent_proactive_sent(state, user_name, now_dt):
+                continue
+            # 直近に危険信号を出した子へは、こちらから催促しない（安全がナッジより上位）。
+            # つらさを訴えた翌朝に「チャレンジどう？」と送るのは害になる。
+            if self._has_recent_safety_signal(log_dir, user_name, now_dt):
+                self._log_reminder_delivery_error(
+                    "proactive_nudge_skipped_for_safety",
+                    RuntimeError("recent safety signal"),
+                    {"user_name": user_name},
+                )
                 continue
             nudge = self._select_proactive_nudge(user_conf, log_dir, now_dt)
             if not nudge:

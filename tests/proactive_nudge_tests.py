@@ -608,6 +608,49 @@ async def test_wallet_audit_uses_channel_name_when_member_cache_empty() -> None:
         assert "初期設定" not in channel.outputs[0]
 
 
+
+async def test_safety_signal_blocks_proactive_nudge() -> None:
+    """直近に危険信号を出した子へは、こちらから催促しないこと（N-11.16 連携）。
+
+    安全は【処理の優先順位】1) に属しナッジより上位である。
+    つらさを訴えた子へ翌朝スケジューラが「チャレンジどう？」と送るのは害になる。
+    ナッジ経路には安全判定が繋がっていなかったため結線した。
+    """
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from datetime import timedelta as _td
+
+    from app.reminder_service import ReminderService
+
+    tmp = Path(_tempfile.mkdtemp())
+    now = datetime.now(JST)
+    recs = [
+        # 2日前に危険信号（猶予3日以内 → 送らない）
+        {"ts": (now - _td(days=2)).isoformat(), "event": "safety_signal_detected",
+         "selected_user": "たろう", "details": {"category": "self_harm"}},
+        # 10日前（猶予外 → 通常どおり送る）
+        {"ts": (now - _td(days=10)).isoformat(), "event": "safety_signal_detected",
+         "selected_user": "はな", "details": {"category": "bullying"}},
+    ]
+    with open(tmp / "runtime_diagnostics.jsonl", "w", encoding="utf-8") as f:
+        for r in recs:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    service = ReminderService(
+        client=None, allowance_reminder_conf={}, wallet_audit_conf={},
+        load_all_users_fn=lambda: [], wallet_service=None, allow_channel_ids=set(),
+    )
+    assert service._has_recent_safety_signal(tmp, "たろう", now) is True, "直近の危険信号がある子には送らない"
+    assert service._has_recent_safety_signal(tmp, "はな", now) is False, "猶予を過ぎたら通常どおり送る"
+    assert service._has_recent_safety_signal(tmp, "ゆい", now) is False, "検知の無い子は通常どおり送る"
+
+    empty = Path(_tempfile.mkdtemp())
+    assert service._has_recent_safety_signal(empty, "たろう", now) is False, "ログが無ければ通常どおり送る"
+
+    _shutil.rmtree(tmp, ignore_errors=True)
+    _shutil.rmtree(empty, ignore_errors=True)
+
+
 async def _run_all() -> int:
     tests = [
         test_no_recent_record_sends_gentle_nudge,
@@ -626,6 +669,7 @@ async def _run_all() -> int:
         test_auto_grant_operation_key_prevents_duplicate,
         test_proactive_send_failure_continues_to_next_user,
         test_wallet_audit_uses_channel_name_when_member_cache_empty,
+        test_safety_signal_blocks_proactive_nudge,
     ]
     failures = []
     for test in tests:
