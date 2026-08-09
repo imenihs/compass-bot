@@ -16,6 +16,7 @@ from app.bot_utils import (
     _spending_analysis_for_user,
     _usage_guide_text,
 )
+from app import config
 from app.config import (
     find_user_by_name,
     find_child_user_by_name,
@@ -25,6 +26,7 @@ from app.config import (
     load_system,
     get_log_dir,
     update_user_field,
+    get_web_base_url,
 )
 from app.error_messages import operation_failure_message
 from app.message_parser import extract_input_from_mention
@@ -248,10 +250,26 @@ def _parse_follow_policy_updates(text: str) -> tuple[dict, str]:
             updates["frequency"] = value
             break
 
+    # 申し送り（parent_note）は、設定語を取り除いた**残りの文**とする。
+    # 取り除かないと「軽め」だけ送ったときに parent_note が文字列 "軽め" で
+    # 上書きされ、それまでの申し送りが壊れる（有識者反証で判明）。
+    # 残りが空なら「申し送りの指定なし」として空文字を返し、
+    # 呼び出し側が現在の申し送りを保つ。
     note = body
     note = re.sub(r"\b(enabled|focus|strength|frequency)\s*=\s*\S+", "", note, flags=re.IGNORECASE)
-    note = note.replace("有効", "").replace("無効", "").replace("オン", "").replace("オフ", "").strip()
-    return updates, note
+    for word in ("有効", "無効", "オン", "オフ"):
+        note = note.replace(word, "")
+    # 実際に採用した設定語だけを消す（別の意味で使われた語まで消さない）
+    for alias_map, key in ((_FOLLOW_POLICY_STRENGTH_ALIASES, "nudge_strength"),
+                           (_FOLLOW_POLICY_FREQUENCY_ALIASES, "frequency"),
+                           (_FOLLOW_POLICY_FOCUS_ALIASES, "focus_area")):
+        if key not in updates:
+            continue
+        for needle, value in alias_map.items():
+            if value == updates[key] and needle in note:
+                note = note.replace(needle, "", 1)
+                break
+    return updates, note.strip()
 
 
 def _follow_policy_summary(name: str, policy: dict) -> str:
@@ -587,6 +605,45 @@ async def maybe_handle_reminder_test(message: discord.Message, content: str) -> 
     return True
 
 
+async def _apply_parent_grant(message, target_conf: dict, target_name: str,
+                              amount: int) -> bool:
+    """少額の支給をその場で実行する（確認を挟まない経路）。
+
+    お小遣い管理なので、少額まで毎回「はい/いいえ」を挟むと操作が煩わしくなる。
+    取り違えても台帳（*_wallet_ledger.jsonl）に日時・増減・理由が残るため、
+    後から追えて戻せる。確認は高額のときだけに絞る。
+
+    Args:
+        message: 親のメッセージ。
+        target_conf: 対象児の設定。
+        target_name: 対象児の名前。
+        amount: 支給額（円）。
+
+    Returns:
+        bool: 常に True（このハンドラで処理を完了したという意味）。
+    """
+    system_conf = load_system()
+    before = _wallet_service.get_balance(target_name)
+    new_balance, achieved_goals = _wallet_service.update_balance(
+        user_conf=target_conf,
+        system_conf=system_conf,
+        delta=amount,
+        action="allowance_manual_grant",
+        note="manual_grant_by_parent",
+        extra={"granted_by": str(message.author.id)},
+        operation_key=_parent_op_key(message, "allowance_manual_grant", target_name),
+    )
+    await message.channel.send(
+        f"{target_name}に{amount}円支給したよ。残高: {before}円 → {new_balance}円"
+    )
+    # 支給により目標が達成された場合は祝福メッセージを送る
+    for achieved_goal in achieved_goals:
+        await message.channel.send(
+            _build_goal_achieved_message(user_conf=target_conf, goal=achieved_goal)
+        )
+    return True
+
+
 async def maybe_handle_manual_grant(message: discord.Message, content: str) -> bool:
     """親が手動でお小遣いを支給するコマンドを処理する（親のみ）。
     「支給 たろう 700円」の形式にマッチする。"""
@@ -610,10 +667,14 @@ async def maybe_handle_manual_grant(message: discord.Message, content: str) -> b
         return True
 
     # 明示コマンドも **AI 経路と同じ確認ステップを通す**（N-11.17）。
-    # 経路によって安全性が食い違わないようにするため。ここで直接 update_balance を呼ぶと
-    # 「AI 経由なら確認あり・コマンドなら即実行」という非対称が生まれ、
-    # 桁の打ち間違いをコマンド側だけ捕まえられない。
+    # 経路によって安全性が食い違わないようにするため。
+    # ただし確認は高額のときだけ。少額まで毎回2ターンにすると煩わしく、
+    # 取り違えても台帳に残って後から追えるため、割に合わない。
     from app import parent_confirm as pc
+    confirm_over = int(config.get_parent_operation_setting()["confirm_over"])
+    if amount < confirm_over:
+        return await _apply_parent_grant(message, target_conf, target_name, amount)
+
     _token, superseded = pc.put_pending(int(message.author.id), "parent_grant",
                                         {"name": target_name, "amount": amount})
     await message.channel.send(
@@ -645,8 +706,31 @@ async def maybe_handle_balance_adjustment(message: discord.Message, content: str
         await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
         return True
 
-    # 支給と同じく確認ステップを通す（N-11.17）。経路によって安全性を食い違わせない
+    # 支給と同じく、確認は高額のときだけ挟む（経路によって基準を変えない）
     from app import parent_confirm as pc
+    confirm_over = int(config.get_parent_operation_setting()["confirm_over"])
+    if abs(delta) < confirm_over:
+        system_conf = load_system()
+        before = _wallet_service.get_balance(target_name)
+        new_balance, achieved_goals = _wallet_service.update_balance(
+            user_conf=target_conf,
+            system_conf=system_conf,
+            delta=delta,
+            action="balance_adjustment",
+            note="manual_adjustment_by_parent",
+            extra={"adjusted_by": str(message.author.id)},
+            operation_key=_parent_op_key(message, "balance_adjustment", target_name),
+        )
+        await message.channel.send(
+            f"{target_name}の残高を{delta:+d}円調整したよ。残高: {before}円 → {new_balance}円"
+        )
+        # 加算調整で目標が達成された場合は祝福メッセージを送る
+        for achieved_goal in achieved_goals:
+            await message.channel.send(
+                _build_goal_achieved_message(user_conf=target_conf, goal=achieved_goal)
+            )
+        return True
+
     _token, superseded = pc.put_pending(int(message.author.id), "parent_adjust_balance",
                                         {"name": target_name, "delta": delta})
     await message.channel.send(
@@ -700,172 +784,94 @@ async def maybe_handle_user_setting_change(message: discord.Message, content: st
     return True
 
 
-# 疑問符はどこにあっても質問とみなす。
+# 疑問符はどこにあっても質問とみなす。これだけは言い回しに依存せず確実に効く。
 _QUESTION_CHARS = ("？", "?")
 
 # 疑問・確認の語尾。**文末にあるときだけ**質問とみなす。
-# 部分一致で見ると誤爆する。例えば「勉強のことはあまり言わないで」は
-# 「こ*とは*あまり」が「とは」に、「元気なので」が「なの」に当たってしまい、
-# 正当な parent_note（自由文）を設定できなくなる。語尾判定にすればこれを避けられる。
+# 部分一致で見ると「勉強のこ*とは*」「元気*なの*で」のような正当な指示文まで弾く。
+#
+# ここは意図的に**狭く**保つ。日本語の質問の言い回しは無限にあり、
+# 語彙を足すと今度は正当な指示文を巻き込む（実測で4周この往復をした）。
+# 網羅は最初から諦め、取りこぼしは下の「何も変わらないなら保存しない」で受け止める。
 _QUESTION_SUFFIXES = (
     "っけ", "かな", "かしら", "ですか", "ますか", "でしたか", "ましたか",
-    "だっけ", "なの", "ですよね", "だよね", "だね", "よね",
-    "って言った", "って設定", "ってした", "とは",
-    "どう", "どうなってる", "なってる", "なってた", "どんな感じ",
+    "だっけ", "なの", "ですよね", "だよね", "よね",
 )
 
-# 文末に付く終助詞。これを落としてから語尾を見る。
-# 「どうなってる」は捕まえるのに「どうなってるの」は捕まえられない、
-# という取りこぼしを防ぐ（有識者の再反証で判明）。
+# 文末に付く終助詞。これを落としてから語尾を見る
+# （「どうなってる」は捕まえるのに「どうなってるの」は捕まえられない、を防ぐ）。
 _TRAILING_PARTICLES = "のよねなさかぁあーっ〜 　"
-
-# 引用・伝聞・回想の形。過去の設定を話題にしているだけで、新しい指示ではない。
-# 「軽めにしてたと思うんだけど」のように、指示と同じ語を含みつつ
-# 実際は現状の確認をしている言い回しをここで捕まえる。
-_QUOTE_MARKERS = (
-    "って設定した", "って言った", "ってしたっけ", "と設定した",
-    "にしてた", "してたっけ", "だったっけ", "と思ってた", "と思うんだけど",
-    "って前に", "って言ってた", "じゃなかった", "ではなかった",
-    "って合ってる", "で合ってる", "って前の", "って昔",
-)
 
 
 def _looks_like_question(text: str) -> bool:
-    """値の部分が疑問文・引用に見えるかを判定する。
+    """値の部分が疑問文に見えるかを判定する。
 
-    コマンドの引数は本来「軽め」「普通」、あるいは親からの指示文（parent_note）である。
-    そこに疑問の語尾が付いている場合、親は設定を指示したのではなく
-    現状を尋ねている可能性が高いため、設定変更として扱わない。
-
-    語尾で判定するのは誤爆を避けるため。部分一致にすると
-    「勉強のことはあまり言わないで」のような正当な指示文まで弾いてしまう。
+    **これは補助的な歯止めである**。日本語の質問を言い回しで網羅することは
+    できないため、ここで漏れても実害が出ないよう、呼び出し側に
+    「何も変わらないなら保存しない」という構造側の歯止めを置いている。
+    そちらが本体で、こちらは分かりやすい質問を早めに弾くためのもの。
 
     Args:
         text: コマンドの値の部分。
 
     Returns:
-        bool: 疑問・引用に見えるなら True。
+        bool: 疑問に見えるなら True。
     """
     t = (text or "").strip()
     if not t:
         return False
-    # 疑問符は位置を問わず質問とみなす
     if any(c in t for c in _QUESTION_CHARS):
         return True
-    # 引用・伝聞は「過去の設定の話」であって指示ではない
-    if any(mark in t for mark in _QUOTE_MARKERS):
-        return True
-    # 終助詞を落としてから語尾を見る。
-    # 「方針どうなってるの」の「の」のような終助詞が付くだけで
-    # endswith が外れてしまうのを防ぐ。
     stripped = t.rstrip(_TRAILING_PARTICLES)
-    if t.endswith(_QUESTION_SUFFIXES) or stripped.endswith(_QUESTION_SUFFIXES):
-        return True
-    # 「今の方針は」「現在の設定は」のような助詞止めの問い合わせ。
-    # 申し送り（自由記述）は文として終わるので助詞では止まらない。
-    # 「食事のことだけは」を巻き込まないよう、**短く・問い合わせ語を含む**ものに限る。
-    inquiry_words = ("方針", "設定", "強さ", "頻度", "今", "いま", "現在")
-    if len(t) <= 10 and t.endswith(("は", "が", "って")):
-        return any(w in t for w in inquiry_words)
-    # 「いまの設定教えて」のような、現状の提示を求める言い方。
-    # 申し送りの「〜を教えてあげて」と混ざらないよう、
-    # **問い合わせ語を伴い、かつ短い**ものに限る
-    if len(t) <= 15 and t.endswith(("教えて", "おしえて", "見せて", "確認したい")):
-        return any(w in t for w in inquiry_words)
-    return False
+    return t.endswith(_QUESTION_SUFFIXES) or stripped.endswith(_QUESTION_SUFFIXES)
 
 
 async def maybe_handle_followup_policy(message: discord.Message, content: str) -> bool:
-    """親がDiscordから子ども別AIフォロー方針を確認・変更する"""
+    """親が AI フォロー方針に触れたとき、Web ダッシュボードへ案内する（親のみ）。
+
+    **チャットで細かい設定を受け付けるのをやめた**（N-11.17）。理由は3つ。
+
+    1. 言葉から「指示」と「質問」を見分けるのは実務上できない。
+       「軽めだっけ」で設定が変わる、逆に「とりあえず軽めで」が無視される、を
+       語彙の調整で4周往復して、どちらかに必ず倒れることが分かった。
+    2. 実ログでは親はこのコマンドをほぼ使わない（親の発話48件中0件）。
+       親は自然文で話すか、Web を使う。
+    3. Web ダッシュボードに同じ設定のフォームが既にある。
+       選択式なので値が曖昧にならず、パースも要らない。
+
+    設定の変更は確実な Web へ寄せ、チャットは案内に徹する。
+    現在値の確認だけはその場で答える（見るだけなら曖昧さが無いため）。
+    """
     body = _command_body(content)
-    m = re.match(r"^(?:AI)?フォロー(?:方針|設定)\s+(\S+)(?:\s+(.+))?$", body, re.IGNORECASE | re.DOTALL)
-    strength_m = re.match(r"^(?:AI)?フォロー強さ\s+(\S+)(?:\s+(.+))?$", body, re.IGNORECASE | re.DOTALL)
-    frequency_m = re.match(r"^(?:AI)?フォロー頻度\s+(\S+)(?:\s+(.+))?$", body, re.IGNORECASE | re.DOTALL)
-    command_match = m or strength_m or frequency_m
-    if not command_match:
+    m = re.match(r"^(?:AI)?フォロー(?:方針|設定|強さ|頻度)(?:\s+(\S+))?", body, re.IGNORECASE)
+    if not m:
         return False
 
+    # 親以外は無視する
     if not _is_parent(message.author.id):
         await message.channel.send("AIフォロー方針の変更は親のみできるよ。")
         return True
 
-    target_name = command_match.group(1).strip()
-    target_conf = find_user_by_name(target_name)
-    if target_conf is None:
-        await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
-        return True
+    target_name = (m.group(1) or "").strip()
+    base_url = get_web_base_url().rstrip("/")
 
-    current_policy = _normalize_follow_policy(target_conf.get("ai_follow_policy"))
-    rest = (command_match.group(2) or "").strip()
-    if not rest:
-        await message.channel.send(_follow_policy_summary(target_name, current_policy))
-        return True
-
-    # 疑問・引用の形は設定変更として扱わない（N-11.17）。
-    # 正規表現が DOTALL + (.+)$ で行末まで飲むため、
-    # 「フォロー方針 たろう 軽め って設定したっけ？」が値「軽め って設定したっけ？」として通り、
-    # 実設定が書き換わったうえ疑問文がそのまま parent_note（子のAIプロンプトに載る）へ入っていた。
-    # 該当する場合は False を返して会話層（AI 経路）へ流し、親には自然文で答える。
-    if _looks_like_question(rest):
-        # 質問には現状を答える。黙って False を返すと親は
-        # 「設定できた」と誤解したまま何も変わらない、という一番まずい形になる
+    # 対象が分かるなら現在値を見せる（確認だけなら曖昧さが無い）
+    if target_name:
+        target_conf = find_user_by_name(target_name)
+        if target_conf is None:
+            await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
+            return True
+        current_policy = _normalize_follow_policy(target_conf.get("ai_follow_policy"))
         await message.channel.send(
             _follow_policy_summary(target_name, current_policy)
-            + "\n\n（質問に見えたので設定は変えていないよ。変えるときは"
-            "「フォロー方針 " + target_name + " 軽め」のように送ってね）"
+            + f"\n\n変更は Web から → {base_url}"
         )
         return True
 
-    updates, note = _parse_follow_policy_updates(rest)
-    if strength_m:
-        if "nudge_strength" not in updates:
-            await message.channel.send("フォロー強さは `軽め` または `普通` で指定してね。")
-            return True
-        updates = {"nudge_strength": updates["nudge_strength"]}
-        note = current_policy["parent_note"]
-    if frequency_m:
-        if "frequency" not in updates:
-            await message.channel.send("フォロー頻度は `必要なときだけ` または `普通` で指定してね。")
-            return True
-        updates = {"frequency": updates["frequency"]}
-        note = current_policy["parent_note"]
-
-    # **何も変わらない保存はしない**（N-11.17・有識者反証）。
-    # 強さ・頻度の指定も無く、申し送り（parent_note）も今と同じなら、
-    # 親の発話は指示ではなく雑談・質問の可能性が高い。
-    # ここで保存すると「保存したよ」と出るのに中身は変わっておらず、
-    # しかも指示のつもりで書いた文が parent_note として子の AI プロンプトに載る。
-    # 言い回しの分類で質問と指示を分けるのは限界があるため、構造側で歯止めを置く。
-    #
-    # ただし **申し送りだけの更新は正当**（「最近ゲームばかりで心配」など）。
-    # note に 300 文字制限と安全語チェックがあることからも単独更新は想定されている。
-    # 「設定語が無い」ではなく「何も変わらない」を条件にすることで、両方を満たす。
-    note_changed = note.strip() != str(current_policy.get("parent_note", "")).strip()
-    if not updates and not note_changed:
-        await message.channel.send(
-            _follow_policy_summary(target_name, current_policy)
-            + "\n\n（変更する内容が読み取れなかったので、設定はそのままにしたよ。"
-            "強さを変えるなら「フォロー方針 " + target_name + " 軽め」、"
-            "申し送りを残すなら「フォロー方針 " + target_name + " 最近ゲームばかりで心配」"
-            "のように送ってね）"
-        )
-        return True
-
-    note_error = _follow_policy_note_error(note)
-    if note_error:
-        await message.channel.send(note_error)
-        return True
-
-    new_policy = dict(current_policy)
-    new_policy.update(updates)
-    new_policy["parent_note"] = note
-    new_policy = _normalize_follow_policy(new_policy)
-
-    if not update_user_field(target_name, "ai_follow_policy", new_policy):
-        await message.channel.send(operation_failure_message(f"{target_name}のAIフォロー方針保存"))
-        return True
-
-    await message.channel.send("AIフォロー方針を保存したよ。\n" + _follow_policy_summary(target_name, new_policy))
+    await message.channel.send(
+        f"AIフォロー方針は Web から設定してね → {base_url}"
+        "\n今の設定を見るなら「フォロー方針 <名前>」だよ。"
+    )
     return True
 
 
@@ -889,7 +895,9 @@ async def execute_bulk_grant(message: discord.Message, items: list | None = None
     conf_by_name = {str(u.get("name", "")): u for u in load_all_users()}
     # 中身が壊れていても落とさない。ここで例外を投げると確認は take_pending 済みで消えており、
     # 「どこまで支給されたか分からないまま汎用エラー」という最悪の見え方になる
+    single_max = int(config.get_parent_operation_setting()["single_max"])
     valid_items = []
+    over = []  # 上限超過。黙って飛ばさず親に知らせる
     for item in (items or []):
         if not isinstance(item, dict):
             continue
@@ -898,6 +906,13 @@ async def execute_bulk_grant(message: discord.Message, items: list | None = None
         except (TypeError, ValueError):
             continue  # 数値でない金額は無視する（壊れた保存データ対策）
         name = str(item.get("name", "")).strip()
+        # 1回あたりの上限を通す（N-11.17・有識者反証）。
+        # parent_grant / parent_adjust_balance には入っているのにここだけ無く、
+        # 固定額の桁を打ち間違えると**登録児全員分まとめて**素通りしていた。
+        # 「経路によって安全性を食い違わせない」という方針そのものに反する非対称だった。
+        if name and amount > single_max:
+            over.append((name, amount))
+            continue
         if name and amount > 0:
             valid_items.append((name, amount))
 
@@ -910,6 +925,8 @@ async def execute_bulk_grant(message: discord.Message, items: list | None = None
         return
 
     lines = ["【一括支給完了】"]
+    for name, amount in over:
+        lines.append(f"・{name}: スキップ（1回の上限 {single_max:,}円を超えている: {amount:,}円）")
     for name, amount in valid_items:
         user_conf = conf_by_name.get(name)
         # 確認後に設定が消えた子は支給できない。黙って飛ばさず親に知らせる

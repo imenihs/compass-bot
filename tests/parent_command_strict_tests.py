@@ -140,117 +140,57 @@ def _run():
         _H._client = _orig_client
 
 
-def _test_followup_policy_question_does_not_write():
-    """親の疑問文で AI フォロー方針が書き換わらないこと。
 
-    正規表現が DOTALL + `(.+)$` で行末まで飲むため、
-    「フォロー方針 <名前> 軽め って設定したっけ？」が
-    値「軽め って設定したっけ？」として通り、**実設定が書き換わっていた**。
-    さらに疑問文そのものが parent_note として保存され、
-    子への AI プロンプトに載るという二重の実害があった。
-    質問は設定変更ではなく会話（AI 経路）へ流すのが正しい。
+
+
+def _test_followup_policy_redirects_to_web():
+    """AI フォロー方針の変更は Web へ誘導し、チャットでは保存しないこと。
+
+    チャットで細かい設定を受け付けるのをやめた（N-11.17）。
+    言葉から「指示」と「質問」を見分けるのは実務上できず、
+    語彙を調整するたび「軽めだっけ で設定が変わる」と
+    「とりあえず軽めで が無視される」の間を往復した（4周）。
+    Web には同じ設定の選択式フォームが既にあり、値が曖昧にならない。
+    実ログでも親はこのコマンドを使っていない（親の発話48件中0件）。
+
+    現在値の確認だけはチャットで答える（見るだけなら曖昧さが無いため）。
     """
+    import asyncio
+
     from app import handlers_parent as H
 
-    for text in ["軽め って設定したっけ？", "軽めかな", "普通ですか", "軽め って言った?",
-                 "軽め って設定した", "軽めだっけ", "今どうなってる",
-                 "普通にしてましたか", "軽めになってる", "今どんな感じ",
-                 "設定は軽めですよね", "軽めだよね", "軽めのままかしら",
-                 "方針どうなってるの"]:
-        # 注: 「今の方針は」のような助詞止めは、ここ（語尾判定）では捕まえない。
-        # 「食事のことだけは」のような正当な指示文まで巻き込むため。
-        # 書き換わらないことは _test_followup_policy_write_decision で担保する。
-        _check(f"followup_question_blocked[{text[:16]}]",
-               H._looks_like_question(text) is True, text)
+    sent = []
 
-    # parent_note は自由文なので、長めの指示文も正しく通ること。
-    # 当初 marker を部分一致で見ていたため「勉強のこ*とは*あまり」が「とは」に、
-    # 「元気*なの*で」が「なの」に当たり、正当な指示文を弾いていた（有識者反証で発見）。
-    for text in ["軽め", "普通", "必要なときだけ", "軽め にして",
-                 "軽め 勉強のことはあまり言わないで", "普通 元気なので見守って",
-                 "軽め 本人のペースを尊重してほしい", "普通 お金の使い方だけ見てあげて",
-                 "軽め そっとしておいて", "普通 ゲームの時間だけ気にかけて"]:
-        _check(f"followup_value_allowed[{text[:16]}]",
-               H._looks_like_question(text) is False, text)
+    class _Ch:
+        async def send(self, msg, **kw):
+            sent.append(msg)
+            return type("M", (), {"id": 1})()
 
+    def _msg():
+        return type("M", (), {"channel": _Ch(),
+                              "author": type("A", (), {"id": 999})(), "id": 1})()
 
-def _test_followup_policy_write_decision():
-    """「実際に設定が書き換わるか」で判定する（語尾判定だけに頼らない）。
+    orig_parent, orig_find, orig_client = H._is_parent, H.find_user_by_name, H._client
+    H._is_parent = lambda uid: True
+    H.find_user_by_name = lambda n: {"name": n, "ai_follow_policy": {}} if n == "たろう" else None
+    H._client = type("C", (), {"user": type("U", (), {"id": 1, "name": "compass-bot"})()})()
+    try:
+        # 設定を変えようとしても、チャットでは保存せず Web へ案内する
+        for text in ["フォロー方針 たろう 軽め", "フォロー強さ たろう 普通",
+                     "フォロー方針 たろう 軽めだっけ", "フォロー方針 たろう とりあえず軽めで"]:
+            sent.clear()
+            handled = asyncio.new_event_loop().run_until_complete(
+                H.maybe_handle_followup_policy(_msg(), text))
+            _check(f"followup_redirects[{text[:20]}]",
+                   handled and any("http" in m for m in sent), sent[:1])
 
-    質問ガードは語尾のゆらぎに弱く、語彙を足すと今度は正当な指示文を弾く
-    （「食事のことだけは」が「は」に当たる等）。いたちごっこになるため、
-    **設定語は値の先頭にあるときだけ拾う**という構造側の防御を主にした。
-    指示なら「軽め …」と先頭に来るのが自然で、質問文では先頭に来ない。
-    質問ガードと合わせて二重に防ぐ。ここでは両方を通した最終結果を固定する。
-    """
-    from app import handlers_parent as H
-
-    def _writes(text):
-        if H._looks_like_question(text):
-            return False
-        updates, _note = H._parse_follow_policy_updates(text)
-        return bool(updates)
-
-    for text in ["今の方針は", "設定は", "いまの設定教えて", "普通にしてましたか",
-                 "軽めになってる", "今どんな感じ", "設定は軽めですよね", "軽めだよね",
-                 "軽めのままかしら", "方針どうなってるの", "軽めだっけ", "どうなってる",
-                 "軽め って設定したっけ？", "軽めかな", "普通ですか", "現在の設定は",
-                 "軽めになってる？", "今の方針は軽めだっけ", "普通にしてたよね",
-                 # 回想・確認の言い回し（指示と同じ語を含むが現状の確認をしている）
-                 "軽めにしてたのって合ってる", "軽めって前に言ったやつ",
-                 "軽めにしてたと思うんだけど", "普通だと思ってた", "軽めじゃなかった"]:
-        _check(f"policy_question_no_write[{text[:16]}]", _writes(text) is False, text)
-
-    # 設定語は文頭に来るとは限らない。一時「先頭にあるときだけ拾う」構造にしたところ、
-    # 「とりあえず軽めで」「今日から軽めにして」を大量に取りこぼした（有識者の再々反証）。
-    # しかも親には「保存したよ」と出るため誤りに気づけず、指示文が
-    # parent_note として子の AI プロンプトに載るという二重の実害があった。
-    for text in ["軽め", "普通", "必要なときだけ",
-                 "軽め 宿題のことは言わないで", "普通 ゲームのことは本人に任せて",
-                 "軽め お金のことはしっかり見て", "普通 早寝のことだけは言ってね",
-                 "軽め そっと見守ってほしいな", "軽め 食事のことだけは",
-                 "普通 なにかあったら教えて", "軽め 何も言わないで",
-                 "普通 元気なので見守って", "軽め 勉強のことはあまり言わないで",
-                 # 設定語が文頭に無い自然な指示
-                 "強さは軽めで", "方針は軽めにして", "とりあえず軽めで",
-                 "今日から軽めにして", "これからは普通で", "次から軽めでお願い",
-                 "できれば軽めにしてほしい", "なるべく軽めで", "もう少し軽めにして",
-                 "やっぱり普通に戻して", "一旦軽めで", "当面は軽めで"]:
-        _check(f"policy_instruction_writes[{text[:16]}]", _writes(text) is True, text)
-
-
-def _test_followup_note_only_update():
-    """申し送り（parent_note）だけの更新が保存できること。
-
-    「変化が無ければ保存しない」歯止めを入れたとき、条件を
-    「設定語が取れなければ保存しない」にしてしまい、
-    「最近ゲームばかりで心配」のような**申し送りだけの更新を潰していた**
-    （有識者の4周目反証で発見）。note に300文字制限と安全語チェックがあることから、
-    単独更新はもともと想定されている機能である。
-    条件を「何も変わらないなら保存しない」に直して両立させた。
-    """
-    from app import handlers_parent as H
-
-    current = {"parent_note": "", "nudge_strength": "normal", "frequency": "normal",
-               "enabled": True, "focus_area": "balanced"}
-
-    def _saved(text):
-        if H._looks_like_question(text):
-            return False
-        updates, note = H._parse_follow_policy_updates(text)
-        note_changed = note.strip() != str(current.get("parent_note", "")).strip()
-        return bool(updates) or note_changed
-
-    # 申し送りだけ（設定語を含まない）でも保存される
-    for text in ["最近ゲームばかりで心配", "来週から塾が始まるよ",
-                 "友達関係で悩んでるみたい", "テスト期間だから見守って",
-                 "買い物の練習をさせたい", "困ったことがあったら教えてあげて"]:
-        _check(f"note_only_saved[{text[:16]}]", _saved(text) is True, text)
-
-    # 現状を尋ねる言い方は、申し送りとして保存してはいけない
-    for text in ["今の方針は", "現在の設定は", "設定は", "強さは",
-                 "いまの設定教えて", "今の設定見せて"]:
-        _check(f"note_only_question_not_saved[{text[:16]}]", _saved(text) is False, text)
+        # 現在値の確認はその場で答える
+        sent.clear()
+        asyncio.new_event_loop().run_until_complete(
+            H.maybe_handle_followup_policy(_msg(), "フォロー方針 たろう"))
+        _check("followup_shows_current", any("たろう" in m for m in sent), sent[:1])
+    finally:
+        H._is_parent, H.find_user_by_name, H._client = orig_parent, orig_find, orig_client
 
 
 def _report():
@@ -260,9 +200,8 @@ def _report():
     （実際に2件が呼ばれないまま「全件PASS」に見えていた）。
     追加したテストが確実に走ることを担保するため、呼び出しと集計をここへ集める。
     """
-    _test_followup_policy_question_does_not_write()
-    _test_followup_policy_write_decision()
-    _test_followup_note_only_update()
+
+    _test_followup_policy_redirects_to_web()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

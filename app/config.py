@@ -661,7 +661,15 @@ def get_parent_operation_setting() -> dict:
     single_max = _safe_int(conf.get("single_max"), 50000)
     if single_max is None or single_max <= 0:
         single_max = 50000
-    return {"single_max": single_max}
+    # 実行前に親へ確認を出す金額のしきい値。
+    # これ未満は確認せずその場で実行する（お小遣い管理なので毎回の確認は煩わしいだけ）。
+    # 取り違えても台帳（*_wallet_ledger.jsonl）に日時・増減・理由が残り、後から追える。
+    # 確認は「桁を間違えた」「まとめて大きく動かす」ような、
+    # 気づかないと困る額のときだけ出す。
+    confirm_over = _safe_int(conf.get("confirm_over"), 10000)
+    if confirm_over is None or confirm_over < 0:
+        confirm_over = 10000
+    return {"single_max": single_max, "confirm_over": confirm_over}
 
 
 def get_safety_alert_setting() -> dict:

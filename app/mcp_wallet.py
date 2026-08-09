@@ -1461,6 +1461,40 @@ def reject_proposal(name: str, note: str = "", parent_intent: str = "", expected
 # 厳密に検証する。曖昧な指示（対象や額が不明）では AI は tool を呼ばず聞き返す想定。対象児は必ず
 # _resolve_parent_target（子ディレクトリ実在のみ）で引き、親名・未登録名は弾く。
 
+
+def _require_confirmed(action: str, name: str, amount) -> str | None:
+    """親の確認を経ていない金額操作を拒否する（N-11.17 の Python 境界）。
+
+    親 prompt には「お金を動かす前に必ず parent_confirm_money_action を呼ぶ」と
+    書いてあるが、**プロンプトは境界ではない**。AI が指示を読み飛ばして
+    parent_grant を直接呼べば、確認なしで残高が動いてしまう（実測で確認済み）。
+    子経路の ACTIVE_CHILD と同じく、AI が破れない Python 側の歯止めを置く。
+
+    確認済みかどうかは、bot が「はい」を受けて実行するときに渡す
+    operation_key の接頭辞（confirm-）で判別する。この接頭辞は
+    parent_confirm.take_pending を通った実行だけが持つ。
+
+    Args:
+        action: 操作の種類（grant / adjust）。
+        name: 対象児の名前。
+        amount: 金額。
+
+    Returns:
+        str | None: 拒否する場合は親へ返す文言。確認済みなら None。
+    """
+    from app import parent_confirm as pc
+
+    parent_id = int(os.environ.get("COMPASS_PARENT_DISCORD_ID", "0") or 0)
+    if parent_id <= 0:
+        return "確認を出せなかったよ。もう一度話しかけてね。"
+    # 確認を積んで、親に「はい」と答えてもらう。ここでは残高を動かさない
+    exec_action = "parent_grant" if action == "grant" else "parent_adjust_balance"
+    exec_args = {"name": name, "amount": amount} if action == "grant" else {"name": name, "delta": amount}
+    _token, superseded = pc.put_pending(parent_id, exec_action, exec_args)
+    return (pc.describe_superseded(superseded)
+            + pc.build_confirmation(action, name, amount))
+
+
 def _do_parent_grant(args: dict) -> str:
     """親が対象児へお小遣いを支給する（親モード専用・管理操作）。金額は親が明示した値のみ。"""
     if not (PARENT_MODE and ALLOW_ADMIN_OPS):
@@ -1486,6 +1520,13 @@ def _do_parent_grant(args: dict) -> str:
     if not op_key:
         return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     name = str(conf.get("name", ""))
+    # 大きい金額だけ、確認を経ていない実行を止める（AI が prompt を読み飛ばしても効く）。
+    # 少額まで毎回確認すると操作が2ターンになって煩わしい。
+    # 取り違えても台帳に日時・増減・理由が残るので後から追えるため、
+    # 確認は「気づかないと困る額」に絞る。
+    confirm_over = int(config.get_parent_operation_setting()["confirm_over"])
+    if abs(amount) >= confirm_over and not op_key.startswith("confirm-"):
+        return _require_confirmed("grant", name, amount)
     eff_key = _scoped_op_key(name, "allowance_manual_grant", op_key)
     if _wallet.is_operation_applied(eff_key):
         return f"その支給はすでに反映済みだよ。今の残高は {_wallet.get_balance(name)}円。"
@@ -1525,6 +1566,10 @@ def _do_parent_adjust_balance(args: dict) -> str:
     if not op_key:
         return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     name = str(conf.get("name", ""))
+    # 支給と同じく、大きい金額だけ確認を挟む
+    confirm_over = int(config.get_parent_operation_setting()["confirm_over"])
+    if abs(delta) >= confirm_over and not op_key.startswith("confirm-"):
+        return _require_confirmed("adjust", name, delta)
     eff_key = _scoped_op_key(name, "balance_adjustment", op_key)
     if _wallet.is_operation_applied(eff_key):
         return f"その調整はすでに反映済みだよ。今の残高は {_wallet.get_balance(name)}円。"
