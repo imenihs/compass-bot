@@ -40,6 +40,7 @@ from app.config import (
     find_user_by_name,
     get_discord_id_conflicts,
     get_allow_channel_ids,
+    is_parent_channel,
     get_assess_keyword,
     get_allowance_reminder_setting,
     get_chat_setting,
@@ -854,7 +855,11 @@ async def _on_message_impl(message: discord.Message):
     if await handlers_parent.maybe_handle_parent_usage_single(message, content):
         return
 
-    if ALLOW_CHANNEL_IDS is not None and message.channel.id not in ALLOW_CHANNEL_IDS:
+    # 親チャンネルは allow_channel_ids に含めない（子に親URLを見せないため・2026/08/10）。
+    # そのぶんここで明示的に通す。含めてしまうと子も入れるチャンネルになる
+    if (ALLOW_CHANNEL_IDS is not None
+            and message.channel.id not in ALLOW_CHANNEL_IDS
+            and not is_parent_channel(message.channel.id)):
         return
 
     if content.startswith("[#SH-"):

@@ -169,7 +169,45 @@ def _test_parent_can_talk_in_child_channel():
     _check("no_amount_not_blocked", moves("お菓子買ったよ") is False, moves("お菓子買ったよ"))
 
 
+def _test_parent_channel_is_not_blocked():
+    """親専用チャンネルでボットが反応すること。
+
+    親URLを子に見せないため、親チャンネルを allow_channel_ids から外した（2026/08/10）。
+    そのぶん bot.py 側で明示的に通す必要がある。
+    外したまま通す処理を入れ忘れると、**親チャンネルでボットが一切反応しなくなる**
+    （設定変更だけで機能が死ぬ、気づきにくい壊れ方）。
+
+    AST で、チャンネル判定に is_parent_channel の除外が入っていることを固定する。
+    """
+    import ast
+
+    src = (ROOT / "app" / "bot.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    found = False
+    for node in ast.walk(tree):
+        # `... not in ALLOW_CHANNEL_IDS and not is_parent_channel(...)` の形を探す
+        if not isinstance(node, ast.BoolOp) or not isinstance(node.op, ast.And):
+            continue
+        text = ast.dump(node)
+        if "ALLOW_CHANNEL_IDS" in text and "is_parent_channel" in text:
+            found = True
+            break
+    _check("parent_channel_bypasses_allow_list", found,
+           "bot.py のチャンネル判定に is_parent_channel の除外が無い")
+
+    # 設定側も、親チャンネルが allow に混ざっていないことを確認する
+    from app import config
+    parent_id = config.get_parent_channel_id()
+    allow = config.get_allow_channel_ids()
+    _check("parent_channel_is_configured", parent_id is not None, parent_id)
+    _check("parent_channel_not_in_allow_list",
+           parent_id is None or allow is None or parent_id not in allow,
+           {"parent": parent_id, "allow": sorted(allow) if allow else None})
+
+
 def main():
+    _test_parent_channel_is_not_blocked()
     _test_channel_context_resolves_child()
     _test_parent_child_same_id_lookup_order()
     _test_resolution_chain_not_broken()

@@ -180,6 +180,39 @@ def get_web_base_url() -> str:
     setting = load_setting()
     return setting.get("web_base_url", "https://example.com")
 
+def get_parent_channel_id() -> int | None:
+    """親専用チャンネルの ID を返す。未設定なら None。
+
+    UUID 認証（docs/設計_UUID認証方式.md）で親へ URL を配る先として使う。
+    **allow_channel_ids には含めない**。含めると子も入れるチャンネルになり、
+    親 URL を子が読めてしまう（子が自分の残高を増やせる状態になる）。
+
+    以前は allowance_reminder.channel_id を親向け通知に流用していたが、
+    それは allow_channel_ids[0] と同一で子も入るチャンネルだった。
+    親子で経路を分けるため専用キーを持たせる（2026/08/10）。
+
+    Returns:
+        int | None: 親チャンネルの ID。未設定なら None。
+    """
+    setting = load_setting()
+    return _safe_int(setting.get("parent_channel_id"))
+
+
+def is_parent_channel(channel_id) -> bool:
+    """指定チャンネルが親専用チャンネルかを判定する。
+
+    Args:
+        channel_id: 判定するチャンネル ID。
+
+    Returns:
+        bool: 親専用チャンネルなら True。未設定時は False（誤って親扱いしない）。
+    """
+    parent_id = get_parent_channel_id()
+    if parent_id is None:
+        return False
+    return _safe_int(channel_id) == parent_id
+
+
 def get_allow_channel_ids() -> set[int] | None:
     """
     ALLOW_CHANNEL_IDS が未設定なら None（制限なし）
