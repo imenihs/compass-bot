@@ -686,7 +686,46 @@ class WalletService:
                 return g
         return None
 
-    def add_savings_goal(self, user_name: str, title: str, target_amount: int) -> tuple[bool, str]:
+    def cancel_goal(self, user_name: str, goal_id: int) -> tuple[bool, str]:
+        """目標を取り消す。**まだ1円も積んでいないときだけ**。
+
+        親が桁を間違えて立て替えを登録したときの復旧手段（設計 6節 E-2）。
+
+        **積み始めた後は取り消せない**。子は「あと◯円」を見て計画しており、
+        途中で消えると返した実績の意味が変わってしまう。
+        その場合は残高調整で個別に戻す。
+
+        削除ではなく `status="cancelled"` にする。
+        「あった」という記録は残す（後から経緯を追えるように）。
+
+        Args:
+            user_name: 対象の子の名前。
+            goal_id: 取り消す目標の id。
+
+        Returns:
+            tuple[bool, str]: (成功したか, メッセージ)。
+        """
+        lock_path = self.wallet_state_path.with_suffix(self.wallet_state_path.suffix + ".lock")
+        with self._lock, _interprocess_lock(lock_path):
+            state = self._load_wallet_state()
+            user_state = state.setdefault("users", {}).setdefault(user_name, {})
+            goal = self._find_goal_locked(user_state, goal_id)
+            if goal is None:
+                return False, "その目標は見つかりませんでした。"
+            if int(goal.get("accumulated", 0) or 0) > 0:
+                return False, (
+                    "もう積み始めているので取り消せません。"
+                    "（残高調整で個別に戻してください）"
+                )
+            if str(goal.get("status", "active")) != "active":
+                return False, "その目標はもう終わっています。"
+            goal["status"] = "cancelled"
+            goal["closed"] = now_jst_iso()
+            self._save_wallet_state(state)
+        return True, "cancelled"
+
+    def add_savings_goal(self, user_name: str, title: str, target_amount: int,
+                         kind: str = "saving") -> tuple[bool, str]:
         """貯金目標を追加する。同名タイトルが既存なら金額を更新する。
         上限(MAX_SAVINGS_GOALS)超過の場合は (False, エラーメッセージ) を返す。
 
@@ -697,9 +736,10 @@ class WalletService:
         """
         lock_path = self.wallet_state_path.with_suffix(self.wallet_state_path.suffix + ".lock")
         with self._lock, _interprocess_lock(lock_path):
-            return self._add_savings_goal_locked(user_name, title, target_amount)
+            return self._add_savings_goal_locked(user_name, title, target_amount, kind)
 
-    def _add_savings_goal_locked(self, user_name: str, title: str, target_amount: int) -> tuple[bool, str]:
+    def _add_savings_goal_locked(self, user_name: str, title: str, target_amount: int,
+                                 kind: str = "saving") -> tuple[bool, str]:
         """add_savings_goal の本体。呼び出し側がロックを保持している前提。"""
         state = self._load_wallet_state()
         users = state.setdefault("users", {})
@@ -722,7 +762,16 @@ class WalletService:
 
         # id は既存の最大値 + 1 で採番する（削除後の再利用は行わない）
         next_id = max((g.get("id", 0) for g in goals), default=0) + 1
-        goals.append({"id": next_id, "title": title, "target_amount": int(target_amount)})
+        # 貯金（saving）と立て替え返済（advance）を同じ構造で持つ（2026/08/10）。
+        # accumulated がこの目標に積んだ額で、target_amount へ向かって増える
+        goals.append({
+            "id": next_id,
+            "kind": "advance" if str(kind) == "advance" else "saving",
+            "title": title,
+            "target_amount": int(target_amount),
+            "accumulated": 0,
+            "status": "active",
+        })
         u["savings_goals"] = goals
         self._save_wallet_state(state)
         return True, "added"

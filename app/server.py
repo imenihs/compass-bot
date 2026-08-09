@@ -22,11 +22,13 @@ from fastapi.templating import Jinja2Templates
 from app import dashboard_token
 from app import web_auth
 from app.config import (
+    find_child_user_by_name,
     CHILDREN_DIR,
     PARENTS_DIR,
     SETTING_PATH,
     get_allow_channel_ids,
     get_allowance_reminder_setting,
+    get_parent_channel_id,
     get_log_dir,
     get_low_balance_alert_setting,
     get_web_base_url,
@@ -272,9 +274,13 @@ async def _notify_discord(message: str) -> bool:
     if _discord_client is None:
         return False
     try:
-        # 通知先チャンネルを取得する（allowance_reminder → allow_channel_ids の順でフォールバック）
-        reminder_conf = get_allowance_reminder_setting()
-        channel_id = reminder_conf.get("channel_id")
+        # 通知先は **親チャンネルを最優先**（2026/08/10）。
+        # 以前は allowance_reminder → allow_channel_ids の順で、
+        # allow_channel_ids は子チャンネルなので、**親の操作が子に流れる**恐れがあった。
+        channel_id = get_parent_channel_id()
+        if not channel_id:
+            reminder_conf = get_allowance_reminder_setting()
+            channel_id = reminder_conf.get("channel_id")
         if not channel_id:
             allow_ids = get_allow_channel_ids()
             channel_id = next(iter(allow_ids), None) if allow_ids else None
@@ -1571,11 +1577,21 @@ async def get_login(request: Request):
 
 @app.get("/compass-bot/logout")
 async def logout(session_token: Optional[str] = Cookie(default=None)):
-    """セッションを削除してログインページへリダイレクトする"""
+    """ログアウトする。**UUID の Cookie も必ず消す**。
+
+    UUID 方式に移したとき `session_token` しか消しておらず、
+    ログアウトしても `dash_token` が残って**そのまま入り直せる**状態だった
+    （反証で判明）。Cookie は365日有効なので、
+    共有端末や子のタブレットを借りたときに「閉じる手段が無い」ことになる。
+
+    消したあとに入り直すには自分専用の URL が要る。
+    無くしていたら Discord で `URL再発行` と送れば新しい URL が届く。
+    """
     if session_token:
         await web_auth.delete_session(session_token)
     response = RedirectResponse(url="/compass-bot/login", status_code=303)
     response.delete_cookie("session_token")
+    response.delete_cookie(DASH_COOKIE)
     return response
 
 
@@ -1716,7 +1732,7 @@ async def get_dashboard(
     if not username:
         return RedirectResponse(url="/compass-bot/login", status_code=303)
 
-    is_admin = _is_admin(username)
+    is_admin = _is_admin(username, dash_token)
     system_conf = load_system()
 
     if is_admin:
@@ -1750,12 +1766,6 @@ async def get_dashboard(
             ensure_ascii=False,
         )
 
-        # 承認待ち申請一覧を取得する
-        pending_apps = await web_auth.list_pending_applications()
-        for app in pending_apps:
-            ts = app.get("requested_at", 0)
-            app["requested_at_str"] = datetime.datetime.fromtimestamp(ts, tz=JST).strftime("%Y-%m-%d %H:%M") if ts else "—"
-
         return templates.TemplateResponse("dashboard.html", {
             "request": request,
             "username": username,
@@ -1764,7 +1774,6 @@ async def get_dashboard(
             "parent_settings": parent_settings,
             "dashboard_user_rows": dashboard_user_rows,
             "dashboard_user_order_json": dashboard_user_order_json,
-            "pending_apps": pending_apps,
             "user_gender_choices": USER_GENDER_CHOICES,
             "bot_personality_choices": BOT_PERSONALITY_CHOICES,
             "user_keyword_buckets": USER_KEYWORD_BUCKETS,
@@ -1829,6 +1838,96 @@ async def op_user_order(
     return _op_redirect(msg="ユーザー一覧の並び順を保存しました。")
 
 
+@app.post("/compass-bot/op/advance")
+async def op_advance(
+    session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
+    target: str = Form(...),
+    title: str = Form(...),
+    amount: str = Form(...),
+):
+    """親が立て替え（子の代わりに先に払った分）を登録する。
+
+    設計（docs/設計_子ダッシュボードと立て替え返済.md ⑤）で
+    「立て替えの登録は親・Web から」と決めた入口。
+    子は返済（contribute_to_goal）だけができ、立て替え自体は作れない。
+
+    **利息は無い**。登録した総額がそのまま返す額で、増えない。
+    登録した時点では残高を動かさない（返済のたびに減る）。
+
+    Args:
+        session_token: 従来のセッション（移行期間中）。
+        dash_token: UUID の Cookie。
+        target: 対象の子の名前。
+        title: 何の立て替えか（子が見て分かる言葉）。
+        amount: 立て替えた総額（円）。
+
+    Returns:
+        RedirectResponse: ダッシュボードへ戻る。
+    """
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    child_name = _short_text(target, 60)
+    goal_title = _short_text(title, 60)
+    if not child_name or not goal_title:
+        return _op_redirect(error="対象と内容を入力してください。")
+    if find_child_user_by_name(child_name) is None:
+        return _op_redirect(error=f"「{child_name}」は子どもユーザーに見つかりません。")
+
+    total = _safe_int(str(amount).replace(",", "").replace("円", "").strip())
+    if not total or total <= 0:
+        return _op_redirect(error="金額は1円以上の数字で入力してください。")
+
+    if not _wallet_service:
+        return _op_redirect(error="残高サービスが利用できません。")
+    ok, result = _wallet_service.add_savings_goal(
+        child_name, goal_title, total, kind="advance")
+    if not ok:
+        return _op_redirect(error=str(result))
+    return _op_redirect(msg=f"{child_name} の立て替え「{goal_title}」{total:,}円を登録しました。")
+
+
+@app.post("/compass-bot/op/advance_cancel")
+async def op_advance_cancel(
+    session_token: Optional[str] = Cookie(default=None),
+    dash_token: Optional[str] = Cookie(default=None),
+    target: str = Form(...),
+    goal_id: str = Form(...),
+):
+    """立て替えを取り消す。**まだ1円も返していないときだけ**。
+
+    設計 6節 E-2 で確定した復旧手段。親が桁を間違えたときに使う。
+
+    **返済が始まった後は取り消せない**。子は「あと◯円」を見て計画しており、
+    途中で消えると返した実績の意味が変わってしまう。
+    その場合は残高調整で個別に戻す。
+
+    Args:
+        target: 対象の子の名前。
+        goal_id: 取り消す立て替えの id。
+
+    Returns:
+        RedirectResponse: ダッシュボードへ戻る。
+    """
+    current_user = await _get_current_user(session_token, dash_token)
+    if not current_user or not _is_admin(current_user, dash_token):
+        return RedirectResponse(url="/compass-bot/login", status_code=303)
+
+    child_name = _short_text(target, 60)
+    gid = _safe_int(goal_id)
+    if not child_name or gid is None:
+        return _op_redirect(error="対象が正しくありません。")
+    if not _wallet_service:
+        return _op_redirect(error="残高サービスが利用できません。")
+
+    ok, result = _wallet_service.cancel_goal(child_name, int(gid))
+    if not ok:
+        return _op_redirect(error=str(result))
+    return _op_redirect(msg=f"{child_name} の立て替えを取り消しました。")
+
+
 @app.post("/compass-bot/op/grant")
 async def op_grant(
     session_token: Optional[str] = Cookie(default=None),
@@ -1865,6 +1964,12 @@ async def op_grant(
         note="manual_grant_by_parent_web",
         extra={"granted_by": current_user},
     )
+    # 金額が動いたことを Discord の親チャンネルへ**事後通知**する
+    # （docs/設計_UUID認証方式.md の条件2）。承認で止めるのではなく、
+    # 手数ゼロで「気づく手段」を残す。復元は台帳から行う
+    await _notify_discord(
+        f"【Web操作】{current_user} が {target} に {amt:,}円 支給しました"
+        f"（{before:,}円 → {new_balance:,}円）")
     return _op_redirect(msg=f"{target}に{amt:,}円を支給しました（{before:,}円 → {new_balance:,}円）")
 
 
@@ -2474,6 +2579,10 @@ async def op_adjust(
         extra={"adjusted_by": current_user},
     )
     label = "加算" if delta >= 0 else "減算"
+    # 支給と同じく事後通知する（条件2）
+    await _notify_discord(
+        f"【Web操作】{current_user} が {target} の残高を {label} しました"
+        f"（{before:,}円 → {new_balance:,}円）")
     return _op_redirect(msg=f"{target}の残高を{label}しました（{before:,}円 → {new_balance:,}円）")
 
 

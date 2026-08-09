@@ -313,6 +313,56 @@ def _test_tool_layer():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_advance_registration_and_cancel():
+    """立て替えを登録でき、まだ返していないときだけ取り消せること。
+
+    読み出し側（子画面の「かえした」表示・親画面の「返済」ラベル・
+    tool の「返しきった」文面）は全部あるのに、
+    **登録する入口だけが無い**状態だった（実装レビューで発覚）。
+    それでは「借金のしくみが無い」という子の指摘が解消されない。
+    """
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        ws, _ = _setup(tmp, [], balance=5000)
+
+        # 立て替えを登録できる
+        ok, _ = ws.add_savings_goal("たろう", "パソコン代", 30000, kind="advance")
+        _check("advance_can_be_added", ok is True, ok)
+        goals = ws.get_savings_goals("たろう")
+        _check("advance_kind_is_saved",
+               goals and goals[0].get("kind") == "advance", goals)
+        _check("advance_starts_at_zero",
+               goals and goals[0].get("accumulated") == 0, goals)
+        _check("advance_is_active",
+               goals and goals[0].get("status") == "active", goals)
+
+        # 貯金は既定で saving（kind 未指定）
+        ws.add_savings_goal("たろう", "パソコン", 150000)
+        saving = [g for g in ws.get_savings_goals("たろう") if g["title"] == "パソコン"]
+        _check("default_kind_is_saving",
+               saving and saving[0].get("kind") == "saving", saving)
+
+        # まだ返していないので取り消せる
+        ok, _ = ws.cancel_goal("たろう", 1)
+        _check("cancel_before_contribution", ok is True, ok)
+        cancelled = [g for g in ws.get_savings_goals("たろう") if g["id"] == 1]
+        _check("cancel_sets_status",
+               cancelled and cancelled[0].get("status") == "cancelled", cancelled)
+
+        # 1円でも積んだ後は取り消せない（子の計画を壊さないため）
+        ws.contribute_to_goal({"name": "たろう"}, {}, 2, 500, "c1",
+                              aux_dedup_window_sec=120)
+        ok, msg = ws.cancel_goal("たろう", 2)
+        _check("cancel_after_contribution_rejected", ok is False, msg)
+        _check("cancel_explains_why", "積み始めている" in str(msg), msg)
+
+        # 存在しない目標
+        ok, msg = ws.cancel_goal("たろう", 999)
+        _check("cancel_missing_goal", ok is False, msg)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     _test_normal_contribution()
     _test_idempotent_resend()
@@ -321,6 +371,7 @@ def main():
     _test_ledger_record()
     _test_migration_three_cases()
     _test_tool_layer()
+    _test_advance_registration_and_cancel()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

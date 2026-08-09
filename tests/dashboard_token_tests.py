@@ -288,6 +288,66 @@ def _test_discord_id_cannot_be_changed_from_web():
            "Discord ID は Web からは変更できません" in src, "")
 
 
+def _test_logout_clears_uuid_cookie():
+    """ログアウトで UUID の Cookie も消えること。
+
+    UUID 方式に移したとき session_token しか消しておらず、
+    ログアウトしても dash_token が残って**そのまま入り直せる**状態だった。
+    Cookie は365日有効なので、共有端末で「閉じる手段が無い」ことになる。
+    """
+    import ast
+
+    src = (ROOT / "app" / "server.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    logout_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == "logout":
+            logout_fn = node
+            break
+    _check("logout_exists", logout_fn is not None, logout_fn)
+    if logout_fn is None:
+        return
+
+    dumped = ast.dump(logout_fn)
+    _check("logout_clears_session", "session_token" in dumped, "")
+    _check("logout_clears_dash_token", "DASH_COOKIE" in dumped,
+           "logout が UUID の Cookie を消していない")
+
+
+def _test_admin_check_always_uses_token():
+    """_is_admin の呼び出しが**全て** dash_token を渡していること。
+
+    1箇所でも渡し忘れると、そこだけ廃止済みの web_users.json の
+    is_admin フラグにフォールバックし、画面と権限が食い違う。
+    """
+    import re
+
+    src = (ROOT / "app" / "server.py").read_text(encoding="utf-8")
+    # 定義行を除いた呼び出しを数える
+    calls = [m for m in re.findall(r"_is_admin\(([^)]*)\)", src)
+             if "username: str" not in m]
+    missing = [c for c in calls if "dash_token" not in c]
+    _check("all_admin_checks_pass_token", not missing,
+           f"dash_token 無しの呼び出し: {missing}")
+
+
+def _test_money_ops_notify_discord():
+    """Web からの金額操作が Discord へ事後通知されること。
+
+    設計（docs/設計_UUID認証方式.md 条件2）で、承認（実行前ブロック）を撤回した
+    代わりに通知（実行後報知）を残すと決めた。
+    これが無いと、URL が漏れたときに気づく手段がゼロになる。
+    """
+    src = (ROOT / "app" / "server.py").read_text(encoding="utf-8")
+    # 定義1 + 呼び出し（支給・調整）
+    _check("notify_is_called", src.count("_notify_discord") >= 3,
+           f"_notify_discord の出現数: {src.count('_notify_discord')}")
+    _check("notify_prefers_parent_channel",
+           "channel_id = get_parent_channel_id()" in src,
+           "通知先が親チャンネル優先になっていない（子チャンネルへ流れる）")
+
+
 def main():
     _test_issue_and_resolve()
     _test_invalid_tokens_are_rejected()
@@ -297,6 +357,9 @@ def main():
     _test_user_key_split()
     _test_url_reissue_command()
     _test_discord_id_cannot_be_changed_from_web()
+    _test_logout_clears_uuid_cookie()
+    _test_admin_check_always_uses_token()
+    _test_money_ops_notify_discord()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

@@ -1084,33 +1084,6 @@
   </div>
 </div>
 
-{% if pending_apps %}
-<div class="card">
-  <h2>🔔 Webアクセス承認待ち申請</h2>
-  <table>
-    <thead>
-      <tr><th>ユーザー名</th><th>申請日時</th><th>操作</th></tr>
-    </thead>
-    <tbody>
-    {% for app in pending_apps %}
-      <tr>
-        <td>{{ app.username }}</td>
-        <td>{{ app.requested_at_str }}</td>
-        <td>
-          <form method="post" action="/compass-bot/admin/approve" style="display:inline;">
-            <input type="hidden" name="username" value="{{ app.username }}">
-            <button type="submit" class="btn btn-primary" style="padding:5px 14px; font-size:0.85rem;">承認</button>
-          </form>
-        </td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
-  <div style="font-size:0.82rem; color:#888; margin-top:8px;">
-    ※ 承認するとDiscordに仮パスワードが通知されます
-  </div>
-</div>
-{% endif %}
 
 {% else %}
 <!-- 一般ユーザー（子供）向け表示 -->
