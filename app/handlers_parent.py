@@ -604,28 +604,16 @@ async def maybe_handle_manual_grant(message: discord.Message, content: str) -> b
         await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
         return True
 
-    system_conf = load_system()
-    before = _wallet_service.get_balance(target_name)
-    # allowance_grant（Gemini査定自動付与）と区別するため別のアクション名にする
-    new_balance, achieved_goals = _wallet_service.update_balance(
-        user_conf=target_conf,
-        system_conf=system_conf,
-        delta=amount,
-        action="allowance_manual_grant",
-        note="manual_grant_by_parent",
-        extra={"granted_by": str(message.author.id)},
-        operation_key=_parent_op_key(message, "allowance_manual_grant", target_name),
-    )
+    # 明示コマンドも **AI 経路と同じ確認ステップを通す**（N-11.17）。
+    # 経路によって安全性が食い違わないようにするため。ここで直接 update_balance を呼ぶと
+    # 「AI 経由なら確認あり・コマンドなら即実行」という非対称が生まれ、
+    # 桁の打ち間違いをコマンド側だけ捕まえられない。
+    from app import parent_confirm as pc
+    pc.put_pending(int(message.author.id), "parent_grant",
+                   {"name": target_name, "amount": amount})
     await message.channel.send(
-        f"{target_name}に支給したよ。"
-        f"\n- 金額: {amount}円"
-        f"\n残高: {before}円 → {new_balance}円"
+        pc.build_confirmation("grant", target_name, amount)
     )
-    # 支給により目標が達成された場合は祝福メッセージを送る
-    for achieved_goal in achieved_goals:
-        await message.channel.send(
-            _build_goal_achieved_message(user_conf=target_conf, goal=achieved_goal)
-        )
     return True
 
 
@@ -651,28 +639,13 @@ async def maybe_handle_balance_adjustment(message: discord.Message, content: str
         await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
         return True
 
-    system_conf = load_system()
-    before = _wallet_service.get_balance(target_name)
-    new_balance, achieved_goals = _wallet_service.update_balance(
-        user_conf=target_conf,
-        system_conf=system_conf,
-        delta=delta,
-        action="balance_adjustment",
-        note="manual_adjustment_by_parent",
-        extra={"adjusted_by": str(message.author.id)},
-        operation_key=_parent_op_key(message, "balance_adjustment", target_name),
-    )
-    direction = "加算" if delta >= 0 else "減算"
+    # 支給と同じく確認ステップを通す（N-11.17）。経路によって安全性を食い違わせない
+    from app import parent_confirm as pc
+    pc.put_pending(int(message.author.id), "parent_adjust_balance",
+                   {"name": target_name, "delta": delta})
     await message.channel.send(
-        f"{target_name}の残高を調整したよ。"
-        f"\n- {direction}: {abs(delta)}円（{delta:+d}円）"
-        f"\n残高: {before}円 → {new_balance}円"
+        pc.build_confirmation("adjust", target_name, delta)
     )
-    # 加算調整で目標が達成された場合は祝福メッセージを送る
-    for achieved_goal in achieved_goals:
-        await message.channel.send(
-            _build_goal_achieved_message(user_conf=target_conf, goal=achieved_goal)
-        )
     return True
 
 
@@ -778,23 +751,13 @@ async def maybe_handle_followup_policy(message: discord.Message, content: str) -
     return True
 
 
-async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> bool:
-    """親が全ユーザーに固定お小遣いを一括支給するコマンドを処理する（親のみ）。
-    全ユーザーの fixed_allowance を残高に加算し、結果を一覧表示する。"""
-    if not _is_parent(message.author.id):
-        return False
-    # メンション付き（「@compass-bot 一括支給」）にも対応するためメンション除去後に判定する
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    target = mention_body if mention_body is not None else (content or "")
-    # 誤作動を防ぐため完全一致で判定する
-    if target.strip() != "一括支給":
-        return False
+async def execute_bulk_grant(message: discord.Message) -> None:
+    """全員への一括支給を実行する（確認で「はい」を受けてから呼ばれる）。
 
+    コマンド経路と AI 経路のどちらから来ても同じ処理を通すため関数に切り出す。
+    ここに来る時点で親の同意は取れている前提。
+    """
     users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-    if not users:
-        await message.channel.send("ユーザーが設定されていないよ。")
-        return True
-
     system_conf = load_system()
     lines = ["【一括支給完了】"]
     # 全ユーザーを走査して fixed_allowance を残高に加算する
@@ -820,8 +783,49 @@ async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> boo
             await message.channel.send(
                 _build_goal_achieved_message(user_conf=u, goal=achieved_goal)
             )
-
     await message.channel.send("\n".join(lines))
+
+
+async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> bool:
+    """親が全ユーザーに固定お小遣いを一括支給するコマンドを処理する（親のみ）。
+
+    **実行前に必ず確認を出す**（N-11.17）。一括支給は登録児全員の残高を一度に動かす、
+    この bot で最も影響の大きい操作である。誰にいくら入るのかを先に見せてから実行する。
+    """
+    if not _is_parent(message.author.id):
+        return False
+    # メンション付き（「@compass-bot 一括支給」）にも対応するためメンション除去後に判定する
+    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
+    target = mention_body if mention_body is not None else (content or "")
+    # 誤作動を防ぐため完全一致で判定する
+    if target.strip() != "一括支給":
+        return False
+
+    users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
+    if not users:
+        await message.channel.send("ユーザーが設定されていないよ。")
+        return True
+
+    # 誰にいくら入るのかを先に見せる。金額の合計まで出して桁の異常に気づけるようにする
+    detail_lines = []
+    total = 0
+    for u in users:
+        name = str(u.get("name", ""))
+        amount = int(u.get("fixed_allowance", 0))
+        if amount <= 0:
+            detail_lines.append(f"{name}: スキップ（固定額未設定）")
+            continue
+        total += amount
+        detail_lines.append(f"{name}: +{amount:,}円")
+    if total <= 0:
+        await message.channel.send("固定お小遣いが設定されている子がいないよ。")
+        return True
+
+    from app import parent_confirm as pc
+    pc.put_pending(int(message.author.id), "bulk_grant", {})
+    await message.channel.send(
+        pc.build_confirmation("bulk_grant", "", total, extra=" / ".join(detail_lines))
+    )
     return True
 
 

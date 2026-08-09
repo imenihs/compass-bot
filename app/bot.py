@@ -245,6 +245,13 @@ async def _handle_parent_confirmation_reply(system_conf, message, input_block: s
     args = dict(rec.get("args") or {})
     # 冪等キーは確認 ID から作る。同じ確認が二重に実行されないようにする
     args.setdefault("operation_key", f"confirm-{rec.get('token')}")
+
+    # 一括支給は wallet tool ではなく Discord 側の処理なので、tool 経由の実行と分ける
+    if action == "bulk_grant":
+        await handlers_parent.execute_bulk_grant(message)
+        _log_runtime_event(system_conf, message, None, input_block,
+                           "parent_confirm_executed", {"action": action})
+        return True
     try:
         from app import mcp_wallet
         # 親モードとして実行する。tool 側の検証（対象児の実在・金額範囲・上限・冪等）は通る
