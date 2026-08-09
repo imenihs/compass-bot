@@ -113,6 +113,8 @@ ALLOWED_PARENT_TOOLS = [
     "mcp__wallet__parent_reject_assessment",
     "mcp__wallet__parent_list_balances",
     "mcp__wallet__parent_get_pending",
+    # お金を動かす前に親へ確認を出す（N-11.17 の Python 境界）
+    "mcp__wallet__parent_confirm_money_action",
     # 約束の承認・履行記録（N-11.18）。確定は親だけができる
     "mcp__wallet__parent_list_promises",
     "mcp__wallet__parent_approve_promise",
@@ -849,6 +851,11 @@ async def _spawn_claude(prompt: str, session_id: str | None, system_prompt: str,
         child_env.pop("COMPASS_ACTIVE_CHILD", None)
         child_env["COMPASS_PARENT_MODE"] = "1"
         child_env["COMPASS_ALLOW_ADMIN_OPS"] = "1"
+        # 発話した親の Discord ID を渡す（N-11.17）。確認待ちは親ごとに保持するため、
+        # 別プロセスの mcp_wallet からも「誰へ確認を出すか」が分かる必要がある。
+        # 親モードでは child_name に session_key（"parent:<id>"）が入る。
+        if str(child_name or "").startswith("parent:"):
+            child_env["COMPASS_PARENT_DISCORD_ID"] = str(child_name).split(":", 1)[1]
     else:
         # 子モード: 発話者を束縛して渡す。mcp_wallet はこの子だけを操作対象にする
         child_env["COMPASS_ACTIVE_CHILD"] = child_name

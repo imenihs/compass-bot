@@ -17,9 +17,13 @@ A 案（言葉の解釈を AI に任せる）へ移すにあたり、この非�
 「実測でゼロ」と「構造上起こり得ない」は別である。金銭は取り返しがつかないため、
 人が捕まえられる経路を残す。
 """
+import json
+import os
+import tempfile
 import threading
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from app.storage import JST
 
@@ -27,11 +31,46 @@ from app.storage import JST
 # 親が席を外して戻ってきた程度は許容しつつ、取り違えは防ぐ長さにする。
 CONFIRM_WAIT_SEC = 300
 
-# 親ごとの確認待ち。{parent_id: {...}}
+# 確認待ちの保存先。**ファイルに置く**。
+# 確認を積むのは mcp_wallet（別プロセス）、読んで実行するのは bot プロセスであり、
+# メモリ保持ではプロセスを跨げない（実測で bot 側から見えないことを確認済み）。
 # 1人につき1件だけ保持する。複数を並べると「どれへの返事か」が曖昧になり取り違えるため、
 # 新しい確認を出した時点で古いものは破棄する（親には新しい確認文だけが見えている）。
-_PENDING: dict[int, dict] = {}
 _LOCK = threading.RLock()
+ROOT = Path(__file__).resolve().parents[1]
+PENDING_PATH = ROOT / "data" / "parent_confirm_pending.json"
+
+
+def _interprocess_lock():
+    """プロセス間ロック。bot と mcp_wallet の両方が読み書きするため必須。"""
+    from app.wallet_service import _interprocess_lock as _lk
+    return _lk(PENDING_PATH.with_suffix(".json.lock"))
+
+
+def _load() -> dict:
+    """確認待ちを読む。壊れていても動作を止めず空で返す。"""
+    try:
+        if not PENDING_PATH.exists():
+            return {}
+        with open(PENDING_PATH, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save(doc: dict) -> None:
+    """一時ファイル＋置換で保存する（書き込み途中の破損を避ける）。"""
+    PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(PENDING_PATH.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        Path(tmp).replace(PENDING_PATH)
+    except Exception:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 # 同意・拒否とみなす返事。完全一致で見る（「はい、でも金額は…」のような曖昧な返事は同意にしない）
 _YES = ("はい", "OK", "ok", "オッケー", "うん", "そう", "実行", "お願い", "おねがい")
@@ -91,11 +130,13 @@ def put_pending(parent_id: int, action: str, args: dict,
     """
     stamp = (now or datetime.now(JST)).timestamp()
     token = uuid.uuid4().hex[:8]
-    with _LOCK:
+    with _LOCK, _interprocess_lock():
+        doc = _load()
         # 古い確認は破棄する。複数保持すると「どれへの返事か」が曖昧になる
-        _PENDING[int(parent_id)] = {
+        doc[str(int(parent_id))] = {
             "token": token, "action": action, "args": dict(args or {}), "ts": stamp,
         }
+        _save(doc)
     return token
 
 
@@ -121,8 +162,11 @@ def take_pending(parent_id: int, now: datetime | None = None) -> dict | None:
     取り出したら必ず消す。同じ確認で二重に実行されるのを防ぐ。
     """
     cur = (now or datetime.now(JST)).timestamp()
-    with _LOCK:
-        rec = _PENDING.pop(int(parent_id), None)
+    with _LOCK, _interprocess_lock():
+        doc = _load()
+        rec = doc.pop(str(int(parent_id)), None)
+        if rec is not None:
+            _save(doc)
     if not rec:
         return None
     if (cur - float(rec.get("ts", 0))) > CONFIRM_WAIT_SEC:
@@ -133,12 +177,14 @@ def take_pending(parent_id: int, now: datetime | None = None) -> dict | None:
 
 def peek_pending(parent_id: int) -> dict | None:
     """確認待ちの有無だけを見る（消さない）。"""
-    with _LOCK:
-        rec = _PENDING.get(int(parent_id))
+    with _LOCK, _interprocess_lock():
+        rec = _load().get(str(int(parent_id)))
     return dict(rec) if rec else None
 
 
 def clear_pending(parent_id: int) -> None:
     """確認待ちを破棄する（キャンセル時）。"""
-    with _LOCK:
-        _PENDING.pop(int(parent_id), None)
+    with _LOCK, _interprocess_lock():
+        doc = _load()
+        if doc.pop(str(int(parent_id)), None) is not None:
+            _save(doc)

@@ -197,6 +197,76 @@ def _load_safety_history(child_name: str, days: int = 30) -> list:
     return out
 
 
+
+async def _handle_parent_confirmation_reply(system_conf, message, input_block: str) -> bool:
+    """確認待ちに対する親の「はい/いいえ」を処理する（N-11.17 の Python 境界）。
+
+    確認文は Python が組み立てて出しており、ここでも **Python が保持した値をそのまま実行**する。
+    AI を経由しないため、親が画面で見た内容と実際に動く値が必ず一致する。
+    AI が対象や金額を取り違えていた場合は、確認文の時点で親が気づける。
+
+    Args:
+        system_conf: システム設定（診断ログ用）。
+        message: 親のメッセージ。
+        input_block: 発話本文。
+
+    Returns:
+        bool: 返事として処理したら True（会話層へ流さない）。
+    """
+    from app import parent_confirm as pc
+
+    parent_id = int(message.author.id)
+    if pc.peek_pending(parent_id) is None:
+        return False
+
+    verdict = pc.classify_reply(input_block)
+    if verdict == "no":
+        pc.clear_pending(parent_id)
+        await message.channel.send("わかりました。今回はやめておきますね。")
+        _log_runtime_event(system_conf, message, None, input_block,
+                           "parent_confirm_cancelled", {})
+        return True
+    if verdict != "yes":
+        # 「はい」でも「いいえ」でもない発話は、確認への返事ではなく別の話とみなす。
+        # 確認は保持したまま会話層へ流す（親が言い直したいだけの場合を妨げない）。
+        return False
+
+    rec = pc.take_pending(parent_id)
+    if rec is None:
+        # 猶予切れ。古い同意で実行しない
+        await message.channel.send(
+            "確認から時間がたっていたので、いったんキャンセルしたよ。もう一度お願いね。"
+        )
+        _log_runtime_event(system_conf, message, None, input_block,
+                           "parent_confirm_expired", {})
+        return True
+
+    action = str(rec.get("action", ""))
+    args = dict(rec.get("args") or {})
+    # 冪等キーは確認 ID から作る。同じ確認が二重に実行されないようにする
+    args.setdefault("operation_key", f"confirm-{rec.get('token')}")
+    try:
+        from app import mcp_wallet
+        # 親モードとして実行する。tool 側の検証（対象児の実在・金額範囲・上限・冪等）は通る
+        prev_mode, prev_admin = mcp_wallet.PARENT_MODE, mcp_wallet.ALLOW_ADMIN_OPS
+        mcp_wallet.PARENT_MODE, mcp_wallet.ALLOW_ADMIN_OPS = True, True
+        try:
+            handler = mcp_wallet._HANDLERS.get(action)
+            result = handler(args) if handler else f"「{action}」は実行できない操作だよ。"
+        finally:
+            mcp_wallet.PARENT_MODE, mcp_wallet.ALLOW_ADMIN_OPS = prev_mode, prev_admin
+        await message.channel.send(result)
+        _log_runtime_event(system_conf, message, None, input_block,
+                           "parent_confirm_executed",
+                           {"action": action, "args": {k: v for k, v in args.items()
+                                                       if k != "operation_key"}})
+    except Exception as e:
+        await message.channel.send(operation_failure_message("実行"))
+        _log_runtime_event(system_conf, message, None, input_block,
+                           "parent_confirm_failed",
+                           {"action": action, "error": f"{type(e).__name__}: {e}"})
+    return True
+
 async def _handle_safety_signal(system_conf, message, user_conf, input_block, judgment: dict) -> None:
     """危険信号を検知したときの送信を担う（N-11.16）。
 
@@ -941,6 +1011,13 @@ async def _on_message_impl(message: discord.Message):
             user_conf = channel_child_conf
             selected_user_source = "parent_channel_context"
         else:
+            # 確認待ちがあるなら、この発話を「はい/いいえ」の返事として先に処理する（N-11.17）。
+            # AI を通さず Python が保持した値をそのまま実行するため、
+            # 親が見た確認文の内容と、実際に動く値が必ず一致する。
+            if await _handle_parent_confirmation_reply(system_conf, message, input_block):
+                _mark_thinking_sent(message, True)
+                return
+
             # 親が子チャンネル外（親専用チャンネル等）で自然文を送った → 親AI会話へ流す。
             # AI が親の意図を判断して親用 tool（支給・調整・承認等）を呼ぶ。金額・対象は AI に推測させず、
             # 親が明示した値だけを tool に渡す設計（mcp_wallet 側で PARENT_MODE・対象児実在・金額検証・冪等）。

@@ -90,10 +90,47 @@ def _test_pending_lifecycle():
            a["args"]["name"] == "X" and b["args"]["name"] == "Y", f"{a} {b}")
 
 
+def _test_cross_process_visibility():
+    """別プロセスが積んだ確認を、bot プロセスから読めること。
+
+    確認を積むのは mcp_wallet（claude が起動する別プロセス）、
+    読んで実行するのは bot プロセスである。当初メモリ保持で実装したところ
+    **bot 側から一切見えず**、確認が機能しないことを実測で発見した。
+    ファイル保持へ変更した経緯があるため、プロセス跨ぎを回帰テストで固定する。
+    """
+    import subprocess
+
+    pc.clear_pending(97001)
+    script = (
+        'import sys, os; sys.path.insert(0,"%s")\n'
+        'os.environ["COMPASS_PARENT_MODE"]="1"\n'
+        'os.environ["COMPASS_ALLOW_ADMIN_OPS"]="1"\n'
+        'os.environ["COMPASS_PARENT_DISCORD_ID"]="97001"\n'
+        'from app import mcp_wallet as m\n'
+        'm.PARENT_MODE=True; m.ALLOW_ADMIN_OPS=True\n'
+        'm._do_parent_confirm_money_action('
+        '{"action":"grant","name":"テスト","amount":500,"reason":"回帰"})\n'
+        % ROOT
+    )
+    subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    try:
+        rec = pc.peek_pending(97001)
+        _check("cross_process_pending_visible", rec is not None, rec)
+        if rec:
+            _check("cross_process_action_is_exec_name",
+                   rec["action"] == "parent_grant", rec["action"])
+            _check("cross_process_args_preserved",
+                   rec["args"].get("name") == "テスト" and rec["args"].get("amount") == 500,
+                   rec["args"])
+    finally:
+        pc.clear_pending(97001)
+
+
 def main():
     _test_confirmation_text_is_built_by_python()
     _test_reply_classification()
     _test_pending_lifecycle()
+    _test_cross_process_visibility()
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))
