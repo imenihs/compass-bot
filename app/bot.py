@@ -852,15 +852,14 @@ async def on_ready():
 
 async def _on_ready_impl():
     print(f"Compass logged in as {client.user}")
-    # 再起動をまたいだ確認待ちは破棄する。
-    # 親は数分前に出た確認文のことを覚えていないし、コード側の保存形式が
-    # 変わっている場合もある（旧形式の確認に「はい」と答えると噛み合わない）。
-    # 消しても親が困らない（もう一度コマンドを打てばよい）ので、安全側に倒す。
+    # 猶予を過ぎた確認待ちだけ掃除する。
+    # 全消しにしないのは、discord.py が再接続のたびに on_ready を再発火するため。
+    # 全消しだと、親が確認文を読んで「はい」と打つ間の瞬断で確認が消えてしまう。
     try:
         from app import parent_confirm as pc
-        pc.clear_all_pending()
+        pc.clear_stale_pending()
     except Exception as exc:  # noqa: BLE001 - 起動を止めない
-        print("clear_pending on boot failed:", exc)
+        print("clear_stale_pending on boot failed:", exc)
     conflicts = get_discord_id_conflicts()
     for conflict in conflicts:
         print(

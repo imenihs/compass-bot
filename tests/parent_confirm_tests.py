@@ -52,7 +52,12 @@ def _test_reply_classification():
                        # 迷いの表れ（読点や三点リーダの連続）は同意にしない。
                        # 「そう」は相槌にもなる弱い同意なので単独では受けない
                        ("そう", "other"), ("そう、、、", "other"), ("うん、、、", "other"),
-                       ("はい…", "other"), ("たぶんはい", "other")]:
+                       ("はい…", "other"), ("たぶんはい", "other"),
+                       # 反復は受け流しなので同意にしない
+                       ("はいはい", "other"), ("うんうん", "other"),
+                       # 拒否の取りこぼしは確認が残り、後の「はい」で実行されうるので広めに取る
+                       ("いや", "no"), ("いやだ", "no"), ("やめとく", "no"),
+                       ("しない", "no"), ("却下", "no"), ("取り消し", "no")]:
         got = pc.classify_reply(text)
         _check(f"reply[{text[:14] or 'empty'}]", got == want, got)
 
@@ -134,8 +139,38 @@ def _test_cross_process_visibility():
         pc.clear_pending(97001)
 
 
+def _test_boot_cleanup_keeps_live_confirmations():
+    """起動時の掃除が、**生きている確認を消さない**こと。
+
+    discord.py は再接続のたびに on_ready を再発火する。
+    起動時に全件消す実装にすると、親が確認文を読んで「はい」と打つ間に
+    ネットワークが瞬断しただけで確認が消え、操作が理不尽に失われる。
+    どのみち take_pending が猶予で弾くので、掃除するのは無効なものだけでよい。
+    """
+    now = datetime.now(JST)
+
+    pc.clear_pending(9201)
+    pc.clear_pending(9202)
+    # 出したばかりの確認（親がこれから答える）
+    pc.put_pending(9201, "parent_grant", {"name": "たろう", "amount": 100}, now)
+    # 猶予を過ぎた確認（もう無効）
+    pc.put_pending(9202, "parent_grant", {"name": "はな", "amount": 200},
+                   now - timedelta(seconds=pc.CONFIRM_WAIT_SEC + 100))
+
+    removed = pc.clear_stale_pending(now)
+    _check("boot_cleanup_removes_only_stale", removed == 1, removed)
+    _check("boot_cleanup_keeps_live", pc.peek_pending(9201) is not None,
+           pc.peek_pending(9201))
+    _check("boot_cleanup_drops_expired", pc.peek_pending(9202) is None,
+           pc.peek_pending(9202))
+
+    pc.clear_pending(9201)
+    pc.clear_pending(9202)
+
+
 def main():
     _test_confirmation_text_is_built_by_python()
+    _test_boot_cleanup_keeps_live_confirmations()
     _test_reply_classification()
     _test_pending_lifecycle()
     _test_cross_process_visibility()

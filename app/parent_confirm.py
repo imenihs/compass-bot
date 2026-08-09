@@ -79,8 +79,12 @@ def _save(doc: dict) -> None:
 _YES = ("はい", "OK", "ok", "Ok", "ＯＫ", "yes", "Yes", "YES", "オッケー", "うん",
         "実行", "実行して", "お願い", "おねがい", "お願いします", "おねがいします",
         "いいよ", "了解", "了解です", "りょうかい", "わかった", "そうして")
-_NO = ("いいえ", "no", "No", "やめる", "やめて", "キャンセル", "cancel",
-       "ちがう", "違う", "だめ", "ダメ", "取り消し", "とりけし")
+# 拒否とみなす語。取りこぼすと確認が保持されたままになり、
+# 親が後で別の文脈で言った「はい」で実行されうるため、同意語より広めに取る。
+_NO = ("いいえ", "no", "No", "NO", "やめる", "やめて", "やめとく", "やめておく",
+       "キャンセル", "cancel", "ちがう", "違う", "だめ", "ダメ", "だめだ",
+       "取り消し", "とりけし", "取消", "いや", "いやだ", "しない", "やらない",
+       "なし", "却下")
 
 
 def build_confirmation(action: str, child_name: str, amount, extra: str = "") -> str:
@@ -239,19 +243,31 @@ def describe_superseded(superseded: dict | None) -> str:
     return f"※ さっきの「{who}{label}」の確認は取り消したよ。こっちに答えてね。\n\n"
 
 
-def clear_all_pending() -> int:
-    """確認待ちを全て破棄する（起動時に呼ぶ）。
+def clear_stale_pending(now: datetime | None = None) -> int:
+    """猶予を過ぎた確認待ちだけを破棄する（起動時に呼ぶ）。
 
-    再起動をまたいだ確認は、親がもう覚えていないうえ、
-    保存形式が変わっている可能性もある（旧形式に「はい」と答えると噛み合わない）。
-    消しても親はコマンドを打ち直せばよいだけなので、安全側に倒す。
+    再起動をまたいだ確認は、親がもう覚えていないうえ、保存形式が
+    変わっている可能性もある（旧形式に「はい」と答えると噛み合わない）。
+
+    ただし**全件消してはいけない**。discord.py は再接続のたびに on_ready を
+    再発火するため、全消しにすると「親が確認を読んで『はい』と打つ間に
+    ネットワークが瞬断したら確認が消える」という理不尽が起きる。
+    どのみち take_pending が CONFIRM_WAIT_SEC で弾くので、
+    ここで消すのは既に無効なものだけでよい。
+
+    Args:
+        now: 現在時刻（テスト用）。
 
     Returns:
         int: 破棄した件数。
     """
+    cur = (now or datetime.now(JST)).timestamp()
     with _LOCK, _interprocess_lock():
         doc = _load()
-        n = len(doc)
-        if n:
-            _save({})
-    return n
+        stale = [k for k, v in doc.items()
+                 if (cur - float(v.get("ts", 0))) > CONFIRM_WAIT_SEC]
+        for k in stale:
+            doc.pop(k, None)
+        if stale:
+            _save(doc)
+    return len(stale)

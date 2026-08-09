@@ -233,16 +233,18 @@ def _parse_follow_policy_updates(text: str) -> tuple[dict, str]:
             updates["focus_area"] = value
             break
 
-    # 設定語は **値の先頭にあるときだけ** 拾う（N-11.17・有識者反証）。
-    # どこにあっても拾うと「今の方針は軽めだっけ」のような質問文に含まれる
-    # 「軽め」で実設定が書き換わる。指示なら「軽め …」と先頭に来るのが自然。
+    # 設定語は文中どこにあっても拾う。
+    # 「とりあえず軽めで」「今日から軽めにして」のように、
+    # 親は設定語を文頭に置くとは限らないため（先頭限定にすると大量に取りこぼす）。
+    # 質問・回想との切り分けは _looks_like_question と、
+    # 呼び出し側の「変化が無ければ保存しない」で担保する。
     for needle, value in _FOLLOW_POLICY_STRENGTH_ALIASES.items():
-        if body.startswith(needle) or normalized.startswith(needle):
+        if needle in body or needle in normalized:
             updates["nudge_strength"] = value
             break
 
     for needle, value in _FOLLOW_POLICY_FREQUENCY_ALIASES.items():
-        if body.startswith(needle) or normalized.startswith(needle):
+        if needle in body or needle in normalized:
             updates["frequency"] = value
             break
 
@@ -717,8 +719,15 @@ _QUESTION_SUFFIXES = (
 # という取りこぼしを防ぐ（有識者の再反証で判明）。
 _TRAILING_PARTICLES = "のよねなさかぁあーっ〜 　"
 
-# 引用・伝聞の形。過去の設定を話題にしているだけで、新しい指示ではない。
-_QUOTE_MARKERS = ("って設定した", "って言った", "ってしたっけ", "と設定した")
+# 引用・伝聞・回想の形。過去の設定を話題にしているだけで、新しい指示ではない。
+# 「軽めにしてたと思うんだけど」のように、指示と同じ語を含みつつ
+# 実際は現状の確認をしている言い回しをここで捕まえる。
+_QUOTE_MARKERS = (
+    "って設定した", "って言った", "ってしたっけ", "と設定した",
+    "にしてた", "してたっけ", "だったっけ", "と思ってた", "と思うんだけど",
+    "って前に", "って言ってた", "じゃなかった", "ではなかった",
+    "って合ってる", "で合ってる", "って前の", "って昔",
+)
 
 
 def _looks_like_question(text: str) -> bool:
@@ -807,6 +816,21 @@ async def maybe_handle_followup_policy(message: discord.Message, content: str) -
             return True
         updates = {"frequency": updates["frequency"]}
         note = current_policy["parent_note"]
+
+    # 設定語が1つも取れていないなら、それは指示ではなく雑談・質問の可能性が高い。
+    # **黙って parent_note だけ書き換えない**（N-11.17・有識者反証）。
+    # ここで保存すると、親には「保存したよ」と出るのに強さ・頻度は変わっておらず、
+    # しかも指示のつもりで書いた文が parent_note として子の AI プロンプトに載る。
+    # 言い回しの網羅で質問と指示を分けるのは限界があるため、
+    # 「何も変わらない保存はしない」という構造側の歯止めを置く。
+    if not updates:
+        await message.channel.send(
+            _follow_policy_summary(target_name, current_policy)
+            + "\n\n（強さ・頻度の指定が読み取れなかったので、設定は変えていないよ。"
+            "「フォロー方針 " + target_name + " 軽め」のように、"
+            "`軽め` `普通` `必要なときだけ` のどれかを入れて送ってね）"
+        )
+        return True
 
     note_error = _follow_policy_note_error(note)
     if note_error:
