@@ -325,7 +325,7 @@ def test_user_settings_endpoint_updates_child_settings() -> None:
             json.dumps(
                 {
                     "name": "はな",
-                    "discord_user_id": 101,
+                    "discord_user_id": 123456789012345678,
                     "age": 7,
                     "gender": "female",
                     "fixed_allowance": 300,
@@ -352,6 +352,8 @@ def test_user_settings_endpoint_updates_child_settings() -> None:
                     user_type="child",
                     original_name="はな",
                     name="はな",
+                    # Discord ID は Web から変更できない（UUID認証の本人性の根拠のため）。
+                    # 既存と同じ値を渡す＝変更しないケースは通る
                     discord_user_id="123456789012345678",
                     age="9",
                     gender="female",
@@ -460,13 +462,14 @@ def test_user_settings_endpoint_updates_parent_settings() -> None:
                     user_type="parent",
                     original_name="親",
                     name="親",
-                    discord_user_id="2025555555",
+                    # 既存(202)と同じ値。Discord ID は Web から変更できない
+                    discord_user_id="202",
                 )
             )
             assert response.status_code == 303
             saved = json.loads(parent_path.read_text(encoding="utf-8"))
             assert saved["name"] == "親"
-            assert saved["discord_user_id"] == 2025555555
+            assert saved["discord_user_id"] == 202
         finally:
             server._get_current_user = old_get_current_user
             server._is_admin = old_is_admin

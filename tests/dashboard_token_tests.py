@@ -259,6 +259,35 @@ def _test_url_reissue_command():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_discord_id_cannot_be_changed_from_web():
+    """Web から discord_user_id を変更できないこと。
+
+    Discord ID は「URL再発行を打ったのが本人か」を判定する唯一の根拠。
+    Web の権限を得た者がこれを自分のものへ書き換えると、
+    **再発行の主が入れ替わり、認証の防御が丸ごと無効になる**（codex 指摘）。
+    """
+    import ast
+
+    src = (ROOT / "app" / "server.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    # 「既存IDと違う値が来たら拒否する」ガードが存在すること
+    found_guard = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        dumped = ast.dump(node)
+        if "existing_id" in dumped and "discord_id" in dumped:
+            found_guard = True
+            break
+    _check("web_forbids_discord_id_change", found_guard,
+           "server.py に既存IDとの不一致を拒否するガードが無い")
+
+    # 拒否メッセージが利用者に伝わる形であること
+    _check("web_explains_why_forbidden",
+           "Discord ID は Web からは変更できません" in src, "")
+
+
 def main():
     _test_issue_and_resolve()
     _test_invalid_tokens_are_rejected()
@@ -267,6 +296,7 @@ def main():
     _test_broken_file_does_not_crash()
     _test_user_key_split()
     _test_url_reissue_command()
+    _test_discord_id_cannot_be_changed_from_web()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

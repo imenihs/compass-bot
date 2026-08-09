@@ -1469,12 +1469,22 @@ def _build_user_stats(name: str, system_conf: dict, user_conf: Optional[dict] = 
     if _wallet_service and has_wallet:
         for g in _wallet_service.get_savings_goals(name):
             target = _safe_int(g.get("target_amount")) or 0
-            saved = balance if balance is not None else 0
+            # 進捗は **その目標に積んだ額**（accumulated）で見る（2026/08/10）。
+            # 総残高で見ると、目標が2つあるとき同じお金が両方に計上され、
+            # 残高が目標額を超えただけで達成扱いになる。
+            # 子ダッシュボードと同じ定義にそろえないと、同じ目標が親子で違う数字に見える。
+            saved = _safe_int(g.get("accumulated")) or 0
             pct = int(saved / target * 100) if target > 0 else 0
+            kind = str(g.get("kind", "saving"))
             goals.append({
                 "title": g.get("title", ""),
+                # 立て替え返済は親が見て区別できるようにする
+                "kind": kind,
+                "label": "返済" if kind == "advance" else "貯金",
                 "target": target,
                 "saved": saved,
+                "remaining": max(target - saved, 0),
+                "status": str(g.get("status", "active")),
                 "pct": min(pct, 100),
             })
 
@@ -2132,7 +2142,16 @@ async def op_user_settings(
 
     updated = dict(current_data)
     updated["name"] = new_name
-    updated["discord_user_id"] = discord_id
+    # **discord_user_id は Web から変更させない**（2026/08/10・UUID認証の前提）。
+    # Discord ID は「URL再発行を打ったのが本人か」を判定する唯一の根拠であり、
+    # Web の権限を得た者がこれを自分のものへ書き換えると、
+    # 再発行の主が入れ替わって認証の防御が丸ごと無効になる。
+    # 変更が必要なときは設定ファイルを直接編集する（サーバへ入れる人だけができる）。
+    existing_id = _safe_int(current_data.get("discord_user_id")) or 0
+    if existing_id and discord_id and int(discord_id) != existing_id:
+        return _op_redirect(
+            error="Discord ID は Web からは変更できません（設定ファイルを直接編集してください）。")
+    updated["discord_user_id"] = existing_id or discord_id
 
     if scope == "parent":
         _save_settings_json(path, updated)
