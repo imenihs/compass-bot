@@ -137,10 +137,43 @@ def _test_resolution_chain_not_broken():
            "if proxy_name → elif is_parent の連鎖が切れている（間に文を挿入していないか確認）")
 
 
+def _test_parent_can_talk_in_child_channel():
+    """親が子チャンネルで会話できること。遮るのは「子の記録になる形」だけ。
+
+    子チャンネルには親も入っており、親が子と話すのは当然の使い方である。
+    以前は親の自然文を一律で遮っており、「なぜ一万1000円使ったの？」のような
+    問いかけまでブロックされて会話が成立しなかった（実機ログで確認）。
+    止めるべきは「300円使った」のような完了した記録だけで、これを親が書くと
+    COMPASS_ACTIVE_CHILD=その子で record_expense が走り、親の発話で子の残高が動く。
+    """
+    from app.bot import _parent_utterance_moves_money as moves
+
+    # 通すべき: 問いかけ・相談・雑談（金額を含んでいても記録ではない）
+    for text in [
+        "なぜ一万1000円使ったの？",
+        "なぜかあちゃんの話に応答しないの？",
+        "この話はもう必要ない",
+        "今日はどうだった？",
+        "300円のお菓子どうだった？",
+        "かき氷のシロップ、1500円って高くない？",
+        "5000円のゲーム買うか迷ってるんだって？",
+        "お小遣い足りてる？",
+    ]:
+        _check(f"parent_can_talk[{text[:18]}]", moves(text) is False, moves(text))
+
+    # 遮るべき: 親が書くと子の記録として登録されてしまう形
+    for text in ["300円使った", "500円もらった", "お菓子を200円で買った"]:
+        _check(f"parent_money_record_blocked[{text[:14]}]", moves(text) is True, moves(text))
+
+    # 金額が無ければそもそも記録にならない
+    _check("no_amount_not_blocked", moves("お菓子買ったよ") is False, moves("お菓子買ったよ"))
+
+
 def main():
     _test_channel_context_resolves_child()
     _test_parent_child_same_id_lookup_order()
     _test_resolution_chain_not_broken()
+    _test_parent_can_talk_in_child_channel()
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))

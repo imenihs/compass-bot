@@ -459,6 +459,42 @@ def _is_child_user_name(name: str) -> bool:
     return any(str(u.get("name", "")).strip() == target for u in load_all_users())
 
 
+def _parent_utterance_moves_money(input_block: str) -> bool:
+    """親の自然文が「子の記録として登録されてしまう」形かを判定する（2026/08/09 新設）。
+
+    子チャンネルには親も入っており、親が子と会話するのは当然の使い方である。
+    以前は親の自然文を一律で遮っており、親が子チャンネルで一切会話できなくなっていた
+    （「なぜ一万1000円使ったの？」のような問いかけまで遮断された）。
+
+    止めたいのは1つだけで、「300円使った」「500円もらった」のような**完了した記録**を
+    親が書くと、COMPASS_ACTIVE_CHILD=その子で record_expense / record_income が走り、
+    親の発話で子の実残高が動いてしまうことである。
+
+    よって「金額 + 完了した収支の動詞」が揃うときだけ True にする。
+    問いかけ・相談・雑談・過去形の疑問はすべて通す。
+
+    Args:
+        input_block: 親の発話本文。
+
+    Returns:
+        bool: 記録として解釈されうる形なら True（遮る）。
+    """
+    body = (input_block or "").strip()
+    if not body:
+        return False
+    # 金額の言及が無ければ記録になりようがない
+    if not re.search(r"\d[\d,]*\s*円|[〇一二三四五六七八九十百千万]+\s*円", body):
+        return False
+    # 疑問・相談・仮定は記録ではない。ここを先に見て通す
+    if re.search(r"[?？]|だっけ|かな|かしら|べき|どう(する|かな|だろ)|なぜ|なんで|どうして|"
+                 r"らしい|そう(だ|です)ね|みたい|かも", body):
+        return False
+    # 完了した収支の動詞。過去・完了の形だけを拾う（「買いたい」「使うつもり」は対象外）
+    done = re.search(r"(使った|つかった|買った|かった|払った|はらった|"
+                     r"もらった|貰った|入った)", body)
+    return bool(done)
+
+
 def _parent_natural_management_guide(input_block: str) -> str | None:
     """親の自然文による管理要求を明示コマンドへ誘導する文面を返す"""
     body = input_block or ""
@@ -1058,10 +1094,19 @@ async def _on_message_impl(message: discord.Message):
     author_is_this_channel_child = (
         author_child_conf is not None and author_child_id == target_child_id
     )
-    if is_parent(message.author.id) and not proxy_name and not author_is_this_channel_child:
+    # 親が子チャンネルで話すこと自体は当然あるので遮らない（子チャンネルには親も入っている）。
+    # 遮るのは「親の自然文が、子の実残高を動かす記録として解釈されうる」場合だけに限る。
+    # 例:「300円使った」を親が書くと COMPASS_ACTIVE_CHILD=その子で record_expense が走り、
+    #     親の発話で子の残高が動く。これは止める必要がある。
+    # 一方「なぜ一万1000円使ったの？」のような問いかけ・相談・雑談は通す。
+    # 以前は親の発話を一律で遮っており、親が子チャンネルで一切会話できなくなっていた（2026/08/09 修正）。
+    looks_like_money_record = _parent_utterance_moves_money(input_block)
+    if (is_parent(message.author.id) and not proxy_name
+            and not author_is_this_channel_child and looks_like_money_record):
         await message.channel.send(
-            "お子さんのお小遣いを動かすときは、明示コマンドか `お子さんの名前の代理 〜` で話しかけてね。"
-            "（このチャンネルの自然文はお子さん本人用だよ）"
+            "そのまま書くと、お子さんの記録として登録されちゃうよ。\n"
+            "お金を動かすときは明示コマンドか `お子さんの名前の代理 〜` で話しかけてね。\n"
+            "（お子さんとのふつうの会話は、そのまま話しかけて大丈夫だよ）"
         )
         _log_runtime_event(
             system_conf, message, user_conf, input_block,
