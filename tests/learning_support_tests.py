@@ -406,7 +406,7 @@ def test_user_order_endpoint_saves_normalized_dashboard_order() -> None:
             server._is_admin = lambda username: username == "parent"
             server.load_all_users = lambda: [
                 {"name": "はな", "discord_user_id": 101},
-                {"name": "ゆい", "discord_user_id": 102},
+                {"name": "みらい", "discord_user_id": 102},
             ]
             server.load_all_parents = lambda: [{"name": "親", "discord_user_id": 202}]
             server.SETTING_PATH = setting_path
@@ -414,12 +414,12 @@ def test_user_order_endpoint_saves_normalized_dashboard_order() -> None:
             response = asyncio.run(
                 server.op_user_order(
                     session_token="token",
-                    user_order=json.dumps(["parent:親", "child:ゆい", "child:不在", "child:はな"], ensure_ascii=False),
+                    user_order=json.dumps(["parent:親", "child:みらい", "child:不在", "child:はな"], ensure_ascii=False),
                 )
             )
             assert response.status_code == 303
             saved = json.loads(setting_path.read_text(encoding="utf-8"))
-            assert saved["web_dashboard"]["user_order"] == ["parent:親", "child:ゆい", "child:はな"]
+            assert saved["web_dashboard"]["user_order"] == ["parent:親", "child:みらい", "child:はな"]
         finally:
             server._get_current_user = old_get_current_user
             server._is_admin = old_is_admin

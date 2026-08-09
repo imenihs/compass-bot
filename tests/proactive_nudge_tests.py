@@ -642,7 +642,7 @@ async def test_safety_signal_blocks_proactive_nudge() -> None:
     )
     assert service._has_recent_safety_signal(tmp, "たろう", now) is True, "直近の危険信号がある子には送らない"
     assert service._has_recent_safety_signal(tmp, "はな", now) is False, "猶予を過ぎたら通常どおり送る"
-    assert service._has_recent_safety_signal(tmp, "ゆい", now) is False, "検知の無い子は通常どおり送る"
+    assert service._has_recent_safety_signal(tmp, "みらい", now) is False, "検知の無い子は通常どおり送る"
 
     empty = Path(_tempfile.mkdtemp())
     assert service._has_recent_safety_signal(empty, "たろう", now) is False, "ログが無ければ通常どおり送る"

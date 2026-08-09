@@ -354,8 +354,8 @@ def _test_consent_flow():
            safety.record_consent_reply("はな", "いいよ", now + safety.CONSENT_WAIT_SEC + 10) is False)
 
     # 沈黙は unknown（拒否と区別する）
-    safety.mark_consent_pending("ゆい", "bullying", now)
-    _check("consent_silence_is_unknown", safety.take_consent("ゆい") == "unknown")
+    safety.mark_consent_pending("みらい", "bullying", now)
+    _check("consent_silence_is_unknown", safety.take_consent("みらい") == "unknown")
     safety._CONSENT_PENDING.clear()
 
 

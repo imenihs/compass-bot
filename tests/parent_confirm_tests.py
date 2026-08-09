@@ -65,7 +65,7 @@ def _test_pending_lifecycle():
     _check("pending_expires", expired is None, expired)
 
     # 猶予内なら有効
-    pc.put_pending(9003, "grant", {"name": "ゆい", "amount": 100}, now)
+    pc.put_pending(9003, "grant", {"name": "みらい", "amount": 100}, now)
     alive = pc.take_pending(9003, now + timedelta(seconds=pc.CONFIRM_WAIT_SEC - 10))
     _check("pending_valid_within_window", alive is not None, alive)
 

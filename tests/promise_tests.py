@@ -92,9 +92,9 @@ def _test_limits_and_validation():
     try:
         ps = PromiseService(data_dir=tmp)
         for i in range(MAX_ACTIVE_PROMISES):
-            ok, _pid, _ = ps.create_draft("ゆい", f"約束{i}", "test", 3)
+            ok, _pid, _ = ps.create_draft("みらい", f"約束{i}", "test", 3)
             _check(f"create_within_limit[{i}]", ok is True)
-        ok_over, _pid, msg = ps.create_draft("ゆい", "はみ出し", "test", 3)
+        ok_over, _pid, msg = ps.create_draft("みらい", "はみ出し", "test", 3)
         _check("create_over_limit_rejected", ok_over is False, msg)
 
         # 別の子は影響を受けない
