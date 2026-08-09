@@ -529,9 +529,12 @@ def _looks_like_parent_only_command(input_block: str) -> bool:
     body = (input_block or "").strip()
     if not body:
         return False
+    # 引数なしの固定コマンドだけを挙げる。
+    # 「支給」「残高調整」は AI 経路へ畳んだため外した（コマンドとして存在しない）。
+    # これらは子も日常会話で使う言葉なので、残すと子の発話を誤って弾く。
     parent_prefixes = [
-        "支給", "残高調整", "設定変更", "アナウンス", "web承認",
-        "全体確認", "全員の分析",         "reminder test", "reminder-test", "リマインダーテスト",
+        "設定変更", "アナウンス", "web承認",
+        "全体確認", "全員の分析",
     ]
     if any(body.lower().startswith(prefix.lower()) for prefix in parent_prefixes):
         return True
@@ -711,8 +714,9 @@ def _should_send_unhandled_error_fallback(message: discord.Message) -> bool:
     if CHAT_SETTING.get("natural_chat_enabled") and not CHAT_SETTING.get("require_mention"):
         return True
     direct_command_prefixes = [
-        "使い方の説明", "つかいかたのせつめい", "支給", "残高調整", "設定変更",         "アナウンス", "web承認", "全体確認", "全員の分析",         "reminder test", "reminder-test", "リマインダーテスト", "フォロー方針", "フォロー強さ",
-        "フォロー頻度",
+        "使い方の説明", "つかいかたのせつめい", "設定変更",
+        "アナウンス", "web承認", "全体確認", "全員の分析",
+        "フォロー方針", "フォロー強さ", "フォロー頻度",
     ]
     return any(content.lower().startswith(prefix.lower()) for prefix in direct_command_prefixes)
 
@@ -867,14 +871,6 @@ async def _on_message_impl(message: discord.Message):
     if await handlers_parent.maybe_handle_spending_analysis(message, content):
         return
 
-    # 親による支給コマンド（「支給 たろう 700円」）
-    if await handlers_parent.maybe_handle_manual_grant(message, content):
-        return
-
-    # 親による残高調整コマンド（「残高調整 たろう +500円」）
-    if await handlers_parent.maybe_handle_balance_adjustment(message, content):
-        return
-
     # 親による設定変更コマンド（「設定変更 たろう 固定 800円」）
     if await handlers_parent.maybe_handle_user_setting_change(message, content):
         return
@@ -890,10 +886,6 @@ async def _on_message_impl(message: discord.Message):
 
     # 親によるWebダッシュボードアクセス申請の承認（「web承認 [ユーザー名]」）
     if await handlers_parent.maybe_handle_web_approve(message, content):
-        return
-
-    # 親による査定支給の承認/却下（「査定承認 [名前]」「査定却下 [名前]」）
-    if await handlers_parent.maybe_handle_assessment_approve(message, content):
         return
 
     mention_input = bot_mention_input

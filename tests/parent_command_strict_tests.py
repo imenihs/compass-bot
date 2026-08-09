@@ -89,43 +89,13 @@ def _run():
         for c in cases_block:
             before = bal()
             msg = _FakeMessage(c, 999)
-            # 3ハンドラを順に試す(bot.pyの順序を模擬)
-            asyncio.get_event_loop().run_until_complete(handlers_parent.maybe_handle_manual_grant(msg, c))
-            asyncio.get_event_loop().run_until_complete(handlers_parent.maybe_handle_balance_adjustment(msg, c))
-            asyncio.get_event_loop().run_until_complete(handlers_parent.maybe_handle_user_setting_change(msg, c))
-            _check(f"block::{c[:20]}", bal() == before, f"balance moved {before}->{bal()} on: {c}")
-
-        # --- 厳密コマンドは受理され、その場で実行される ---
-        # 確認ステップは置かない（お小遣い管理で毎回2ターンは割に合わない）。
-        # 取り違えは台帳に残るので後から追える。
-        before = bal()
-        c = "支給 はな 200円"
-        msg = _FakeMessage(c, 999)
-        handled = asyncio.get_event_loop().run_until_complete(
-            handlers_parent.maybe_handle_manual_grant(msg, c))
-        _check("exact_grant_applied", handled and bal() == before + 200, f"{before}->{bal()}")
-
-        before = bal()
-        c = "残高調整 はな -100円"
-        msg = _FakeMessage(c, 999)
-        handled = asyncio.get_event_loop().run_until_complete(
-            handlers_parent.maybe_handle_balance_adjustment(msg, c))
-        _check("exact_adjust_applied", handled and bal() == before - 100, f"{before}->{bal()}")
-        before = bal()
-        c = "支給 はな 200円"
-        msg = _FakeMessage(c, 999)
-        before = bal()
-        handled = asyncio.get_event_loop().run_until_complete(
-            handlers_parent.maybe_handle_manual_grant(msg, c))
-        _check("exact_grant_applied", handled and bal() == before + 200, f"{before}->{bal()}")
-
-        # --- 厳密コマンド(残高調整)もその場で実行される ---
-        before = bal()
-        c = "残高調整 はな -100円"
-        msg = _FakeMessage(c, 999)
-        handled = asyncio.get_event_loop().run_until_complete(
-            handlers_parent.maybe_handle_balance_adjustment(msg, c))
-        _check("exact_adjust_applied", handled and bal() == before - 100, f"{before}->{bal()}")
+            # 支給・残高調整・査定承認却下は AI 経路へ畳んだため、
+            # 残っているコマンドハンドラ（設定変更）だけを試す。
+            # 文中に引用されたコマンド文字列で設定や残高が動かないことを見る。
+            asyncio.get_event_loop().run_until_complete(
+                handlers_parent.maybe_handle_user_setting_change(msg, c))
+            _check(f"block::{c[:20]}", bal() == before,
+                   f"balance moved {before}->{bal()} on: {c}")
 
     # 固定コマンドが完全一致で判定され、順序依存が無いこと（N-11.17）
     from app import handlers_parent as _H
