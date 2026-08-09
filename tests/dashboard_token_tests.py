@@ -214,8 +214,13 @@ def _test_url_reissue_command():
         orig_extract = H.extract_input_from_mention
         H.extract_input_from_mention = lambda t, u: None
         try:
-            parent_ch = config.get_parent_channel_id()
-            child_ch = sorted(config.get_allow_channel_ids() or {0})[0]
+            # **本番設定を読まない**（設定変更でテストが落ちないようにする）。
+            # 判定に必要なのは「親チャンネルか否か」だけなので、
+            # is_parent_channel を差し替えて固定値で判別させる
+            parent_ch, child_ch = 9001, 9002
+            orig_is_parent_ch = H.is_parent_channel if hasattr(H, "is_parent_channel") else None
+            config.get_parent_channel_id = lambda: parent_ch
+            config.is_parent_channel = lambda cid: int(cid or 0) == parent_ch
             # 実データの兼務 ID（子「テスト」と親のどちらにも登録されている）
             dual_id = 111
 

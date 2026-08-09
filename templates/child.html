@@ -57,6 +57,15 @@
     .day-num { color: var(--muted); font-size: .75rem; }
     .amt-in { color: var(--in); display: block; }
     .amt-out { color: var(--out); display: block; }
+    td.has-entry { cursor: pointer; }
+    td.has-entry:hover { background: #232735; }
+    /* 内訳はセルの外に大きく出す（セルが狭いため） */
+    #detail-box {
+      margin-top: 10px; padding: 10px; background: #12141c;
+      border: 1px solid var(--line); border-radius: 8px; font-size: .8rem;
+    }
+    #detail-box:empty { display: none; }
+    #detail-box div { margin-top: 4px; }
 
     /* 目標バー */
     .goal { margin-bottom: 14px; }
@@ -115,11 +124,18 @@
               <td class="empty"></td>
             {% else %}
               {% set cell = calendar.days.get(day) %}
-              <td>
+              <td{% if cell %} class="has-entry" data-day="{{ day }}"{% endif %}>
                 <span class="day-num">{{ day }}</span>
                 {% if cell %}
                   {% if cell["in"] %}<span class="amt-in">+{{ "{:,}".format(cell["in"]) }}</span>{% endif %}
                   {% if cell["out"] %}<span class="amt-out">-{{ "{:,}".format(cell["out"]) }}</span>{% endif %}
+                  {# 内訳は ledger を子向けに射影したもの。運用メモや extra は含まない #}
+                  <div class="detail" hidden>
+                    <strong>{{ calendar.month }}月{{ day }}日</strong>
+                    {% for e in cell["entries"] %}
+                      <div>{{ e.label }} {{ "{:+,}".format(e.amount) }}円{% if e.note %}（{{ e.note }}）{% endif %}</div>
+                    {% endfor %}
+                  </div>
                 {% endif %}
               </td>
             {% endif %}
@@ -127,7 +143,8 @@
         </tr>
         {% endfor %}
       </table>
-      <p class="note">お金がうごいた日に、はいった額とつかった額が出るよ。</p>
+      <div id="detail-box"></div>
+      <p class="note">日にちをタップすると、その日のくわしい中みが見られるよ。</p>
     </section>
 
     {# ── 右: 貯蓄・返済グラフ ─────────────────── #}
@@ -184,7 +201,7 @@
     <label>けいさんのしかた</label>
     <select id="mode">
       <option value="per">1回にためる金額から、なん回かかるか</option>
-      <option value="months">なか月でためるか から、1回いくらか</option>
+      <option value="months">なんか月でためるか から、1回いくらか</option>
     </select>
 
     <label id="lbl">1回にためる金額（円）</label>
@@ -198,6 +215,17 @@
   </section>
 
   <script>
+    // カレンダーの日をタップすると、その日の内訳を下に出す。
+    // 内訳は ledger を子向けに射影したもので、運用メモや Discord ID は含まない
+    const detailBox = document.getElementById("detail-box");
+    document.querySelectorAll("td.has-entry").forEach(td => {
+      td.addEventListener("click", () => {
+        const detail = td.querySelector(".detail");
+        if (!detail) return;
+        detailBox.innerHTML = detail.innerHTML;
+      });
+    });
+
     // シミュレータは計算だけ。**残高には一切さわらない**（子の画面は閲覧専用）
     const target = document.getElementById("target");
     const mode = document.getElementById("mode");
