@@ -13,7 +13,6 @@ from app.bot_utils import (
     _build_goal_achieved_message,
     _load_jsonl,
     _normalize_japanese_command,
-    _spending_analysis_for_user,
     _usage_guide_text,
 )
 from app import config
@@ -506,50 +505,6 @@ async def maybe_handle_parent_dashboard(message: discord.Message, content: str) 
         )
 
     await message.channel.send("\n".join(lines))
-    return True
-
-
-async def maybe_handle_spending_analysis(message: discord.Message, content: str) -> bool:
-    """支出傾向分析コマンドを処理する: 「[name]の分析」または「全員の分析」（Feature 4、親専用）"""
-    # 親以外のアクセスは無視する
-    if not _is_parent(message.author.id):
-        return False
-
-    # メンション除去後の本文を取得する
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    body = mention_body if mention_body is not None else (content or "")
-    body_stripped = body.strip()
-
-    # 「全員の分析」パターン — 正規化後の表記でも反応する
-    all_match = "全員の分析" in body_stripped or "ぜんいんのぶんせき" in _normalize_japanese_command(body_stripped)
-    # 「[name]の分析」パターン — 名前部分を正規表現で抽出する
-    name_match = re.search(r"(.+)の分析", body_stripped)
-
-    # いずれのパターンにも該当しない場合は次のハンドラへ委譲する
-    if not all_match and not name_match:
-        return False
-
-    system_conf = load_system()
-    log_dir = get_log_dir(system_conf)
-    # 過去3ヶ月の集計基準日として現在時刻を使用する
-    now_dt = datetime.now(JST)
-
-    if all_match:
-        # 全ユーザーの分析テキストをまとめて生成する
-        users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-        parts = [_spending_analysis_for_user(log_dir, str(u.get("name", "")), now_dt) for u in users]
-        reply = "\n\n".join(parts) if parts else "ユーザーが見つからないよ。"
-    else:
-        # 特定ユーザー名を正規表現グループから取得する
-        target_name = name_match.group(1).strip()
-        reply = _spending_analysis_for_user(log_dir, target_name, now_dt)
-
-    # Discord の1メッセージ文字数上限（2000文字）を超えないよう 1900 文字で分割する
-    if len(reply) > 1900:
-        for i in range(0, len(reply), 1900):
-            await message.channel.send(reply[i: i + 1900])
-    else:
-        await message.channel.send(reply)
     return True
 
 

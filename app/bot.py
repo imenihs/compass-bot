@@ -533,12 +533,9 @@ def _looks_like_parent_only_command(input_block: str) -> bool:
     # 「支給」「残高調整」は AI 経路へ畳んだため外した（コマンドとして存在しない）。
     # これらは子も日常会話で使う言葉なので、残すと子の発話を誤って弾く。
     parent_prefixes = [
-        "設定変更", "アナウンス", "web承認",
-        "全体確認", "全員の分析",
+        "設定変更", "アナウンス", "web承認", "全体確認",
     ]
-    if any(body.lower().startswith(prefix.lower()) for prefix in parent_prefixes):
-        return True
-    return bool(re.match(r"^.+の分析\s*$", body))
+    return any(body.lower().startswith(prefix.lower()) for prefix in parent_prefixes)
 
 
 def _short_log_text(value, limit: int = 1200) -> str:
@@ -715,8 +712,7 @@ def _should_send_unhandled_error_fallback(message: discord.Message) -> bool:
         return True
     direct_command_prefixes = [
         "使い方の説明", "つかいかたのせつめい", "設定変更",
-        "アナウンス", "web承認", "全体確認", "全員の分析",
-        "フォロー方針", "フォロー強さ", "フォロー頻度",
+        "アナウンス", "web承認", "全体確認",         "フォロー方針", "フォロー強さ", "フォロー頻度",
     ]
     return any(content.lower().startswith(prefix.lower()) for prefix in direct_command_prefixes)
 
@@ -866,9 +862,6 @@ async def _on_message_impl(message: discord.Message):
         return
 
     if await handlers_parent.maybe_handle_parent_dashboard(message, content):
-        return
-
-    if await handlers_parent.maybe_handle_spending_analysis(message, content):
         return
 
     # 親による設定変更コマンド（「設定変更 たろう 固定 800円」）
