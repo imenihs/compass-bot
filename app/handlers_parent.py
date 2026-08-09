@@ -703,9 +703,17 @@ _QUESTION_CHARS = ("？", "?")
 # 「こ*とは*あまり」が「とは」に、「元気なので」が「なの」に当たってしまい、
 # 正当な parent_note（自由文）を設定できなくなる。語尾判定にすればこれを避けられる。
 _QUESTION_SUFFIXES = (
-    "っけ", "かな", "ですか", "でしたか", "だっけ", "なの",
-    "って言った", "って設定", "ってした", "とは", "どう", "どうなってる",
+    "っけ", "かな", "かしら", "ですか", "ますか", "でしたか", "ましたか",
+    "だっけ", "なの", "ですよね", "だよね", "だね", "よね",
+    "って言った", "って設定", "ってした", "とは",
+    "どう", "どうなってる", "なってる", "なってた", "どんな感じ", "どんな",
+    "教えて", "おしえて", "は", "何", "なに",
 )
+
+# 文末に付く終助詞。これを落としてから語尾を見る。
+# 「どうなってる」は捕まえるのに「どうなってるの」は捕まえられない、
+# という取りこぼしを防ぐ（有識者の再反証で判明）。
+_TRAILING_PARTICLES = "のよねなさかぁあーっ〜 　"
 
 # 引用・伝聞の形。過去の設定を話題にしているだけで、新しい指示ではない。
 _QUOTE_MARKERS = ("って設定した", "って言った", "ってしたっけ", "と設定した")
@@ -736,8 +744,11 @@ def _looks_like_question(text: str) -> bool:
     # 引用・伝聞は「過去の設定の話」であって指示ではない
     if any(mark in t for mark in _QUOTE_MARKERS):
         return True
-    # 語尾だけを見る（文中に同じ字面があっても誤爆しない）
-    return t.endswith(_QUESTION_SUFFIXES)
+    # 終助詞を落としてから語尾を見る。
+    # 「方針どうなってるの」の「の」のような終助詞が付くだけで
+    # endswith が外れてしまうのを防ぐ。
+    stripped = t.rstrip(_TRAILING_PARTICLES)
+    return t.endswith(_QUESTION_SUFFIXES) or stripped.endswith(_QUESTION_SUFFIXES)
 
 
 async def maybe_handle_followup_policy(message: discord.Message, content: str) -> bool:
@@ -831,16 +842,34 @@ async def execute_bulk_grant(message: discord.Message, items: list | None = None
     system_conf = load_system()
     # 名前→設定を引くため一度だけ読む。金額は必ず items 側を使う（読み直した値は使わない）
     conf_by_name = {str(u.get("name", "")): u for u in load_all_users()}
-    lines = ["【一括支給完了】"]
+    # 中身が壊れていても落とさない。ここで例外を投げると確認は take_pending 済みで消えており、
+    # 「どこまで支給されたか分からないまま汎用エラー」という最悪の見え方になる
+    valid_items = []
     for item in (items or []):
-        name = str(item.get("name", ""))
-        amount = int(item.get("amount", 0))
+        if not isinstance(item, dict):
+            continue
+        try:
+            amount = int(item.get("amount", 0))
+        except (TypeError, ValueError):
+            continue  # 数値でない金額は無視する（壊れた保存データ対策）
+        name = str(item.get("name", "")).strip()
+        if name and amount > 0:
+            valid_items.append((name, amount))
+
+    # 支給対象がゼロなら「完了」と言わない。何も起きていないのに成功に見えるのが一番まずい。
+    # 修正前に積まれた確認（items を持たない）が再起動をまたぐ場合もここに来る
+    if not valid_items:
+        await message.channel.send(
+            "支給する内容が見つからなかったよ。もう一度「一括支給」と送ってね。"
+        )
+        return
+
+    lines = ["【一括支給完了】"]
+    for name, amount in valid_items:
         user_conf = conf_by_name.get(name)
         # 確認後に設定が消えた子は支給できない。黙って飛ばさず親に知らせる
         if user_conf is None:
             lines.append(f"・{name}: スキップ（確認後にユーザー設定が見つからなくなった）")
-            continue
-        if amount <= 0:
             continue
         new_balance, achieved_goals = _wallet_service.update_balance(
             user_conf=user_conf,

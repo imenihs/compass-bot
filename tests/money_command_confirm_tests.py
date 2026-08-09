@@ -154,8 +154,37 @@ async def _run():
            pc.describe_superseded(superseded))
     pc.clear_pending(pid)
 
+    await _test_broken_snapshot_is_safe(H, ws, pid)
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def _test_broken_snapshot_is_safe(H, ws, pid):
+    """壊れた・空のスナップショットで落ちず、嘘の「完了」を出さないこと。
+
+    execute_bulk_grant は take_pending の**後**に呼ばれるため、ここで例外が出ると
+    確認は既に消えており「どこまで支給されたか分からないまま汎用エラー」になる。
+    また空の内訳で「【一括支給完了】」だけ返すと、何も起きていないのに成功に見える。
+    修正前に積まれた確認（items を持たない）が再起動をまたぐ場合もこの経路に来る。
+    """
+    before = ws.get_balance("たろう")
+    for label, items in [("empty", []), ("none", None),
+                         ("amount_not_number", [{"name": "たろう", "amount": "abc"}]),
+                         ("item_not_dict", ["broken"]),
+                         ("name_missing", [{"amount": 100}])]:
+        ch = _Ch()
+        try:
+            await H.execute_bulk_grant(_msg(ch, pid), items=items, op_key_base="t-broken")
+            crashed = False
+        except Exception as exc:  # noqa: BLE001 - 例外が出ないことの確認が目的
+            crashed = True
+            ch.sent.append(f"{type(exc).__name__}: {exc}")
+        _check(f"broken_snapshot_no_crash[{label}]", not crashed, ch.sent[-1:])
+        _check(f"broken_snapshot_no_fake_success[{label}]",
+               bool(ch.sent) and "完了" not in ch.sent[-1], ch.sent[-1:])
+    _check("broken_snapshot_moves_no_money", ws.get_balance("たろう") == before,
+           ws.get_balance("たろう"))
 
 
 def main():
