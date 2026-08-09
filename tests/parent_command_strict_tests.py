@@ -219,6 +219,40 @@ def _test_followup_policy_write_decision():
         _check(f"policy_instruction_writes[{text[:16]}]", _writes(text) is True, text)
 
 
+def _test_followup_note_only_update():
+    """申し送り（parent_note）だけの更新が保存できること。
+
+    「変化が無ければ保存しない」歯止めを入れたとき、条件を
+    「設定語が取れなければ保存しない」にしてしまい、
+    「最近ゲームばかりで心配」のような**申し送りだけの更新を潰していた**
+    （有識者の4周目反証で発見）。note に300文字制限と安全語チェックがあることから、
+    単独更新はもともと想定されている機能である。
+    条件を「何も変わらないなら保存しない」に直して両立させた。
+    """
+    from app import handlers_parent as H
+
+    current = {"parent_note": "", "nudge_strength": "normal", "frequency": "normal",
+               "enabled": True, "focus_area": "balanced"}
+
+    def _saved(text):
+        if H._looks_like_question(text):
+            return False
+        updates, note = H._parse_follow_policy_updates(text)
+        note_changed = note.strip() != str(current.get("parent_note", "")).strip()
+        return bool(updates) or note_changed
+
+    # 申し送りだけ（設定語を含まない）でも保存される
+    for text in ["最近ゲームばかりで心配", "来週から塾が始まるよ",
+                 "友達関係で悩んでるみたい", "テスト期間だから見守って",
+                 "買い物の練習をさせたい", "困ったことがあったら教えてあげて"]:
+        _check(f"note_only_saved[{text[:16]}]", _saved(text) is True, text)
+
+    # 現状を尋ねる言い方は、申し送りとして保存してはいけない
+    for text in ["今の方針は", "現在の設定は", "設定は", "強さは",
+                 "いまの設定教えて", "今の設定見せて"]:
+        _check(f"note_only_question_not_saved[{text[:16]}]", _saved(text) is False, text)
+
+
 def _report():
     """全テストを走らせたあとに結果をまとめて出す。
 
@@ -228,6 +262,7 @@ def _report():
     """
     _test_followup_policy_question_does_not_write()
     _test_followup_policy_write_decision()
+    _test_followup_note_only_update()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

@@ -759,7 +759,20 @@ def _looks_like_question(text: str) -> bool:
     # 「方針どうなってるの」の「の」のような終助詞が付くだけで
     # endswith が外れてしまうのを防ぐ。
     stripped = t.rstrip(_TRAILING_PARTICLES)
-    return t.endswith(_QUESTION_SUFFIXES) or stripped.endswith(_QUESTION_SUFFIXES)
+    if t.endswith(_QUESTION_SUFFIXES) or stripped.endswith(_QUESTION_SUFFIXES):
+        return True
+    # 「今の方針は」「現在の設定は」のような助詞止めの問い合わせ。
+    # 申し送り（自由記述）は文として終わるので助詞では止まらない。
+    # 「食事のことだけは」を巻き込まないよう、**短く・問い合わせ語を含む**ものに限る。
+    inquiry_words = ("方針", "設定", "強さ", "頻度", "今", "いま", "現在")
+    if len(t) <= 10 and t.endswith(("は", "が", "って")):
+        return any(w in t for w in inquiry_words)
+    # 「いまの設定教えて」のような、現状の提示を求める言い方。
+    # 申し送りの「〜を教えてあげて」と混ざらないよう、
+    # **問い合わせ語を伴い、かつ短い**ものに限る
+    if len(t) <= 15 and t.endswith(("教えて", "おしえて", "見せて", "確認したい")):
+        return any(w in t for w in inquiry_words)
+    return False
 
 
 async def maybe_handle_followup_policy(message: discord.Message, content: str) -> bool:
@@ -817,18 +830,24 @@ async def maybe_handle_followup_policy(message: discord.Message, content: str) -
         updates = {"frequency": updates["frequency"]}
         note = current_policy["parent_note"]
 
-    # 設定語が1つも取れていないなら、それは指示ではなく雑談・質問の可能性が高い。
-    # **黙って parent_note だけ書き換えない**（N-11.17・有識者反証）。
-    # ここで保存すると、親には「保存したよ」と出るのに強さ・頻度は変わっておらず、
+    # **何も変わらない保存はしない**（N-11.17・有識者反証）。
+    # 強さ・頻度の指定も無く、申し送り（parent_note）も今と同じなら、
+    # 親の発話は指示ではなく雑談・質問の可能性が高い。
+    # ここで保存すると「保存したよ」と出るのに中身は変わっておらず、
     # しかも指示のつもりで書いた文が parent_note として子の AI プロンプトに載る。
-    # 言い回しの網羅で質問と指示を分けるのは限界があるため、
-    # 「何も変わらない保存はしない」という構造側の歯止めを置く。
-    if not updates:
+    # 言い回しの分類で質問と指示を分けるのは限界があるため、構造側で歯止めを置く。
+    #
+    # ただし **申し送りだけの更新は正当**（「最近ゲームばかりで心配」など）。
+    # note に 300 文字制限と安全語チェックがあることからも単独更新は想定されている。
+    # 「設定語が無い」ではなく「何も変わらない」を条件にすることで、両方を満たす。
+    note_changed = note.strip() != str(current_policy.get("parent_note", "")).strip()
+    if not updates and not note_changed:
         await message.channel.send(
             _follow_policy_summary(target_name, current_policy)
-            + "\n\n（強さ・頻度の指定が読み取れなかったので、設定は変えていないよ。"
-            "「フォロー方針 " + target_name + " 軽め」のように、"
-            "`軽め` `普通` `必要なときだけ` のどれかを入れて送ってね）"
+            + "\n\n（変更する内容が読み取れなかったので、設定はそのままにしたよ。"
+            "強さを変えるなら「フォロー方針 " + target_name + " 軽め」、"
+            "申し送りを残すなら「フォロー方針 " + target_name + " 最近ゲームばかりで心配」"
+            "のように送ってね）"
         )
         return True
 
