@@ -66,19 +66,62 @@ class WalletService:
 
     @staticmethod
     def _migrate_savings_goals_if_needed(state: dict) -> bool:
-        """旧形式(savings_goal 単数キー)を新形式(savings_goals リスト)に変換する。
-        変換が発生した場合は True を返す。初回ロード時に一度だけ実行される。"""
+        """savings_goals を現行形式へそろえる。変換が発生したら True を返す。
+
+        この関数は `_load_wallet_state` の中で **全ての wallet 操作の入口** で走る。
+        ここで例外を出すと残高操作を含む全機能が停止するため、**壊れた形でも落とさない**。
+
+        そろえる形（2026/08/10・貯金と立て替え返済の統合）:
+          - `kind`        … "saving"（貯金）/ "advance"（立て替え返済）
+          - `accumulated` … 貯めた額／返した額。**これが target_amount へ向かって増える**
+          - `status`      … "active" / "done" / "cancelled"
+
+        耐える必要のある3ケース（実データで確認）:
+          1. `savings_goals` キー自体が無い … 実データの4人中3人がこれ
+          2. リストだが kind/accumulated を持たない … 旧形式
+          3. リストでない（None 等） … 既存コードが3箇所で isinstance ガードしている＝過去に踏んだ形
+
+        Args:
+            state: wallet_state の中身。破壊的に更新する。
+
+        Returns:
+            bool: 変換が発生したら True（呼び出し側が保存する）。
+        """
         migrated = False
         for u in state.get("users", {}).values():
-            # 旧キーがあり新キーが未設定の場合のみ移行する
+            # 旧キー(単数 savings_goal)があり新キーが未設定なら先にリスト化する
             if "savings_goal" in u and "savings_goals" not in u:
                 old = u.pop("savings_goal")
-                # 旧目標が有効な dict なら id=1 を付与してリスト化する
                 if isinstance(old, dict) and old.get("title"):
                     u["savings_goals"] = [{"id": 1, **old}]
                 else:
                     u["savings_goals"] = []
                 migrated = True
+
+            goals = u.get("savings_goals")
+            # ケース1（キー無し）・ケース3（非リスト）はどちらも空リストへ倒す
+            if not isinstance(goals, list):
+                if "savings_goals" in u or goals is not None:
+                    migrated = True
+                u["savings_goals"] = []
+                continue
+
+            # ケース2: 各要素に不足フィールドを補う
+            for g in goals:
+                if not isinstance(g, dict):
+                    continue
+                if "kind" not in g:
+                    # 既存の目標はすべて貯金。立て替えは今回の新機能なので既存には存在しない
+                    g["kind"] = "saving"
+                    migrated = True
+                if "accumulated" not in g:
+                    # 過去の積立額は記録されていないため 0 から数え直す。
+                    # ledger には「どの目標への積立か」が入っておらず遡って復元できない
+                    g["accumulated"] = 0
+                    migrated = True
+                if "status" not in g:
+                    g["status"] = "active"
+                    migrated = True
         return migrated
 
     # ------------------------------------------------------------------
@@ -207,6 +250,46 @@ class WalletService:
             u = users.setdefault(user_name, {})
             u["expected_balance"] = int(amount)
             self._save_wallet_state(state)
+
+    @staticmethod
+    def _is_recent_aux_applied(applied_keys: dict, aux_key: str, window_sec: int) -> bool:
+        """内容キー（言い直し検知）が窓内に適用済みかを判定する。
+
+        update_balance が持っていた判定を、contribute_to_goal からも使うため切り出した。
+        判定の意味は変えていない。
+
+        Args:
+            applied_keys: 適用済みキーの辞書。
+            aux_key: 判定する内容キー。
+            window_sec: 有効窓（秒）。**0 以下だと「存在するだけで弾く」**。
+                積立・返済は定額の繰り返しで内容キーが構造的に衝突するため、
+                呼び出し側は必ず正の値を渡すこと。
+
+        Returns:
+            bool: 窓内に適用済みなら True（＝言い直しとみなす）。
+        """
+        from datetime import datetime as _dt, timedelta as _td
+
+        key = str(aux_key or "").strip()
+        if not key:
+            return False
+        meta = applied_keys.get(key)
+        if not isinstance(meta, dict):
+            return False
+        ts_raw = meta.get("ts")
+        window = int(window_sec or 0)
+        if window > 0 and ts_raw:
+            try:
+                applied_at = _dt.fromisoformat(str(ts_raw))
+                now_dt = _dt.fromisoformat(now_jst_iso())
+                if applied_at.tzinfo is None:
+                    applied_at = applied_at.replace(tzinfo=now_dt.tzinfo)
+                return applied_at > now_dt - _td(seconds=window)
+            except (TypeError, ValueError):
+                # ts が壊れていたら従来どおり「存在で弾く」へ倒す
+                return True
+        # window 未指定・ts 不明なら従来どおり存在で弾く
+        return True
 
     def _prune_aux_operation_keys(self, applied_keys: dict, max_age_days: int = 2) -> None:
         """applied_operation_keys から、aux=True かつ ts が max_age_days より古い自然キーを削る。
@@ -358,18 +441,19 @@ class WalletService:
                 }
             self._save_wallet_state(state)
 
-            achieved: list[dict] = []
-            if delta > 0:
-                goals = user_state.get("savings_goals", [])
-                for goal in goals if isinstance(goals, list) else []:
-                    try:
-                        target = int(goal.get("target_amount", 0))
-                    except (TypeError, ValueError):
-                        continue
-                    if before < target <= after:
-                        achieved.append(goal)
-
-            return after, achieved
+            # 目標の達成判定は **ここでは行わない**（2026/08/10）。
+            #
+            # 以前は「残高が target_amount を超えたら達成」としていたが、
+            # 目標ごとの積立額（accumulated）を持つようにしたため定義が二重になり、誤爆する。
+            #   例: 目標「パソコン15万円」に3万円しか積んでいないのに、
+            #       残高が15万円を超えただけで「達成おめでとう」が出る
+            #   例: 立て替え3万円を4,500円しか返していないのに、
+            #       残高が3万円を超えただけで「返済完了」の祝いが出る（より悪い）
+            #
+            # 達成は「accumulated が target_amount に届いたとき」だけとし、
+            # contribute_to_goal() が返す closed に一本化した。
+            # 戻り値の形は呼び出し側との互換のため維持する（常に空リストを返す）。
+            return after, []
 
     # ------------------------------------------------------------------
     # 監査・ペナルティ
@@ -450,6 +534,157 @@ class WalletService:
         goals = u.get("savings_goals", [])
         # 壊れたデータに備えてリスト型以外は空リストに差し替える
         return goals if isinstance(goals, list) else []
+
+    def contribute_to_goal(
+        self,
+        user_conf: dict,
+        system_conf: dict,
+        goal_id: int,
+        amount: int,
+        operation_key: str,
+        aux_operation_keys: list[str] | None = None,
+        aux_dedup_window_sec: int = 0,
+    ) -> tuple[int, int, dict | None, bool]:
+        """目標へ積み立てる／立て替えを返済する。**残高の減算と accumulated の加算を1回で行う。**
+
+        貯金も立て替え返済も「ある数字が target_amount へ向かって増える」という同じ構造なので、
+        同じ関数で扱う（kind が saving か advance かの違いだけ）。
+
+        **なぜ update_balance を呼ばずに専用処理を書くのか**:
+        update_balance は `with` を抜けた時点でロックを解放し `_save_wallet_state` で確定する。
+        その後で accumulated を更新するにはロックを取り直すしかなく、そこで落ちると
+        「残高は減ったのに返済が記録されない（子が損する）」または
+        「返済は記録されたのに残高が減らない（返済がタダになる）」が起きる。
+        さらにリトライ時は冪等キーで**残高側だけスキップ**され（update_balance:279-280 相当）、
+        accumulated 側だけ再実行されて二重計上する。
+        よって**同じ flock 区間の中で、保存を1回だけ**行う。
+
+        Args:
+            user_conf: 対象ユーザーの設定。
+            system_conf: システム設定（ログ出力先の解決に使う）。
+            goal_id: 対象の目標 id。
+            amount: 積み立てる／返す額（正の数）。
+            operation_key: 冪等キー。必須。再送を弾く。
+            aux_operation_keys: 内容キー（言い直し検知）。
+            aux_dedup_window_sec: 内容キーの有効窓（秒）。
+                **積立・返済は定額の繰り返しで内容キーが構造的に衝突するため、必ず指定する。**
+                0 を渡すと「存在するだけで弾く」動作になり、2回目以降が無音で拒否される。
+
+        Returns:
+            tuple[int, int, dict | None, bool]:
+                applied_amount … **実際に引いた額**。過払いは残額へ丸める。再送時は 0
+                new_balance    … 処理後の残高
+                goal_after     … 更新後の目標（accumulated / status を含む）
+                closed         … **この呼び出しで**完了したか。
+                                 再送時は False（完済のお祝いを二度出さないため）
+
+        Raises:
+            ValueError: 目標が無い／既に完了している／operation_key が空／金額が不正。
+            _PrecheckRejected: 残高不足（**丸めた後の額**で判定する）。
+        """
+        user_name = str(user_conf.get("name", "unknown"))
+        safe_key = str(operation_key or "").strip()
+        if not safe_key:
+            raise ValueError("operation_key は必須だよ。")
+        try:
+            want = int(amount)
+        except (TypeError, ValueError):
+            raise ValueError("金額が正しくないよ。")
+        if want <= 0:
+            raise ValueError("金額は1円以上にしてね。")
+
+        lock_path = self.wallet_state_path.with_suffix(self.wallet_state_path.suffix + ".lock")
+        with self._lock, _interprocess_lock(lock_path):
+            state = self._load_wallet_state()
+            users = state.setdefault("users", {})
+            user_state = users.setdefault(user_name, {})
+            before = int(user_state.get("expected_balance", 0))
+
+            # 冪等: 同じ operation_key はもう適用済み。**何も引かず 0 を返す**
+            applied_keys = state.setdefault("applied_operation_keys", {})
+            self._prune_aux_operation_keys(applied_keys)
+            if safe_key in applied_keys:
+                goal_now = self._find_goal_locked(user_state, goal_id)
+                return 0, before, goal_now, False
+
+            # 内容キー（言い直し）。窓の指定が無いと2回目以降が無音で拒否されるため注意
+            for aux in (aux_operation_keys or []):
+                if self._is_recent_aux_applied(applied_keys, aux, aux_dedup_window_sec):
+                    goal_now = self._find_goal_locked(user_state, goal_id)
+                    return 0, before, goal_now, False
+
+            goal = self._find_goal_locked(user_state, goal_id)
+            if goal is None:
+                raise ValueError("その目標は見つからなかったよ。")
+            if str(goal.get("status", "active")) != "active":
+                raise ValueError("その目標はもう終わっているよ。")
+
+            target = int(goal.get("target_amount", 0) or 0)
+            accumulated = int(goal.get("accumulated", 0) or 0)
+            remaining = max(target - accumulated, 0)
+            if remaining <= 0:
+                raise ValueError("その目標はもう終わっているよ。")
+
+            # 過払いは残額へ丸める。残高判定も**丸めた後の額**で行う
+            applied = min(want, remaining)
+            if applied > before:
+                raise _PrecheckRejected(
+                    f"残高が足りないよ。今の残高は {before}円で、{applied}円は引けないんだ。"
+                )
+
+            after = before - applied
+            new_accumulated = accumulated + applied
+            closed = new_accumulated >= target
+
+            # 台帳へ残す。kind で action を分ける（親が見て何の操作か分かるように）
+            action = ("advance_repayment" if str(goal.get("kind")) == "advance"
+                      else "goal_contribution")
+            log_dir = get_log_dir(system_conf)
+            ledger_path = log_dir / f"{user_name}_wallet_ledger.jsonl"
+            ts = now_jst_iso()
+            append_jsonl(ledger_path, {
+                "ts": ts,
+                "name": user_name,
+                "action": action,
+                "delta": -applied,
+                "balance_before": before,
+                "balance_after": after,
+                "note": str(goal.get("title", "")),
+                "operation_key": safe_key,
+                "extra": {"goal_id": int(goal_id), "kind": str(goal.get("kind", "saving"))},
+            })
+
+            # ここから state の更新。**保存は最後に1回だけ**
+            user_state["expected_balance"] = after
+            goal["accumulated"] = new_accumulated
+            if closed:
+                goal["status"] = "done"
+                goal["closed"] = ts
+            applied_keys[safe_key] = {"ts": ts, "action": action}
+            for aux in (aux_operation_keys or []):
+                applied_keys[aux] = {"ts": ts, "action": action, "aux": True}
+            self._save_wallet_state(state)
+
+            return applied, after, dict(goal), closed
+
+    @staticmethod
+    def _find_goal_locked(user_state: dict, goal_id: int) -> dict | None:
+        """目標を id で引く（呼び出し側がロックを保持している前提）。
+
+        Args:
+            user_state: 対象ユーザーの状態。
+            goal_id: 探す目標の id。
+
+        Returns:
+            dict | None: 見つかった目標（state 内の実体）。無ければ None。
+        """
+        goals = user_state.get("savings_goals")
+        if not isinstance(goals, list):
+            return None
+        for g in goals:
+            if isinstance(g, dict) and int(g.get("id", 0) or 0) == int(goal_id):
+                return g
+        return None
 
     def add_savings_goal(self, user_name: str, title: str, target_amount: int) -> tuple[bool, str]:
         """貯金目標を追加する。同名タイトルが既存なら金額を更新する。
