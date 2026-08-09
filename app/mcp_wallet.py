@@ -469,33 +469,6 @@ def _tool_defs() -> list[dict]:
                 "inputSchema": {"type": "object", "properties": {}, "required": []},
             },
             {
-            "name": "parent_confirm_money_action",
-            "description": (
-                "親モード専用。**お金を動かす前に、親へ確認を出す**（まだ実行しない）。"
-                "支給・残高調整をするときは、直接 parent_grant / parent_adjust_balance を呼ばず"
-                "**必ずこれを先に呼ぶ**。確認文は Python が組み立てて親へ出し、"
-                "親が「はい」と答えたときに Python が実行する。\n"
-                "金額や対象を取り違えていた場合、親が確認文を見て気づけるようにするための仕組み。"
-                "参照だけの操作（残高一覧・査定の確認）には使わない。"
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "実行したい操作。grant=支給 / adjust=残高の増減調整",
-                    },
-                    "name": {"type": "string", "description": "対象の子どもの名前"},
-                    "amount": {
-                        "type": "integer",
-                        "description": "金額。grant は正の整数、adjust は符号つき（例 -300）。親が明示した値のみ。",
-                    },
-                    "reason": {"type": "string", "description": "理由（親が話した内容のまま。推測・美化しない）"},
-                },
-                "required": ["action", "name", "amount"],
-            },
-        },
-        {
             "name": "parent_list_promises",
             "description": (
                 "親モード専用。子どもたちの約束の一覧と進み具合を返す。"
@@ -1462,39 +1435,6 @@ def reject_proposal(name: str, note: str = "", parent_intent: str = "", expected
 # _resolve_parent_target（子ディレクトリ実在のみ）で引き、親名・未登録名は弾く。
 
 
-def _require_confirmed(action: str, name: str, amount) -> str | None:
-    """親の確認を経ていない金額操作を拒否する（N-11.17 の Python 境界）。
-
-    親 prompt には「お金を動かす前に必ず parent_confirm_money_action を呼ぶ」と
-    書いてあるが、**プロンプトは境界ではない**。AI が指示を読み飛ばして
-    parent_grant を直接呼べば、確認なしで残高が動いてしまう（実測で確認済み）。
-    子経路の ACTIVE_CHILD と同じく、AI が破れない Python 側の歯止めを置く。
-
-    確認済みかどうかは、bot が「はい」を受けて実行するときに渡す
-    operation_key の接頭辞（confirm-）で判別する。この接頭辞は
-    parent_confirm.take_pending を通った実行だけが持つ。
-
-    Args:
-        action: 操作の種類（grant / adjust）。
-        name: 対象児の名前。
-        amount: 金額。
-
-    Returns:
-        str | None: 拒否する場合は親へ返す文言。確認済みなら None。
-    """
-    from app import parent_confirm as pc
-
-    parent_id = int(os.environ.get("COMPASS_PARENT_DISCORD_ID", "0") or 0)
-    if parent_id <= 0:
-        return "確認を出せなかったよ。もう一度話しかけてね。"
-    # 確認を積んで、親に「はい」と答えてもらう。ここでは残高を動かさない
-    exec_action = "parent_grant" if action == "grant" else "parent_adjust_balance"
-    exec_args = {"name": name, "amount": amount} if action == "grant" else {"name": name, "delta": amount}
-    _token, superseded = pc.put_pending(parent_id, exec_action, exec_args)
-    return (pc.describe_superseded(superseded)
-            + pc.build_confirmation(action, name, amount))
-
-
 def _do_parent_grant(args: dict) -> str:
     """親が対象児へお小遣いを支給する（親モード専用・管理操作）。金額は親が明示した値のみ。"""
     if not (PARENT_MODE and ALLOW_ADMIN_OPS):
@@ -1505,28 +1445,10 @@ def _do_parent_grant(args: dict) -> str:
     amount = _parse_amount(args.get("amount"))
     if amount is None:
         return f"金額が正しくないよ（1〜{MAX_AMOUNT}円で、はっきりした金額を教えてね）。"
-    # 1回あたりの上限を検証する（N-11.17 前提・2026/08/09）。
-    # 従来は 1〜MAX_AMOUNT（100万円）しか見ておらず、査定経路のようなガードレールが一切無かった。
-    # 親は管理者だが、桁の打ち間違い（5000→50000）や AI が値を取り違えた場合の歯止めが要る。
-    # 上限超過は実行せず、親に金額の確認を促す（勝手に丸めない・N-11.14 の方針を踏襲）。
-    single_max = int(config.get_parent_operation_setting()["single_max"])
-    if abs(amount) > single_max:
-        return (
-            f"1回に動かせる金額は {single_max}円までにしているよ（今回は {abs(amount)}円）。\n"
-            "桁の打ち間違いを防ぐためのしくみだよ。金額を確かめて、もう一度お願いね。\n"
-            "本当に大きい金額を動かすときは、何回かに分けてね。"
-        )
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
         return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     name = str(conf.get("name", ""))
-    # 大きい金額だけ、確認を経ていない実行を止める（AI が prompt を読み飛ばしても効く）。
-    # 少額まで毎回確認すると操作が2ターンになって煩わしい。
-    # 取り違えても台帳に日時・増減・理由が残るので後から追えるため、
-    # 確認は「気づかないと困る額」に絞る。
-    confirm_over = int(config.get_parent_operation_setting()["confirm_over"])
-    if abs(amount) >= confirm_over and not op_key.startswith("confirm-"):
-        return _require_confirmed("grant", name, amount)
     eff_key = _scoped_op_key(name, "allowance_manual_grant", op_key)
     if _wallet.is_operation_applied(eff_key):
         return f"その支給はすでに反映済みだよ。今の残高は {_wallet.get_balance(name)}円。"
@@ -1553,23 +1475,10 @@ def _do_parent_adjust_balance(args: dict) -> str:
         return "増やす/減らす金額が正しくないよ（例: +500 や -300 のように教えてね）。"
     if delta == 0:
         return "0円だと残高は変わらないよ。"
-    # 1回あたりの上限を検証する（N-11.17 前提・2026/08/09）。
-    # 従来は MAX_AMOUNT（100万円）しか見ておらず、桁の打ち間違いや AI の取り違えに歯止めが無かった。
-    single_max = int(config.get_parent_operation_setting()["single_max"])
-    if abs(delta) > single_max:
-        return (
-            f"1回に動かせる金額は {single_max}円までにしているよ（今回は {abs(delta)}円）。\n"
-            "桁の打ち間違いを防ぐためのしくみだよ。金額を確かめて、もう一度お願いね。\n"
-            "本当に大きい金額を動かすときは、何回かに分けてね。"
-        )
     op_key = str(args.get("operation_key") or "").strip()
     if not op_key:
         return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
     name = str(conf.get("name", ""))
-    # 支給と同じく、大きい金額だけ確認を挟む
-    confirm_over = int(config.get_parent_operation_setting()["confirm_over"])
-    if abs(delta) >= confirm_over and not op_key.startswith("confirm-"):
-        return _require_confirmed("adjust", name, delta)
     eff_key = _scoped_op_key(name, "balance_adjustment", op_key)
     if _wallet.is_operation_applied(eff_key):
         return f"その調整はすでに反映済みだよ。今の残高は {_wallet.get_balance(name)}円。"
@@ -1693,57 +1602,6 @@ def _do_parent_record_promise_progress(args: dict) -> str:
 
 
 
-def _do_parent_confirm_money_action(args: dict) -> str:
-    """お金を動かす前に親へ確認を出す（N-11.17 の Python 境界）。
-
-    ここでは**実行しない**。確認待ちへ積むだけで、実行は親が「はい」と答えたときに
-    bot 側（_handle_parent_confirmation_reply）が Python の保持した値で行う。
-
-    AI が対象や金額を取り違えていても、親が見る確認文は Python が構造化データから
-    起こしたものなので、食い違いがそのまま目に入る。これが人による最終チェックになる。
-    """
-    if not (PARENT_MODE and ALLOW_ADMIN_OPS):
-        return "この操作は親のチャンネルからのみできるよ。"
-    action = str(args.get("action") or "").strip().lower()
-    if action not in ("grant", "adjust"):
-        return "確認できるのは支給（grant）と残高調整（adjust）だけだよ。"
-    conf = _resolve_parent_target(str(args.get("name", "")))
-    if conf is None:
-        return f"「{args.get('name')}」という子どもは見つからなかったよ。名前を確認してね。"
-    name = str(conf.get("name", ""))
-    # 金額はここでも検証する。確認を出す前に明らかにおかしい値を弾く
-    try:
-        amount = int(args.get("amount"))
-    except (TypeError, ValueError):
-        return "金額が読み取れなかったよ。いくらにするか教えてね。"
-    if amount == 0:
-        return "0円だと何も変わらないよ。"
-    single_max = int(config.get_parent_operation_setting()["single_max"])
-    if abs(amount) > single_max:
-        return (
-            f"1回に動かせる金額は {single_max}円までにしているよ（今回は {abs(amount)}円）。\n"
-            "桁の打ち間違いを防ぐためのしくみだよ。金額を確かめて、もう一度お願いね。"
-        )
-    if action == "grant" and amount < 0:
-        return "支給の金額はプラスで教えてね（減らすときは残高調整だよ）。"
-
-    # 実行に必要な引数を組み立てて確認待ちへ積む。実行時はこの値をそのまま使う
-    if action == "grant":
-        exec_action, exec_args = "parent_grant", {"name": name, "amount": amount}
-    else:
-        exec_action, exec_args = "parent_adjust_balance", {"name": name, "delta": amount}
-
-    from app import parent_confirm as pc
-    parent_id = int(os.environ.get("COMPASS_PARENT_DISCORD_ID", "0") or 0)
-    if parent_id <= 0:
-        return "確認を出せなかったよ。もう一度話しかけてね。"
-    _token, superseded = pc.put_pending(parent_id, exec_action, exec_args)
-    # 古い確認を破棄した場合は、それも親へ伝える（どれに答えているかを一意にする）
-    return (pc.describe_superseded(superseded)
-            + pc.build_confirmation(action, name, amount,
-                                    extra=str(args.get("reason") or "")))
-
-
 _HANDLERS = {
     "get_balance": _do_get_balance,
     "record_expense": _do_record_expense,
@@ -1762,7 +1620,6 @@ _HANDLERS = {
     "parent_reject_assessment": _do_parent_reject_assessment,
     "parent_list_balances": _do_parent_list_balances,
     "parent_get_pending": _do_parent_get_pending,
-    "parent_confirm_money_action": _do_parent_confirm_money_action,
     "parent_list_promises": _do_parent_list_promises,
     "parent_approve_promise": _do_parent_approve_promise,
     "parent_record_promise_progress": _do_parent_record_promise_progress,

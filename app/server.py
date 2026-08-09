@@ -1837,44 +1837,6 @@ async def op_grant(
     return _op_redirect(msg=f"{target}に{amt:,}円を支給しました（{before:,}円 → {new_balance:,}円）")
 
 
-@app.post("/compass-bot/op/bulk_grant")
-async def op_bulk_grant(
-    session_token: Optional[str] = Cookie(default=None),
-):
-    """親が全子供ユーザーに固定お小遣いを一括支給する"""
-    current_user = await _get_current_user(session_token)
-    if not current_user or not _is_admin(current_user):
-        return RedirectResponse(url="/compass-bot/login", status_code=303)
-
-    if not _wallet_service:
-        return _op_redirect(error="ウォレットサービスが未初期化です。")
-
-    system_conf = load_system()
-    results = []
-    # 子供ユーザー（load_all_users = 子供のみ）を一括処理する
-    for user_conf in sorted(load_all_users(), key=lambda x: str(x.get("name", ""))):
-        name = user_conf.get("name", "")
-        fixed = int(user_conf.get("fixed_allowance", 0))
-        if not name or fixed <= 0:
-            continue
-        if not _wallet_service.has_wallet(name):
-            continue
-        before = _wallet_service.get_balance(name)
-        new_bal, _ = _wallet_service.update_balance(
-            user_conf=user_conf,
-            system_conf=system_conf,
-            delta=fixed,
-            action="allowance_grant",
-            note="bulk_grant_by_parent_web",
-            extra={"granted_by": current_user},
-        )
-        results.append(f"{name}: {before:,}→{new_bal:,}円")
-
-    if not results:
-        return _op_redirect(error="支給対象のユーザーが見つかりませんでした。")
-    return _op_redirect(msg="一括支給完了 / " + " | ".join(results))
-
-
 @app.post("/compass-bot/op/fixed_allowance")
 async def op_fixed_allowance(
     session_token: Optional[str] = Cookie(default=None),

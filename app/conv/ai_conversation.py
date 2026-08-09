@@ -113,8 +113,6 @@ ALLOWED_PARENT_TOOLS = [
     "mcp__wallet__parent_reject_assessment",
     "mcp__wallet__parent_list_balances",
     "mcp__wallet__parent_get_pending",
-    # お金を動かす前に親へ確認を出す（N-11.17 の Python 境界）
-    "mcp__wallet__parent_confirm_money_action",
     # 約束の承認・履行記録（N-11.18）。確定は親だけができる
     "mcp__wallet__parent_list_promises",
     "mcp__wallet__parent_approve_promise",
@@ -174,8 +172,6 @@ def _build_parent_system_prompt(child_names: list[str]) -> str:
         "打ち間違いかもしれないので確かめる。\n"
         "- 迷ったら parent_get_pending や get_balance で直前の状況を見てから動く。\n"
         "\n"
-        "【大きい金額を動かすときは、先に確認を出す】\n"
-        "- 支給・残高調整をするときは、**parent_confirm_money_action を必ず先に呼ぶ**。\n"
         "  parent_grant / parent_adjust_balance を直接呼んではいけない。\n"
         "- この道具は実行しない。確認文を親へ出すだけで、親が『はい』と答えたときに"
         "Python が実行する。あなたが対象や金額を取り違えていても、親が確認文を見て気づける。\n"
@@ -183,7 +179,6 @@ def _build_parent_system_prompt(child_names: list[str]) -> str:
         "道具が返した確認文をそのまま親へ見せること。\n"
         "- 参照だけの操作（残高一覧・査定の確認）には確認は要らない。すぐ答える。\n"
         "【使える道具】\n"
-        "- お金を動かす前の確認: parent_confirm_money_action"
         "（action=grant または adjust, name=お子さん, amount=金額（adjust は符号つき）, reason=理由）\n"
         "- 査定の承認/却下: parent_approve_assessment / parent_reject_assessment（name）\n"
         "- 残高一覧: parent_list_balances、承認待ちの査定: parent_get_pending\n"

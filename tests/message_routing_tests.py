@@ -169,46 +169,7 @@ def _test_parent_can_talk_in_child_channel():
     _check("no_amount_not_blocked", moves("お菓子買ったよ") is False, moves("お菓子買ったよ"))
 
 
-def _test_confirmation_reply_is_channel_independent():
-    """確認の「はい」が、チャンネルに関係なく確認ハンドラへ届くこと。
-
-    確認を積む maybe_handle_*（支給・残高調整・一括支給）はチャンネル非依存で発火する。
-    ところが取り出す _handle_parent_confirmation_reply は、以前
-    「親が子ども用チャンネルにいない」場合の else 側にしか無かった。
-    このため子ども用チャンネルで金額コマンドを打つと、
-    **確認文は出るのに「はい」が永久に届かない**（確認待ちが残り続ける）。
-    積む側と取り出す側の条件は必ず対称にする。
-
-    AST で、_handle_parent_confirmation_reply の呼び出しが
-    _find_channel_child_user_conf の結果による分岐**より前**にあることを固定する。
-    """
-    import ast
-
-    src = (ROOT / "app" / "bot.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-
-    confirm_line = None
-    channel_branch_line = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
-                and node.func.id == "_handle_parent_confirmation_reply":
-            confirm_line = node.lineno if confirm_line is None else min(confirm_line, node.lineno)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
-                and node.func.id == "_find_channel_child_user_conf":
-            # 代入に使われている箇所（分岐の条件になるもの）を見る
-            channel_branch_line = (node.lineno if channel_branch_line is None
-                                   else min(channel_branch_line, node.lineno))
-
-    _check("confirm_reply_call_exists", confirm_line is not None, confirm_line)
-    _check("channel_child_lookup_exists", channel_branch_line is not None, channel_branch_line)
-    _check("confirm_reply_before_channel_branch",
-           confirm_line is not None and channel_branch_line is not None
-           and confirm_line < channel_branch_line,
-           f"confirm={confirm_line} channel_branch={channel_branch_line}")
-
-
 def main():
-    _test_confirmation_reply_is_channel_independent()
     _test_channel_context_resolves_child()
     _test_parent_child_same_id_lookup_order()
     _test_resolution_chain_not_broken()

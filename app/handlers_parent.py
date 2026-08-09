@@ -605,23 +605,29 @@ async def maybe_handle_reminder_test(message: discord.Message, content: str) -> 
     return True
 
 
-async def _apply_parent_grant(message, target_conf: dict, target_name: str,
-                              amount: int) -> bool:
-    """少額の支給をその場で実行する（確認を挟まない経路）。
+async def maybe_handle_manual_grant(message: discord.Message, content: str) -> bool:
+    """親の「支給 <名前> <金額>円」コマンドを処理する（親のみ）。
 
-    お小遣い管理なので、少額まで毎回「はい/いいえ」を挟むと操作が煩わしくなる。
-    取り違えても台帳（*_wallet_ledger.jsonl）に日時・増減・理由が残るため、
-    後から追えて戻せる。確認は高額のときだけに絞る。
-
-    Args:
-        message: 親のメッセージ。
-        target_conf: 対象児の設定。
-        target_name: 対象児の名前。
-        amount: 支給額（円）。
-
-    Returns:
-        bool: 常に True（このハンドラで処理を完了したという意味）。
+    確認ステップは置かない。お小遣い管理であり、毎回「はい/いいえ」を挟むと
+    操作が2ターンになって煩わしいだけで、割に合わない。
+    取り違えても台帳（*_wallet_ledger.jsonl）に日時・増減・理由が残るため
+    後から追えるし、AI 側にも直前の操作を思い出す点検を入れている。
     """
+    if not _is_parent(message.author.id):
+        return False
+    # コマンド全体が厳密にこの形式のときだけ発火（文中に含まれる引用・疑問文で誤発火させない）
+    m = re.fullmatch(r"支給\s+(\S+)\s+(\d[\d,]*)\s*円", _command_body(content))
+    if not m:
+        return False
+
+    target_name = m.group(1).strip()
+    amount = int(m.group(2).replace(",", ""))
+    # 対象は子ども限定で検索する（find_user_by_name だと親名でも解決してしまう）
+    target_conf = find_child_user_by_name(target_name)
+    if target_conf is None:
+        await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
+        return True
+
     system_conf = load_system()
     before = _wallet_service.get_balance(target_name)
     new_balance, achieved_goals = _wallet_service.update_balance(
@@ -631,6 +637,7 @@ async def _apply_parent_grant(message, target_conf: dict, target_name: str,
         action="allowance_manual_grant",
         note="manual_grant_by_parent",
         extra={"granted_by": str(message.author.id)},
+        # Discord のメッセージ ID を冪等キーにする。再送は弾き、意図した2回は通す
         operation_key=_parent_op_key(message, "allowance_manual_grant", target_name),
     )
     await message.channel.send(
@@ -643,102 +650,49 @@ async def _apply_parent_grant(message, target_conf: dict, target_name: str,
         )
     return True
 
-
-async def maybe_handle_manual_grant(message: discord.Message, content: str) -> bool:
-    """親が手動でお小遣いを支給するコマンドを処理する（親のみ）。
-    「支給 たろう 700円」の形式にマッチする。"""
-    # 親以外は無視する
-    if not _is_parent(message.author.id):
-        return False
-    # コマンド全体が厳密にこの形式のときだけ発火させる（re.fullmatch）。re.search（部分一致）だと
-    # 「昨日 支給 はな 300円 ってやった?」のような引用・疑問・説明の文中コマンドにマッチし、親の自然文で
-    # 実残高が動く越境になる（codex 指摘の blocker）。前後に余計な文字が無い明示コマンドだけを実行する。
-    m = re.fullmatch(r"支給\s+(\S+)\s+(\d[\d,]*)\s*円", (content or "").strip())
-    if not m:
-        return False
-
-    target_name = m.group(1)
-    amount = int(m.group(2).replace(",", ""))
-
-    # 対象は子ども限定で検索する（find_user_by_name だと親名でも解決し、親の残高を動かす経路になりうる）
-    target_conf = find_child_user_by_name(target_name)
-    if target_conf is None:
-        await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
-        return True
-
-    # 明示コマンドも **AI 経路と同じ確認ステップを通す**（N-11.17）。
-    # 経路によって安全性が食い違わないようにするため。
-    # ただし確認は高額のときだけ。少額まで毎回2ターンにすると煩わしく、
-    # 取り違えても台帳に残って後から追えるため、割に合わない。
-    from app import parent_confirm as pc
-    confirm_over = int(config.get_parent_operation_setting()["confirm_over"])
-    if amount < confirm_over:
-        return await _apply_parent_grant(message, target_conf, target_name, amount)
-
-    _token, superseded = pc.put_pending(int(message.author.id), "parent_grant",
-                                        {"name": target_name, "amount": amount})
-    await message.channel.send(
-        pc.describe_superseded(superseded)
-        + pc.build_confirmation("grant", target_name, amount)
-    )
-    return True
-
-
 async def maybe_handle_balance_adjustment(message: discord.Message, content: str) -> bool:
-    """親が残高を直接調整するコマンドを処理する（親のみ）。
-    「残高調整 たろう +500円」「残高調整 たろう -300円」「残高調整 たろう 500円」の形式にマッチする。"""
-    # 親以外は無視する
+    """親の「残高調整 <名前> <±金額>円」コマンドを処理する（親のみ）。
+
+    支給と同じく確認は挟まない（理由は maybe_handle_manual_grant を参照）。
+    """
     if not _is_parent(message.author.id):
         return False
-    # コマンド全体が厳密にこの形式のときだけ発火（re.fullmatch）。re.search だと「残高調整 たろう -500円
-    # ってどういう意味?」の文中コマンドにマッチし親の自然文で実残高が動く（codex 指摘の blocker）。
-    m = re.fullmatch(r"残高調整\s+(\S+)\s+([+-]?\d[\d,]*)\s*円", (content or "").strip())
+    # コマンド全体が厳密にこの形式のときだけ発火する
+    m = re.fullmatch(r"残高調整\s+(\S+)\s+([+-]?\d[\d,]*)\s*円", _command_body(content))
     if not m:
         return False
 
-    target_name = m.group(1)
-    # 符号なしの場合は加算（正）として扱う
+    target_name = m.group(1).strip()
     delta = int(m.group(2).replace(",", ""))
+    if delta == 0:
+        await message.channel.send("0円の調整はできないよ。")
+        return True
 
-    # 対象は子ども限定（親名で親残高を動かす経路を塞ぐ）
     target_conf = find_child_user_by_name(target_name)
     if target_conf is None:
         await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
         return True
 
-    # 支給と同じく、確認は高額のときだけ挟む（経路によって基準を変えない）
-    from app import parent_confirm as pc
-    confirm_over = int(config.get_parent_operation_setting()["confirm_over"])
-    if abs(delta) < confirm_over:
-        system_conf = load_system()
-        before = _wallet_service.get_balance(target_name)
-        new_balance, achieved_goals = _wallet_service.update_balance(
-            user_conf=target_conf,
-            system_conf=system_conf,
-            delta=delta,
-            action="balance_adjustment",
-            note="manual_adjustment_by_parent",
-            extra={"adjusted_by": str(message.author.id)},
-            operation_key=_parent_op_key(message, "balance_adjustment", target_name),
-        )
-        await message.channel.send(
-            f"{target_name}の残高を{delta:+d}円調整したよ。残高: {before}円 → {new_balance}円"
-        )
-        # 加算調整で目標が達成された場合は祝福メッセージを送る
-        for achieved_goal in achieved_goals:
-            await message.channel.send(
-                _build_goal_achieved_message(user_conf=target_conf, goal=achieved_goal)
-            )
-        return True
-
-    _token, superseded = pc.put_pending(int(message.author.id), "parent_adjust_balance",
-                                        {"name": target_name, "delta": delta})
-    await message.channel.send(
-        pc.describe_superseded(superseded)
-        + pc.build_confirmation("adjust", target_name, delta)
+    system_conf = load_system()
+    before = _wallet_service.get_balance(target_name)
+    new_balance, achieved_goals = _wallet_service.update_balance(
+        user_conf=target_conf,
+        system_conf=system_conf,
+        delta=delta,
+        action="balance_adjustment",
+        note="manual_adjustment_by_parent",
+        extra={"adjusted_by": str(message.author.id)},
+        operation_key=_parent_op_key(message, "balance_adjustment", target_name),
     )
+    await message.channel.send(
+        f"{target_name}の残高を{delta:+d}円調整したよ。残高: {before}円 → {new_balance}円"
+    )
+    # 加算調整で目標が達成された場合は祝福メッセージを送る
+    for achieved_goal in achieved_goals:
+        await message.channel.send(
+            _build_goal_achieved_message(user_conf=target_conf, goal=achieved_goal)
+        )
     return True
-
 
 async def maybe_handle_user_setting_change(message: discord.Message, content: str) -> bool:
     """親がユーザーの固定お小遣い・臨時上限を変更するコマンドを処理する（親のみ）。
@@ -871,136 +825,6 @@ async def maybe_handle_followup_policy(message: discord.Message, content: str) -
     await message.channel.send(
         f"AIフォロー方針は Web から設定してね → {base_url}"
         "\n今の設定を見るなら「フォロー方針 <名前>」だよ。"
-    )
-    return True
-
-
-async def execute_bulk_grant(message: discord.Message, items: list | None = None,
-                             op_key_base: str = "") -> None:
-    """全員への一括支給を実行する（確認で「はい」を受けてから呼ばれる）。
-
-    **確認した時点の内訳（items）だけを使う**。ここで load_all_users を読み直すと、
-    確認から「はい」までの間に固定額が変わったり子が追加された場合に、
-    親が見た確認文と実際に動く金額がズレる。確認の価値は
-    「親が見た内容＝実行される内容」の保証なので、スナップショットを正とする。
-
-    Args:
-        message: 「はい」と答えた親のメッセージ（送信先チャンネルとして使う）。
-        items: 確認時点の [{"name":…, "amount":…}, …]。
-        op_key_base: 冪等キーの土台（確認 ID）。同じ確認が二重に実行されないようにする。
-            親が改めて一括支給し直した場合は別の確認 ID になるため、正しく通る。
-    """
-    system_conf = load_system()
-    # 名前→設定を引くため一度だけ読む。金額は必ず items 側を使う（読み直した値は使わない）
-    conf_by_name = {str(u.get("name", "")): u for u in load_all_users()}
-    # 中身が壊れていても落とさない。ここで例外を投げると確認は take_pending 済みで消えており、
-    # 「どこまで支給されたか分からないまま汎用エラー」という最悪の見え方になる
-    single_max = int(config.get_parent_operation_setting()["single_max"])
-    valid_items = []
-    over = []  # 上限超過。黙って飛ばさず親に知らせる
-    for item in (items or []):
-        if not isinstance(item, dict):
-            continue
-        try:
-            amount = int(item.get("amount", 0))
-        except (TypeError, ValueError):
-            continue  # 数値でない金額は無視する（壊れた保存データ対策）
-        name = str(item.get("name", "")).strip()
-        # 1回あたりの上限を通す（N-11.17・有識者反証）。
-        # parent_grant / parent_adjust_balance には入っているのにここだけ無く、
-        # 固定額の桁を打ち間違えると**登録児全員分まとめて**素通りしていた。
-        # 「経路によって安全性を食い違わせない」という方針そのものに反する非対称だった。
-        if name and amount > single_max:
-            over.append((name, amount))
-            continue
-        if name and amount > 0:
-            valid_items.append((name, amount))
-
-    # 支給対象がゼロなら「完了」と言わない。何も起きていないのに成功に見えるのが一番まずい。
-    # 修正前に積まれた確認（items を持たない）が再起動をまたぐ場合もここに来る
-    if not valid_items:
-        await message.channel.send(
-            "支給する内容が見つからなかったよ。もう一度「一括支給」と送ってね。"
-        )
-        return
-
-    lines = ["【一括支給完了】"]
-    for name, amount in over:
-        lines.append(f"・{name}: スキップ（1回の上限 {single_max:,}円を超えている: {amount:,}円）")
-    for name, amount in valid_items:
-        user_conf = conf_by_name.get(name)
-        # 確認後に設定が消えた子は支給できない。黙って飛ばさず親に知らせる
-        if user_conf is None:
-            lines.append(f"・{name}: スキップ（確認後にユーザー設定が見つからなくなった）")
-            continue
-        new_balance, achieved_goals = _wallet_service.update_balance(
-            user_conf=user_conf,
-            system_conf=system_conf,
-            delta=amount,
-            action="allowance_monthly_auto_grant",
-            note="bulk_grant_by_parent",
-            extra={"granted_by": str(message.author.id)},
-            # 確認 ID を土台にする。message.id だと「一括支給→はい」を繰り返したとき
-            # 毎回別 ID になり二重支給を防げない
-            operation_key=(f"{op_key_base}-{name}" if op_key_base
-                           else _parent_op_key(message, "allowance_monthly_auto_grant", name)),
-        )
-        lines.append(f"・{name}: +{amount}円 → {new_balance}円")
-        # 支給により目標が達成された場合は祝福メッセージを送る
-        for achieved_goal in achieved_goals:
-            await message.channel.send(
-                _build_goal_achieved_message(user_conf=user_conf, goal=achieved_goal)
-            )
-    await message.channel.send("\n".join(lines))
-
-
-async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> bool:
-    """親が全ユーザーに固定お小遣いを一括支給するコマンドを処理する（親のみ）。
-
-    **実行前に必ず確認を出す**（N-11.17）。一括支給は登録児全員の残高を一度に動かす、
-    この bot で最も影響の大きい操作である。誰にいくら入るのかを先に見せてから実行する。
-    """
-    if not _is_parent(message.author.id):
-        return False
-    # メンション付き（「@compass-bot 一括支給」）にも対応するためメンション除去後に判定する
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    target = mention_body if mention_body is not None else (content or "")
-    # 誤作動を防ぐため完全一致で判定する
-    if target.strip() != "一括支給":
-        return False
-
-    users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-    if not users:
-        await message.channel.send("ユーザーが設定されていないよ。")
-        return True
-
-    # 誰にいくら入るのかを先に見せる。金額の合計まで出して桁の異常に気づけるようにする
-    detail_lines = []
-    snapshot = []  # 確認時点の (名前, 金額)。実行はこれだけを使う
-    total = 0
-    for u in users:
-        name = str(u.get("name", ""))
-        amount = int(u.get("fixed_allowance", 0))
-        if amount <= 0:
-            detail_lines.append(f"{name}: スキップ（固定額未設定）")
-            continue
-        total += amount
-        snapshot.append({"name": name, "amount": amount})
-        detail_lines.append(f"{name}: +{amount:,}円")
-    if total <= 0:
-        await message.channel.send("固定お小遣いが設定されている子がいないよ。")
-        return True
-
-    # **確認した時点の内訳をそのまま保存する**（N-11.17・有識者反証）。
-    # 実行時に load_all_users を読み直すと、確認から「はい」までの間に固定額が変わったり
-    # 子が追加された場合に、親が見た確認文と実際に動く金額がズレる。
-    # 確認の価値は「親が見た内容＝実行される内容」の保証なので、ここで固定する。
-    from app import parent_confirm as pc
-    _token, superseded = pc.put_pending(int(message.author.id), "bulk_grant",
-                                        {"items": snapshot, "total": total})
-    await message.channel.send(
-        pc.describe_superseded(superseded)
-        + pc.build_confirmation("bulk_grant", "", total, extra=" / ".join(detail_lines))
     )
     return True
 
