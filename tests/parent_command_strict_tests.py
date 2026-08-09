@@ -139,11 +139,91 @@ def _run():
     finally:
         _H._client = _orig_client
 
+
+def _test_followup_policy_question_does_not_write():
+    """親の疑問文で AI フォロー方針が書き換わらないこと。
+
+    正規表現が DOTALL + `(.+)$` で行末まで飲むため、
+    「フォロー方針 <名前> 軽め って設定したっけ？」が
+    値「軽め って設定したっけ？」として通り、**実設定が書き換わっていた**。
+    さらに疑問文そのものが parent_note として保存され、
+    子への AI プロンプトに載るという二重の実害があった。
+    質問は設定変更ではなく会話（AI 経路）へ流すのが正しい。
+    """
+    from app import handlers_parent as H
+
+    for text in ["軽め って設定したっけ？", "軽めかな", "普通ですか", "軽め って言った?",
+                 "軽め って設定した", "軽めだっけ", "今どうなってる",
+                 "普通にしてましたか", "軽めになってる", "今どんな感じ",
+                 "設定は軽めですよね", "軽めだよね", "軽めのままかしら",
+                 "方針どうなってるの"]:
+        # 注: 「今の方針は」のような助詞止めは、ここ（語尾判定）では捕まえない。
+        # 「食事のことだけは」のような正当な指示文まで巻き込むため。
+        # 書き換わらないことは _test_followup_policy_write_decision で担保する。
+        _check(f"followup_question_blocked[{text[:16]}]",
+               H._looks_like_question(text) is True, text)
+
+    # parent_note は自由文なので、長めの指示文も正しく通ること。
+    # 当初 marker を部分一致で見ていたため「勉強のこ*とは*あまり」が「とは」に、
+    # 「元気*なの*で」が「なの」に当たり、正当な指示文を弾いていた（有識者反証で発見）。
+    for text in ["軽め", "普通", "必要なときだけ", "軽め にして",
+                 "軽め 勉強のことはあまり言わないで", "普通 元気なので見守って",
+                 "軽め 本人のペースを尊重してほしい", "普通 お金の使い方だけ見てあげて",
+                 "軽め そっとしておいて", "普通 ゲームの時間だけ気にかけて"]:
+        _check(f"followup_value_allowed[{text[:16]}]",
+               H._looks_like_question(text) is False, text)
+
+
+def _test_followup_policy_write_decision():
+    """「実際に設定が書き換わるか」で判定する（語尾判定だけに頼らない）。
+
+    質問ガードは語尾のゆらぎに弱く、語彙を足すと今度は正当な指示文を弾く
+    （「食事のことだけは」が「は」に当たる等）。いたちごっこになるため、
+    **設定語は値の先頭にあるときだけ拾う**という構造側の防御を主にした。
+    指示なら「軽め …」と先頭に来るのが自然で、質問文では先頭に来ない。
+    質問ガードと合わせて二重に防ぐ。ここでは両方を通した最終結果を固定する。
+    """
+    from app import handlers_parent as H
+
+    def _writes(text):
+        if H._looks_like_question(text):
+            return False
+        updates, _note = H._parse_follow_policy_updates(text)
+        return bool(updates)
+
+    for text in ["今の方針は", "設定は", "いまの設定教えて", "普通にしてましたか",
+                 "軽めになってる", "今どんな感じ", "設定は軽めですよね", "軽めだよね",
+                 "軽めのままかしら", "方針どうなってるの", "軽めだっけ", "どうなってる",
+                 "軽め って設定したっけ？", "軽めかな", "普通ですか", "現在の設定は",
+                 "軽めになってる？", "今の方針は軽めだっけ", "普通にしてたよね"]:
+        _check(f"policy_question_no_write[{text[:16]}]", _writes(text) is False, text)
+
+    for text in ["軽め", "普通", "必要なときだけ",
+                 "軽め 宿題のことは言わないで", "普通 ゲームのことは本人に任せて",
+                 "軽め お金のことはしっかり見て", "普通 早寝のことだけは言ってね",
+                 "軽め そっと見守ってほしいな", "軽め 食事のことだけは",
+                 "普通 なにかあったら教えて", "軽め 何も言わないで",
+                 "普通 元気なので見守って", "軽め 勉強のことはあまり言わないで"]:
+        _check(f"policy_instruction_writes[{text[:16]}]", _writes(text) is True, text)
+
+
+def _report():
+    """全テストを走らせたあとに結果をまとめて出す。
+
+    _run の中で集計すると、_run より後ろで定義したテストが集計に入らない
+    （実際に2件が呼ばれないまま「全件PASS」に見えていた）。
+    追加したテストが確実に走ることを担保するため、呼び出しと集計をここへ集める。
+    """
+    _test_followup_policy_question_does_not_write()
+    _test_followup_policy_write_decision()
+
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))
     print(json.dumps({"summary": True, "passed": passed, "total": len(_results)}, ensure_ascii=False))
+    return passed == len(_results)
 
 
 if __name__ == "__main__":
     _run()
+    sys.exit(0 if _report() else 1)

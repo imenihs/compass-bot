@@ -233,13 +233,16 @@ def _parse_follow_policy_updates(text: str) -> tuple[dict, str]:
             updates["focus_area"] = value
             break
 
+    # 設定語は **値の先頭にあるときだけ** 拾う（N-11.17・有識者反証）。
+    # どこにあっても拾うと「今の方針は軽めだっけ」のような質問文に含まれる
+    # 「軽め」で実設定が書き換わる。指示なら「軽め …」と先頭に来るのが自然。
     for needle, value in _FOLLOW_POLICY_STRENGTH_ALIASES.items():
-        if needle in body or needle in normalized:
+        if body.startswith(needle) or normalized.startswith(needle):
             updates["nudge_strength"] = value
             break
 
     for needle, value in _FOLLOW_POLICY_FREQUENCY_ALIASES.items():
-        if needle in body or needle in normalized:
+        if body.startswith(needle) or normalized.startswith(needle):
             updates["frequency"] = value
             break
 
@@ -706,8 +709,7 @@ _QUESTION_SUFFIXES = (
     "っけ", "かな", "かしら", "ですか", "ますか", "でしたか", "ましたか",
     "だっけ", "なの", "ですよね", "だよね", "だね", "よね",
     "って言った", "って設定", "ってした", "とは",
-    "どう", "どうなってる", "なってる", "なってた", "どんな感じ", "どんな",
-    "教えて", "おしえて", "は", "何", "なに",
+    "どう", "どうなってる", "なってる", "なってた", "どんな感じ",
 )
 
 # 文末に付く終助詞。これを落としてから語尾を見る。
