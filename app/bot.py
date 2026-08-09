@@ -531,8 +531,7 @@ def _looks_like_parent_only_command(input_block: str) -> bool:
         return False
     parent_prefixes = [
         "支給", "残高調整", "設定変更", "アナウンス", "web承認",
-        "全体確認", "全員の分析", "残高チェック送信", "月頭案内送信",
-        "reminder test", "reminder-test", "リマインダーテスト",
+        "全体確認", "全員の分析",         "reminder test", "reminder-test", "リマインダーテスト",
     ]
     if any(body.lower().startswith(prefix.lower()) for prefix in parent_prefixes):
         return True
@@ -712,8 +711,7 @@ def _should_send_unhandled_error_fallback(message: discord.Message) -> bool:
     if CHAT_SETTING.get("natural_chat_enabled") and not CHAT_SETTING.get("require_mention"):
         return True
     direct_command_prefixes = [
-        "使い方の説明", "つかいかたのせつめい", "支給", "残高調整", "設定変更",         "アナウンス", "web承認", "全体確認", "全員の分析", "残高チェック送信", "月頭案内送信",
-        "reminder test", "reminder-test", "リマインダーテスト", "フォロー方針", "フォロー強さ",
+        "使い方の説明", "つかいかたのせつめい", "支給", "残高調整", "設定変更",         "アナウンス", "web承認", "全体確認", "全員の分析",         "reminder test", "reminder-test", "リマインダーテスト", "フォロー方針", "フォロー強さ",
         "フォロー頻度",
     ]
     return any(content.lower().startswith(prefix.lower()) for prefix in direct_command_prefixes)
@@ -867,12 +865,6 @@ async def _on_message_impl(message: discord.Message):
         return
 
     if await handlers_parent.maybe_handle_spending_analysis(message, content):
-        return
-
-    if await handlers_parent.maybe_handle_wallet_audit_send(message, content):
-        return
-
-    if await handlers_parent.maybe_handle_reminder_test(message, content):
         return
 
     # 親による支給コマンド（「支給 たろう 700円」）

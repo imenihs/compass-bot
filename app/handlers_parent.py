@@ -553,58 +553,6 @@ async def maybe_handle_spending_analysis(message: discord.Message, content: str)
     return True
 
 
-async def maybe_handle_wallet_audit_send(message: discord.Message, content: str) -> bool:
-    """「残高チェック送信」コマンドで今月の残高チェック案内を即時送信する（親のみ）"""
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    if not (mention_body and mention_body.strip() in {"残高チェック送信", "月頭案内送信"}):
-        return False
-
-    if not _is_parent(message.author.id):
-        await message.channel.send("残高チェック送信は親のみ実行できるよ。")
-        return True
-
-    try:
-        await _reminder_service.send_wallet_audit()
-        await message.channel.send("残高チェック案内を送信したよ。")
-    except Exception as e:
-        _log_parent_handler_error(message, "wallet_audit_send_error", e)
-        await message.channel.send(operation_failure_message("残高チェック案内の送信"))
-    return True
-
-
-async def maybe_handle_reminder_test(message: discord.Message, content: str) -> bool:
-    """「reminder test」コマンドでリマインダーをテスト送信する（親のみ）"""
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    is_test_cmd = bool(
-        mention_body
-        and mention_body.strip().lower()
-        in {"reminder test", "reminder-test", "リマインダーテスト", "リマインダー テスト"}
-    )
-    if not is_test_cmd:
-        return False
-
-    if not _is_parent(message.author.id):
-        await message.channel.send("リマインダーテストは親のみ実行できるよ。")
-        return True
-
-    channel_id = _allowance_reminder_conf.get("channel_id")
-    if not channel_id:
-        await message.channel.send("`settings/setting.json` の `allowance_reminder.channel_id` を設定してね。")
-        return True
-
-    payday = _reminder_service.next_payday(
-        today=datetime.now(JST).date(),
-        payday_day=int(_allowance_reminder_conf["payday_day"]),
-    )
-    try:
-        await _reminder_service.send_allowance_reminder(payday=payday, channel_id=int(channel_id), is_test=True)
-        await message.channel.send("リマインダーをテスト送信したよ。")
-    except Exception as e:
-        _log_parent_handler_error(message, "reminder_test_send_error", e)
-        await message.channel.send(operation_failure_message("リマインダーテスト送信"))
-    return True
-
-
 async def maybe_handle_manual_grant(message: discord.Message, content: str) -> bool:
     """親の「支給 <名前> <金額>円」コマンドを処理する（親のみ）。
 
