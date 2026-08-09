@@ -509,90 +509,44 @@ async def maybe_handle_parent_dashboard(message: discord.Message, content: str) 
 
 
 async def maybe_handle_user_setting_change(message: discord.Message, content: str) -> bool:
-    """親がユーザーの固定お小遣い・臨時上限を変更するコマンドを処理する（親のみ）。
-    「設定変更 たろう 固定 800円」「設定変更 たろう 臨時 5000円」の形式にマッチする。"""
-    # 親以外は無視する
+    """親が固定お小遣い・臨時上限に触れたとき、Web ダッシュボードへ案内する（親のみ）。
+
+    **チャットで金額の設定を受け付けるのをやめた**（N-11.17）。
+    固定お小遣いは毎月効き続ける設定で、桁を間違えると気づきにくい。
+    Web には数値入力のフォームが既にあり、値が曖昧にならないうえ
+    一覧で見比べられる。フォロー方針と同じ方針にそろえる。
+
+    現在値の確認だけはその場で答える（見るだけなら曖昧さが無いため）。
+    """
     if not _is_parent(message.author.id):
         return False
-    # コマンド全体が厳密にこの形式のときだけ発火（re.fullmatch）。re.search だと文中コマンドにマッチし
-    # 親の自然文で設定（上限）が変わる。実残高は動かないが親統制の一貫性のため厳密一致に揃える。
-    m = re.fullmatch(r"設定変更\s+(\S+)\s+(固定|臨時)\s+(\d[\d,]*)\s*円", (content or "").strip())
+    body = _command_body(content)
+    m = re.match(r"^設定変更(?:\s+(\S+))?", body)
     if not m:
         return False
 
-    target_name = m.group(1)
-    setting_type = m.group(2)  # "固定" または "臨時"
-    amount = int(m.group(3).replace(",", ""))
-
-    # 対象は子ども限定で検索する
-    target_conf = find_child_user_by_name(target_name)
-    if target_conf is None:
-        await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
-        return True
-
-    # 変更対象フィールドと表示ラベルを決定する
-    if setting_type == "固定":
-        field = "fixed_allowance"
-        label = "固定お小遣い"
-    else:
-        field = "temporary_max"
-        label = "臨時お小遣い上限"
-
-    old_value = int(target_conf.get(field, 0))
-
-    # users/*.json ファイルの対象フィールドを書き換える
-    if not update_user_field(target_name, field, amount):
-        await message.channel.send(operation_failure_message(f"{target_name}の設定ファイル更新"))
+    base_url = get_web_base_url().rstrip("/")
+    target_name = (m.group(1) or "").strip()
+    if target_name:
+        target_conf = find_child_user_by_name(target_name)
+        if target_conf is None:
+            await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
+            return True
+        fixed = int(target_conf.get("fixed_allowance", 0) or 0)
+        temp = int(target_conf.get("temporary_max", 0) or 0)
+        await message.channel.send(
+            f"{target_name}の今の設定だよ。"
+            f"\n- 固定お小遣い: {fixed:,}円"
+            f"\n- 臨時の上限: {temp:,}円"
+            f"\n\n変更は Web から → {base_url}"
+        )
         return True
 
     await message.channel.send(
-        f"{target_name}の{label}を変更したよ。"
-        f"\n{old_value}円 → {amount}円"
+        f"お小遣いの設定は Web からお願いね → {base_url}"
+        "\n今の設定を見るなら「設定変更 <名前>」だよ。"
     )
     return True
-
-
-# 疑問符はどこにあっても質問とみなす。これだけは言い回しに依存せず確実に効く。
-_QUESTION_CHARS = ("？", "?")
-
-# 疑問・確認の語尾。**文末にあるときだけ**質問とみなす。
-# 部分一致で見ると「勉強のこ*とは*」「元気*なの*で」のような正当な指示文まで弾く。
-#
-# ここは意図的に**狭く**保つ。日本語の質問の言い回しは無限にあり、
-# 語彙を足すと今度は正当な指示文を巻き込む（実測で4周この往復をした）。
-# 網羅は最初から諦め、取りこぼしは下の「何も変わらないなら保存しない」で受け止める。
-_QUESTION_SUFFIXES = (
-    "っけ", "かな", "かしら", "ですか", "ますか", "でしたか", "ましたか",
-    "だっけ", "なの", "ですよね", "だよね", "よね",
-)
-
-# 文末に付く終助詞。これを落としてから語尾を見る
-# （「どうなってる」は捕まえるのに「どうなってるの」は捕まえられない、を防ぐ）。
-_TRAILING_PARTICLES = "のよねなさかぁあーっ〜 　"
-
-
-def _looks_like_question(text: str) -> bool:
-    """値の部分が疑問文に見えるかを判定する。
-
-    **これは補助的な歯止めである**。日本語の質問を言い回しで網羅することは
-    できないため、ここで漏れても実害が出ないよう、呼び出し側に
-    「何も変わらないなら保存しない」という構造側の歯止めを置いている。
-    そちらが本体で、こちらは分かりやすい質問を早めに弾くためのもの。
-
-    Args:
-        text: コマンドの値の部分。
-
-    Returns:
-        bool: 疑問に見えるなら True。
-    """
-    t = (text or "").strip()
-    if not t:
-        return False
-    if any(c in t for c in _QUESTION_CHARS):
-        return True
-    stripped = t.rstrip(_TRAILING_PARTICLES)
-    return t.endswith(_QUESTION_SUFFIXES) or stripped.endswith(_QUESTION_SUFFIXES)
-
 
 async def maybe_handle_followup_policy(message: discord.Message, content: str) -> bool:
     """親が AI フォロー方針に触れたとき、Web ダッシュボードへ案内する（親のみ）。
