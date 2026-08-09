@@ -338,6 +338,39 @@ def _tool_defs() -> list[dict]:
             },
         },
         {
+            "name": "propose_promise",
+            "description": (
+                "親子の間で決めた『条件つきの約束』を下書きとして記録する（例「1万円借りるかわりに"
+                "毎月500円ずつ10回返す」「ゲームは1日1時間まで」）。**まだ確定しない**。"
+                "おうちの人が承認して初めて有効になる。子どもが勝手に約束を作ることはできない。\n"
+                "使うのは、子どもと親のあいだで具体的な条件（何を・何回・どれくらいの期間）が"
+                "実際に話し合われたときだけ。子どもが「〜したい」と言っただけでは呼ばない。"
+                "こちらから借金や分割払いを提案してはいけない。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "子どもの名前"},
+                    "title": {"type": "string", "description": "約束の短い名前（例「パソコン代の返済」）"},
+                    "detail": {"type": "string", "description": "約束の中身（例「毎月500円ずつ10回返す」）"},
+                    "total_times": {"type": "integer", "description": "履行の回数（例10）。1〜120。"},
+                    "note": {"type": "string", "description": "どういう経緯でこの約束になったか。後から意図が分かるように残す。"},
+                },
+                "required": ["name", "title", "detail", "total_times"],
+            },
+        },
+        {
+            "name": "list_promises",
+            "description": (
+                "その子の約束の一覧と進み具合を返す。子どもが「あとどれくらい？」と聞いたときに使う。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "子どもの名前"}},
+                "required": ["name"],
+            },
+        },
+        {
             "name": "grant_allowance",
             "description": (
                 "査定の結果としてお小遣いを支給する（残高を増やす）。親の承認経路からのみ使う。fixed（固定の増額）と "
@@ -436,6 +469,47 @@ def _tool_defs() -> list[dict]:
                 "inputSchema": {"type": "object", "properties": {}, "required": []},
             },
             {
+            "name": "parent_list_promises",
+            "description": (
+                "親モード専用。子どもたちの約束の一覧と進み具合を返す。"
+                "承認まちの下書きも含めて表示する。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "子どもの名前（省略で全員）"}},
+            },
+        },
+        {
+            "name": "parent_approve_promise",
+            "description": (
+                "親モード専用。子どもの約束の下書きを承認して確定する。"
+                "確定して初めて進み具合の追跡とリマインドが始まる。"
+                "promise_id は parent_list_promises で確認できる。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "promise_id": {"type": "string", "description": "約束のID"},
+                },
+                "required": ["promise_id"],
+            },
+        },
+        {
+            "name": "parent_record_promise_progress",
+            "description": (
+                "親モード専用。約束の履行を1回ぶん進める（例「今月の返済を受け取った」）。"
+                "親が実際に確認したときだけ呼ぶこと。台帳から自動では判定しない。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "promise_id": {"type": "string", "description": "約束のID"},
+                    "note": {"type": "string", "description": "メモ（任意）"},
+                },
+                "required": ["promise_id"],
+            },
+        },
+        {
                 "name": "parent_get_pending",
                 "description": "承認待ちの査定提案の一覧を返す（残高は変えない）。親が『承認待ちは？』等と聞いたら呼ぶ。",
                 "inputSchema": {"type": "object", "properties": {}, "required": []},
@@ -606,6 +680,53 @@ def _do_record_income(args: dict) -> str:
         msg += f"\n🎉 目標「{goal.get('title')}」を達成したよ！"
     return msg
 
+
+
+def _do_propose_promise(args: dict) -> str:
+    """約束の下書きを作る（N-11.18）。確定は親の承認を要する。
+
+    子が勝手に約束を作れないよう、ここでは draft のまま止める。
+    親が承認して初めて追跡・通知の対象になる。
+    """
+    conf = _resolve_child(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
+    from app.promise_service import PromiseService
+    name = str(conf.get("name", ""))
+    ok, pid, msg = PromiseService().create_draft(
+        child_name=name,
+        title=str(args.get("title") or ""),
+        detail=str(args.get("detail") or ""),
+        total_times=args.get("total_times"),
+        note=str(args.get("note") or ""),
+    )
+    if not ok:
+        return msg
+    return (
+        f"{msg}\n"
+        "おうちの人が「約束承認」してくれたら、そこから一緒に進み具合を見ていくね。"
+    )
+
+
+def _do_list_promises(args: dict) -> str:
+    """その子の約束と進み具合を返す。減点でなく積み上がりを見せる。"""
+    conf = _resolve_child(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
+    from app.promise_service import PromiseService, STATUS_ACTIVE, STATUS_DRAFT
+    name = str(conf.get("name", ""))
+    ps = PromiseService()
+    active = ps.list_promises(name, STATUS_ACTIVE)
+    draft = ps.list_promises(name, STATUS_DRAFT)
+    if not active and not draft:
+        return "いまのところ、約束はないよ。"
+    lines = []
+    for p in active:
+        done, total = int(p.get("done_times", 0)), int(p.get("total_times", 0))
+        lines.append(f"・{p.get('title')}: {done}/{total} 回できたよ")
+    for p in draft:
+        lines.append(f"・{p.get('title')}: おうちの人の承認まちだよ")
+    return "\n".join(lines)
 
 def _do_set_initial_balance(args: dict) -> str:
     """初期設定。現在残高との差分を記録して指定額へ合わせる。operation_key 必須。"""
@@ -1452,6 +1573,53 @@ def _do_parent_get_pending(args: dict) -> str:
 
 
 # tool 名から実装への対応表。dispatch はここを引く
+
+def _do_parent_list_promises(args: dict) -> str:
+    """親向け: 約束の一覧と進み具合（承認まちも含む）。"""
+    if not (PARENT_MODE and ALLOW_ADMIN_OPS):
+        return "この操作は親のチャンネルからのみできるよ。"
+    from app.promise_service import PromiseService, STATUS_ACTIVE, STATUS_DRAFT
+    ps = PromiseService()
+    target = str(args.get("name") or "").strip()
+    rows = ps.list_promises(target) if target else ps.list_promises()
+    rows = [r for r in rows if r.get("status") in (STATUS_ACTIVE, STATUS_DRAFT)]
+    if not rows:
+        return "いま追いかけている約束はありません。"
+    lines = []
+    for r in rows:
+        if r.get("status") == STATUS_DRAFT:
+            lines.append(
+                f"・[承認まち] {r.get('child_name')}「{r.get('title')}」{r.get('detail')}\n"
+                f"　　ID: {r.get('id')}　経緯: {r.get('note') or 'なし'}"
+            )
+        else:
+            done, total = int(r.get("done_times", 0)), int(r.get("total_times", 0))
+            lines.append(
+                f"・{r.get('child_name')}「{r.get('title')}」{done}/{total} 回　ID: {r.get('id')}"
+            )
+    return "\n".join(lines)
+
+
+def _do_parent_approve_promise(args: dict) -> str:
+    """親向け: 約束の下書きを承認して確定する。"""
+    if not (PARENT_MODE and ALLOW_ADMIN_OPS):
+        return "この操作は親のチャンネルからのみできるよ。"
+    from app.promise_service import PromiseService
+    ok, msg = PromiseService().approve(str(args.get("promise_id") or ""))
+    return msg
+
+
+def _do_parent_record_promise_progress(args: dict) -> str:
+    """親向け: 約束の履行を1回進める。親が確認したときだけ呼ぶ。"""
+    if not (PARENT_MODE and ALLOW_ADMIN_OPS):
+        return "この操作は親のチャンネルからのみできるよ。"
+    from app.promise_service import PromiseService
+    ok, msg = PromiseService().record_progress(
+        str(args.get("promise_id") or ""), note=str(args.get("note") or ""),
+    )
+    return msg
+
+
 _HANDLERS = {
     "get_balance": _do_get_balance,
     "record_expense": _do_record_expense,
@@ -1460,6 +1628,8 @@ _HANDLERS = {
     "get_savings_goals": _do_get_savings_goals,
     "set_savings_goal": _do_set_savings_goal,
     "propose_allowance": _do_propose_allowance,
+    "propose_promise": _do_propose_promise,
+    "list_promises": _do_list_promises,
     "grant_allowance": _do_grant_allowance,
     # 親モード専用
     "parent_grant": _do_parent_grant,
@@ -1468,6 +1638,9 @@ _HANDLERS = {
     "parent_reject_assessment": _do_parent_reject_assessment,
     "parent_list_balances": _do_parent_list_balances,
     "parent_get_pending": _do_parent_get_pending,
+    "parent_list_promises": _do_parent_list_promises,
+    "parent_approve_promise": _do_parent_approve_promise,
+    "parent_record_promise_progress": _do_parent_record_promise_progress,
 }
 
 

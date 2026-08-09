@@ -97,6 +97,9 @@ ALLOWED_WALLET_TOOLS = [
     "mcp__wallet__set_savings_goal",
     # 査定は「提案」まで。残高は動かさず親の承認を待つ。実支給(grant_allowance)は親経路のみ
     "mcp__wallet__propose_allowance",
+    # 約束も「提案」まで。確定は親の承認（子が勝手に約束を作れない・N-11.18）
+    "mcp__wallet__propose_promise",
+    "mcp__wallet__list_promises",
 ]
 
 # 親会話の spawn で許可する tool。親は全児童の残高を操作できる保護者のため、支給・調整・査定承認等を
@@ -110,6 +113,10 @@ ALLOWED_PARENT_TOOLS = [
     "mcp__wallet__parent_reject_assessment",
     "mcp__wallet__parent_list_balances",
     "mcp__wallet__parent_get_pending",
+    # 約束の承認・履行記録（N-11.18）。確定は親だけができる
+    "mcp__wallet__parent_list_promises",
+    "mcp__wallet__parent_approve_promise",
+    "mcp__wallet__parent_record_promise_progress",
 ]
 
 

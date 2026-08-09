@@ -163,11 +163,67 @@ def _test_concurrent_progress_no_lost_update():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_tool_layer_permissions():
+    """tool 層で「子は提案まで・確定は親だけ」が守られること。
+
+    子が勝手に約束を作れないことは保存層(draft)と tool 層(親モード判定)の
+    二重で守る。片方だけでは、AI が親モード相当の呼び出しを試みたときに抜ける。
+    """
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        os.environ["COMPASS_ACTIVE_CHILD"] = "テスト"
+        from app import mcp_wallet as m
+        from app import promise_service as psvc
+
+        orig_cls = psvc.PromiseService
+
+        class _Scoped(orig_cls):
+            def __init__(self, data_dir=None):
+                super().__init__(data_dir=tmp)
+
+        psvc.PromiseService = _Scoped
+        try:
+            m.ACTIVE_CHILD = "テスト"
+            r = m._do_propose_promise({"name": "テスト", "title": "返済",
+                                       "detail": "毎月500円ずつ10回", "total_times": 10})
+            _check("tool_child_can_propose", "下書き" in r, r)
+
+            pid = _Scoped().list_promises("テスト")[0]["id"]
+
+            # 子モードでは承認できない
+            m.PARENT_MODE, m.ALLOW_ADMIN_OPS = False, False
+            r2 = m._do_parent_approve_promise({"promise_id": pid})
+            _check("tool_child_cannot_approve", "親のチャンネル" in r2, r2)
+            _check("tool_still_draft_after_child_attempt",
+                   _Scoped().get_promise(pid)["status"] == STATUS_DRAFT,
+                   _Scoped().get_promise(pid)["status"])
+
+            # 子モードでは履行も進められない
+            r3 = m._do_parent_record_promise_progress({"promise_id": pid})
+            _check("tool_child_cannot_record", "親のチャンネル" in r3, r3)
+
+            # 親モードなら承認できる
+            m.PARENT_MODE, m.ALLOW_ADMIN_OPS = True, True
+            r4 = m._do_parent_approve_promise({"promise_id": pid})
+            _check("tool_parent_can_approve",
+                   _Scoped().get_promise(pid)["status"] == STATUS_ACTIVE, r4)
+
+            # 履行の文面が積み上がり表示であること
+            r5 = m._do_parent_record_promise_progress({"promise_id": pid, "note": "1回目"})
+            _check("tool_progress_is_additive", "1/10" in r5 and "あと" not in r5, r5)
+        finally:
+            psvc.PromiseService = orig_cls
+            m.PARENT_MODE, m.ALLOW_ADMIN_OPS = False, False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     _test_approval_gates_tracking()
     _test_progress_and_completion()
     _test_limits_and_validation()
     _test_concurrent_progress_no_lost_update()
+    _test_tool_layer_permissions()
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))
