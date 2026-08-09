@@ -169,6 +169,96 @@ def _test_user_key_split():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_url_reissue_command():
+    """URL再発行コマンドが、打ったチャンネルで役割を正しく分けること。
+
+    実データで子「テスト」と親「とうちゃん」が同一 Discord ID を持つ（兼務アカウント）。
+    ID だけでは親か子か決まらないため、**どのチャンネルで打たれたか**で決める。
+    親チャンネル → parent、子チャンネル → child。
+
+    また DM が拒否設定のときは、チャンネルへフォールバックする
+    （親チャンネルは子から分離済みなので、最悪ここへ出しても子には見えない）。
+    """
+    import asyncio
+
+    import discord
+
+    from app import config, dashboard_token as dt, handlers_parent as H
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dt.TOKENS_PATH = tmp / "tokens.json"
+        sent, dms = [], []
+
+        class _Ch:
+            def __init__(self, cid):
+                self.id = cid
+
+            async def send(self, msg, **kw):
+                sent.append(msg)
+                return type("M", (), {"id": 1})()
+
+        class _Author:
+            def __init__(self, uid, dm_ok=True):
+                self.id = uid
+                self._ok = dm_ok
+
+            async def send(self, msg, **kw):
+                if not self._ok:
+                    raise discord.Forbidden(type("R", (), {"status": 403})(), "blocked")
+                dms.append(msg)
+
+        orig_client = H._client
+        H._client = type("C", (), {"user": type("U", (), {
+            "id": 1, "name": "compass-bot", "discriminator": "0"})()})()
+        orig_extract = H.extract_input_from_mention
+        H.extract_input_from_mention = lambda t, u: None
+        try:
+            parent_ch = config.get_parent_channel_id()
+            child_ch = sorted(config.get_allow_channel_ids() or {0})[0]
+            # 実データの兼務 ID（子「テスト」と親のどちらにも登録されている）
+            dual_id = 111
+
+            def _run(channel_id, dm_ok=True):
+                sent.clear()
+                dms.clear()
+                msg = type("M", (), {"channel": _Ch(channel_id),
+                                     "author": _Author(dual_id, dm_ok), "id": 1})()
+                return asyncio.new_event_loop().run_until_complete(
+                    H.maybe_handle_url_reissue(msg, "URL再発行"))
+
+            def _role_of(text):
+                token = text.split("/d/")[1].split(">")[0]
+                resolved = dt.resolve(token)
+                return resolved["user_key"] if resolved else None
+
+            handled = _run(parent_ch)
+            _check("reissue_handled_in_parent_channel", handled is True, handled)
+            _check("reissue_sends_dm", bool(dms), sent)
+            _check("reissue_parent_role",
+                   dms and _role_of(dms[0]).startswith("parent:"), dms[:1])
+
+            handled = _run(child_ch)
+            _check("reissue_handled_in_child_channel", handled is True, handled)
+            _check("reissue_child_role",
+                   dms and _role_of(dms[0]).startswith("child:"), dms[:1])
+
+            # DM 拒否時はチャンネルへ出す（詰まらない構成）
+            _run(parent_ch, dm_ok=False)
+            _check("reissue_falls_back_to_channel",
+                   any("/d/" in m for m in sent), sent[:1])
+
+            # リンクプレビューを抑止するため山括弧で囲む
+            _run(parent_ch)
+            _check("reissue_suppresses_preview",
+                   dms and "<http" in dms[0], dms[:1])
+        finally:
+            H._client = orig_client
+            H.extract_input_from_mention = orig_extract
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     _test_issue_and_resolve()
     _test_invalid_tokens_are_rejected()
@@ -176,6 +266,7 @@ def main():
     _test_same_discord_id_coexists()
     _test_broken_file_does_not_crash()
     _test_user_key_split()
+    _test_url_reissue_command()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

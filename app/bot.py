@@ -883,6 +883,10 @@ async def _on_message_impl(message: discord.Message):
         return
 
     # 親によるWebダッシュボードアクセス申請の承認（「web承認 [ユーザー名]」）
+    # URL再発行（親子共通）。Web に入口を置かず Discord からのみ再発行できる
+    if await handlers_parent.maybe_handle_url_reissue(message, content):
+        return
+
     if await handlers_parent.maybe_handle_web_approve(message, content):
         return
 

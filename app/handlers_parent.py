@@ -7,6 +7,8 @@ bot.py の肥大化防止のために分離。グローバル状態は init() �
 import re
 from datetime import datetime
 
+import json
+
 import discord
 
 from app.bot_utils import (
@@ -762,6 +764,120 @@ async def _drive_assessment_feedback() -> None:
         except Exception:
             # 1件の失敗で後続を止めない（再enqueueはしない＝重複opener防止）
             pass
+
+
+def _find_user_file_stem(discord_user_id: int, want_role: str) -> str | None:
+    """Discord ID と役割から、設定ファイル名（拡張子なし）を引く。
+
+    トークンのキーは user_key（`child:<ファイル名>` / `parent:<ファイル名>`）である。
+    **discord_user_id はキーにできない**。実データで子「テスト」と親「とうちゃん」が
+    同一 ID を持つ（兼務アカウント）ため、ID だけでは一意に定まらない。
+    そこで「どのチャンネルで打たれたか」で役割を先に決め、この関数で絞り込む。
+
+    Args:
+        discord_user_id: 打った人の Discord ID。
+        want_role: dashboard_token.ROLE_CHILD / ROLE_PARENT。
+
+    Returns:
+        str | None: 設定ファイル名。見つからなければ None。
+    """
+    from app import dashboard_token
+    from app.config import CHILDREN_DIR, PARENTS_DIR
+
+    base = (PARENTS_DIR if want_role == dashboard_token.ROLE_PARENT else CHILDREN_DIR)
+    if not base.exists():
+        return None
+    for path in sorted(base.glob("*.json")):
+        if path.name.endswith(".example.json"):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if int(data.get("discord_user_id", 0) or 0) == int(discord_user_id):
+            return path.stem
+    return None
+
+
+async def _send_dashboard_url(message: discord.Message, token: str, role: str) -> None:
+    """発行した URL を本人へ届ける。**まず DM、届かなければそのチャンネルへ**。
+
+    親チャンネルは夫婦2人が見ているため、そこへ流すと相手の URL も見えてしまう。
+    DM なら打った本人にだけ届く。
+    ただし DM は相手の設定次第で `discord.Forbidden` になるため、
+    **届かなかったときはチャンネルへ出す**（親チャンネルは子から分離済みなので、
+    最悪ここへ出しても子には見えない）。片方が失敗しても詰まらない構成にする。
+
+    Args:
+        message: コマンドを打ったメッセージ。
+        token: 発行された UUID。
+        role: child / parent。
+    """
+    base_url = get_web_base_url().rstrip("/")
+    url = f"{base_url}/compass-bot/d/{token}"
+    body = (
+        "あたらしいダッシュボードのURLだよ。ひらいてブックマークしてね。\n"
+        # 山括弧で囲むと Discord がリンクプレビューを作らない。
+        # プレビューのために Discord 側が URL をクロールし、UUID がログに残るのを避ける
+        f"<{url}>\n"
+        "（このURLは自分専用だよ。ほかの人に見せないでね）"
+    )
+    try:
+        await message.author.send(body)
+        await message.channel.send("あたらしいURLをDMで送ったよ。")
+        return
+    except discord.Forbidden:
+        # DM が拒否設定のとき。親チャンネル（子から分離済み）へ出す
+        await message.channel.send(body)
+    except Exception as exc:  # noqa: BLE001 - 送信失敗で処理を止めない
+        _log_parent_handler_error(message, "dashboard_url_dm_failed", exc)
+        await message.channel.send(body)
+
+
+async def maybe_handle_url_reissue(message: discord.Message, content: str) -> bool:
+    """「URL再発行」コマンド。**打った本人のダッシュボードURLだけ**を再発行する（親子共通）。
+
+    再発行の入口を Web に置かない理由（docs/設計_UUID認証方式.md）:
+      URL が漏れた場合、Web に入口があると**盗んだ側も同じ画面から再発行できる**。
+      盗った側が先に再発行すると、正規の本人が締め出される。
+      Discord のアカウントは本人確認済みの独立した経路なので、
+      URL を盗んだだけの相手は再発行できず、正規の本人はいつでも取り戻せる。
+
+    **他人の UUID は誰も再発行できない**（本人の Discord アカウントからのみ）。
+
+    Args:
+        message: Discord メッセージ。
+        content: 発話本文。
+
+    Returns:
+        bool: このコマンドとして処理したら True。
+    """
+    from app import dashboard_token
+    from app.config import is_parent_channel
+
+    body = _command_body(content)
+    if body.strip() not in {"URL再発行", "url再発行", "URLさいはっこう", "ダッシュボードURL"}:
+        return False
+
+    # 兼務アカウント（親IDが子としても登録されている）があるため、
+    # **どのチャンネルで打たれたか**で役割を決める
+    if is_parent_channel(message.channel.id):
+        role = dashboard_token.ROLE_PARENT
+    else:
+        role = dashboard_token.ROLE_CHILD
+
+    stem = _find_user_file_stem(message.author.id, role)
+    if stem is None:
+        await message.channel.send(
+            "ごめん、あなたの登録が見つからなかったよ。おうちの人に伝えてね。"
+        )
+        return True
+
+    user_key = dashboard_token.build_user_key(role, stem)
+    token = dashboard_token.issue(user_key, role, issued_by=str(message.author.id))
+    await _send_dashboard_url(message, token, role)
+    return True
 
 
 async def maybe_handle_web_approve(message: discord.Message, content: str) -> bool:
