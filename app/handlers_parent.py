@@ -137,6 +137,31 @@ def _log_parent_handler_error(message: discord.Message, event: str, error: Excep
         print(f"[parent_handler_diagnostics] log error: {type(log_error).__name__}: {log_error}")
 
 
+def _is_exact_command(content: str, *forms: str) -> bool:
+    """引数の無い固定コマンドを**完全一致**で判定する（N-11.17）。
+
+    従来は `"使い方の説明" in normalized` のような部分一致で判定しており、
+    ①文中にその語があるだけで発火する ②「使い方の説明」と「使い方の説明と初期設定」が
+    衝突するため否定条件（`"初期設定" not in ...`）で回避する、という状態だった。
+    後者は **bot.py の呼び出し順に依存する暗黙のルール**で、
+    並び順を変えると壊れる。順序依存を無くすには完全一致にするのが正しい。
+
+    引数を取るコマンド（支給・残高調整など）はここでは扱わない。
+    それらは言葉の解釈が要るため AI に構造化させる（A案）。
+
+    Args:
+        content: 生のメッセージ本文。
+        *forms: 許可する表記（漢字・ひらがな等の表記ゆれを列挙する）。
+
+    Returns:
+        bool: いずれかの表記と完全一致すれば True。
+    """
+    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
+    body = mention_body if mention_body is not None else (content or "")
+    normalized = _normalize_japanese_command(body).strip()
+    return any(normalized == f for f in forms)
+
+
 def _parent_op_key(message: discord.Message, action: str, target: str) -> str:
     """親のテキストコマンド用の冪等キーを作る。
 
@@ -248,15 +273,9 @@ async def maybe_handle_parent_broadcast_guide(message: discord.Message, content:
     if not _is_parent(message.author.id):
         return False
 
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    body = mention_body if mention_body is not None else (content or "")
-    normalized = _normalize_japanese_command(body)
-    # 「と初期設定」付きを先に判定して単体送信と区別する
-    is_cmd = (
-        "使い方の説明と初期設定" in normalized
-        or "つかいかたのせつめいとしょきせってい" in normalized
-    )
-    if not is_cmd:
+    # 完全一致で判定する（N-11.17）。部分一致だと文中にこの語があるだけで一斉送信が走る
+    if not _is_exact_command(content, "使い方の説明と初期設定",
+                             "つかいかたのせつめいとしょきせってい"):
         return False
 
     channel_ids = get_allow_channel_ids()
@@ -308,10 +327,8 @@ async def maybe_handle_safety_setup_check(message: discord.Message, content: str
     """
     if not _is_parent(message.author.id):
         return False
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    body = mention_body if mention_body is not None else (content or "")
-    normalized = _normalize_japanese_command(body)
-    if not ("安全設定チェック" in normalized or "あんぜんせっていちぇっく" in normalized):
+    # 完全一致で判定する（N-11.17）
+    if not _is_exact_command(content, "安全設定チェック", "あんぜんせっていちぇっく"):
         return False
 
     from app.config import get_safety_alert_setting, get_allowance_reminder_setting, load_all_users
@@ -408,18 +425,9 @@ async def maybe_handle_parent_usage_single(message: discord.Message, content: st
     if not _is_parent(message.author.id):
         return False
 
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    body = mention_body if mention_body is not None else (content or "")
-    normalized = _normalize_japanese_command(body)
-    # 「と初期設定」付きは一斉送信コマンドなのでここでは除外する
-    is_cmd = (
-        "使い方の説明" in normalized
-        or "つかいかたのせつめい" in normalized
-    ) and (
-        "初期設定" not in normalized
-        and "しょきせってい" not in normalized
-    )
-    if not is_cmd:
+    # 完全一致なので「使い方の説明と初期設定」とは自然に区別される（N-11.17）。
+    # 従来は部分一致＋否定条件で除外しており、bot.py の呼び出し順に依存していた。
+    if not _is_exact_command(content, "使い方の説明", "つかいかたのせつめい"):
         return False
 
     # コマンドを送ったチャンネルに直接送信する
@@ -434,12 +442,9 @@ async def maybe_handle_parent_dashboard(message: discord.Message, content: str) 
     if not _is_parent(message.author.id):
         return False
 
-    # メンション部分を除去してコマンド本文を取得する
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    body = mention_body if mention_body is not None else (content or "")
-    normalized = _normalize_japanese_command(body)
-    # 「全体確認」「ぜんたいかくにん」のどちらでも反応する
-    if "全体確認" not in normalized and "ぜんたいかくにん" not in normalized:
+    # 「全体確認」「ぜんたいかくにん」に**完全一致**したときだけ反応する（N-11.17）。
+    # 部分一致だと「全体確認ってどうやるの？」のような疑問文でも発火する
+    if not _is_exact_command(content, "全体確認", "ぜんたいかくにん"):
         return False
 
     # ユーザー一覧・残高監査状態・ログディレクトリを取得する

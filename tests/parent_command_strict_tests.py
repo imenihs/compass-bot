@@ -95,6 +95,33 @@ def _run():
         handled = asyncio.get_event_loop().run_until_complete(handlers_parent.maybe_handle_balance_adjustment(msg, c))
         _check("exact_adjust_applied", handled and bal() == before - 100, f"{before}->{bal()}")
 
+    # 固定コマンドが完全一致で判定され、順序依存が無いこと（N-11.17）
+    from app import handlers_parent as _H
+
+    class _U:
+        id = 1
+        name = "compass-bot"
+        discriminator = "0"
+
+    _orig_client = _H._client
+    _H._client = type("C", (), {"user": _U()})()
+    try:
+        # 完全一致したときだけ発火する（疑問文・文中では発火しない）
+        for _t, _want in [("全体確認", True), ("ぜんたいかくにん", True),
+                          ("全体確認ってどうやるの？", False), ("あとで全体確認するね", False)]:
+            _got = _H._is_exact_command(_t, "全体確認", "ぜんたいかくにん")
+            _check(f"exact_dashboard::{_t[:14]}", _got is _want, _got)
+        # 「使い方の説明」と「使い方の説明と初期設定」が否定条件なしで排他になる
+        for _t, _ws, _wb in [("使い方の説明", True, False),
+                             ("使い方の説明と初期設定", False, True)]:
+            _s1 = _H._is_exact_command(_t, "使い方の説明", "つかいかたのせつめい")
+            _s2 = _H._is_exact_command(_t, "使い方の説明と初期設定",
+                                       "つかいかたのせつめいとしょきせってい")
+            _check(f"exact_usage_exclusive::{_t[:12]}",
+                   _s1 is _ws and _s2 is _wb, f"single={_s1} broad={_s2}")
+    finally:
+        _H._client = _orig_client
+
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))
