@@ -311,6 +311,26 @@ def _tool_defs() -> list[dict]:
             },
         },
         {
+            "name": "contribute_to_goal",
+            "description": (
+                "目標へ積み立てる／立て替えを返す。残高が減り、その目標の進み具合が増える。"
+                "子が『500円貯金した』『パソコン代を500円返した』と言ったときに呼ぶ。"
+                "どの目標かは goal_id で指定する（get_savings_goals の [番号]）。"
+                "目標が複数あって子がどれか言っていないときは、**呼ばずに『どれに？』と聞き返すこと**。"
+                "金額は子が言った額だけを渡す。推測して決めてはいけない。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "子どもの名前"},
+                    "goal_id": {"type": "integer", "description": "対象の目標番号"},
+                    "amount": {"type": "integer", "description": "積む／返す額（円。子が明示した値）"},
+                    "operation_key": op_key,
+                },
+                "required": ["name", "goal_id", "amount", "operation_key"],
+            },
+        },
+        {
             "name": "propose_allowance",
             "description": (
                 "査定の結果としてお小遣いの支給を『提案』する（残高はまだ動かさない）。おうちの人が承認して"
@@ -764,6 +784,92 @@ def _do_set_initial_balance(args: dict) -> str:
     return f"初期設定を反映したよ。\n対象: {name}\n所持金: {before}円 → {after}円"
 
 
+def _do_contribute_to_goal(args: dict) -> str:
+    """目標へ積み立てる／立て替えを返す。残高を減らし、その目標の accumulated を増やす。
+
+    貯金も立て替え返済も「ある数字が target_amount へ向かって増える」同じ構造なので、
+    同じ tool で扱う（対象の kind が saving か advance かの違いだけ）。
+
+    **既存の金額 tool の作法をすべて踏襲する**（1つでも落とすと穴になる）:
+      1. `_resolve_child`      … AI が別の子を指定しても Python 側で弾く（ACTIVE_CHILD 境界）
+      2. `_parse_amount`       … 範囲外・数値でないものを弾く
+      3. `operation_key` 必須  … 再送で二重に引かれると残高が余計に減る
+      4. `_scoped_op_key`      … 子ごとに名前空間を分ける。落とすと子Aの "repay_1" が子Bの返済を消す
+      5. `_natural_dup_key`    … 言い直しを弾く。**goal_id を含める**（後述）
+      6. 残高不足なら拒否      … 子の残高をマイナスにしない（wallet 側で判定）
+
+    **⑤の注意**: 積立・返済は「毎月500円」のような定額の繰り返しで、
+    内容キーが構造的に衝突する。`item` に goal_id を含めることで、
+    別の目標への同額積立を誤って弾かないようにする。
+    窓（DEDUP_WINDOW_SEC）も必ず渡す。0 だと「存在するだけで弾く」動作になり、
+    2回目以降の返済が無音で拒否される。
+
+    Args:
+        args: name / goal_id / amount / operation_key。
+
+    Returns:
+        str: 子へ返す文面。
+    """
+    conf = _resolve_child(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
+    name = str(conf.get("name", ""))
+
+    amount = _parse_amount(args.get("amount"))
+    if amount is None:
+        return f"きんがくがうまく読めなかったよ。1円から{MAX_AMOUNT}円までの数字で教えてね。"
+
+    op_key = str(args.get("operation_key") or "").strip()
+    if not op_key:
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
+
+    try:
+        goal_id = int(args.get("goal_id"))
+    except (TypeError, ValueError):
+        return "どの目標かが分からなかったよ。目標の番号を教えてね。"
+
+    eff_key = _scoped_op_key(name, "goal_contribution", op_key)
+    # 内容キーに goal_id を混ぜる。定額の繰り返しでも別目標なら別キーになる
+    dup_key = _natural_dup_key(name, "goal_contribution", amount, f"goal{goal_id}")
+
+    from app.wallet_service import _PrecheckRejected
+    try:
+        applied, balance, goal, closed = _wallet.contribute_to_goal(
+            user_conf=conf,
+            system_conf=_system_conf(),
+            goal_id=goal_id,
+            amount=amount,
+            operation_key=eff_key,
+            aux_operation_keys=[dup_key],
+            aux_dedup_window_sec=DEDUP_WINDOW_SEC,
+        )
+    except _PrecheckRejected as e:
+        return str(e)
+    except ValueError as e:
+        return str(e)
+
+    title = str((goal or {}).get("title", ""))
+    kind = str((goal or {}).get("kind", "saving"))
+    verb = "返した" if kind == "advance" else "貯めた"
+
+    if applied == 0:
+        # 冪等再送。残高は動いていない。**完済の祝いは出さない**（二度出さないため）
+        return f"それはさっき記録したよ。今の残高は {balance}円。"
+
+    accumulated = int((goal or {}).get("accumulated", 0) or 0)
+    target = int((goal or {}).get("target_amount", 0) or 0)
+    if closed:
+        done_word = "返しきった" if kind == "advance" else "貯めきった"
+        extra = ""
+        if applied < amount:
+            # 過払いは残額へ丸めた。差額は引いていないことを伝える
+            extra = f"\n（{amount}円って言ってくれたけど、のこりは {applied}円だったよ）"
+        return (f"やったね！「{title}」を{done_word}よ。"
+                f"\n{applied}円{verb}。残高は {balance}円。{extra}")
+    return (f"{applied}円{verb}よ。「{title}」は {accumulated}/{target}円になった。"
+            f"\n残高は {balance}円。")
+
+
 def _do_get_savings_goals(args: dict) -> str:
     """貯金目標一覧。残高を変えない。"""
     conf = _resolve_child(str(args.get("name", "")))
@@ -774,12 +880,26 @@ def _do_get_savings_goals(args: dict) -> str:
     current = _wallet.get_balance(name)
     if not goals:
         return f"{name}さんはまだ貯金目標が無いよ（残高: {current}円）。"
-    lines = [f"{name}さんの貯金目標（残高: {current}円）:"]
+    lines = [f"{name}さんの目標（残高: {current}円）:"]
     for g in goals:
         title = str(g.get("title", ""))
-        target = int(g.get("target_amount", 0))
-        remaining = max(target - current, 0)
-        lines.append(f"・{title}: {target}円（あと{remaining}円）")
+        target = int(g.get("target_amount", 0) or 0)
+        # 進捗は **その目標に積んだ額**（accumulated）で見る。
+        # 総残高で見ると、目標が2つあるとき同じお金が両方に計上され、
+        # 残高が目標額を超えただけで達成扱いになる（2026/08/10 に是正）
+        accumulated = int(g.get("accumulated", 0) or 0)
+        remaining = max(target - accumulated, 0)
+        kind = str(g.get("kind", "saving"))
+        status = str(g.get("status", "active"))
+        goal_id = int(g.get("id", 0) or 0)
+        label = "返済" if kind == "advance" else "貯金"
+        if status == "done":
+            lines.append(f"・[{goal_id}] {title}（{label}）: 達成ずみ！")
+        else:
+            lines.append(
+                f"・[{goal_id}] {title}（{label}）: {accumulated}/{target}円"
+                f"（あと{remaining}円）"
+            )
     return "\n".join(lines)
 
 
@@ -1609,6 +1729,7 @@ _HANDLERS = {
     "set_initial_balance": _do_set_initial_balance,
     "get_savings_goals": _do_get_savings_goals,
     "set_savings_goal": _do_set_savings_goal,
+    "contribute_to_goal": _do_contribute_to_goal,
     "propose_allowance": _do_propose_allowance,
     "propose_promise": _do_propose_promise,
     "list_promises": _do_list_promises,

@@ -238,6 +238,81 @@ def _test_migration_three_cases():
            len(single) == 1 and single[0].get("kind") == "saving", single)
 
 
+def _test_tool_layer():
+    """tool 層（子がチャットから使う経路）が既存の作法をすべて守ること。
+
+    作法を1つでも落とすと穴になる:
+      _resolve_child(別の子を弾く) / _parse_amount / operation_key必須 /
+      _scoped_op_key(子ごとの名前空間) / _natural_dup_key(言い直し) / 残高不足の拒否
+    """
+    import os
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        (tmp / "logs").mkdir(exist_ok=True)
+        json.dump({"users": {"たろう": {"expected_balance": 10000, "savings_goals": [
+            _goal(1, "saving", "パソコン", 150000),
+            _goal(2, "advance", "パソコン代", 3000, accumulated=2800),
+        ]}}}, open(tmp / "wallet_state.json", "w"))
+
+        from app import config, wallet_service
+        config.get_log_dir = lambda *a, **k: tmp / "logs"
+        wallet_service.get_log_dir = lambda *a, **k: tmp / "logs"
+        from app import mcp_wallet as m
+        m._wallet.wallet_state_path = tmp / "wallet_state.json"
+        m.ACTIVE_CHILD = "たろう"
+        m._resolve_child = lambda n=None: {"name": "たろう"}
+        m._system_conf = lambda: {}
+
+        r = m._do_contribute_to_goal(
+            {"name": "たろう", "goal_id": 1, "amount": 3000, "operation_key": "c1"})
+        _check("tool_contributes", "3000円貯めた" in r, r)
+        _check("tool_shows_progress", "3000/150000" in r, r)
+
+        # 冪等再送: 残高を動かさず、完済の祝いも出さない
+        r = m._do_contribute_to_goal(
+            {"name": "たろう", "goal_id": 1, "amount": 3000, "operation_key": "c1"})
+        _check("tool_idempotent", "さっき記録した" in r, r)
+        _check("tool_idempotent_balance", m._wallet.get_balance("たろう") == 7000,
+               m._wallet.get_balance("たろう"))
+
+        # 過払いは丸めて完済し、差額を子へ伝える
+        r = m._do_contribute_to_goal(
+            {"name": "たろう", "goal_id": 2, "amount": 500, "operation_key": "c2"})
+        _check("tool_overpay_closes", "返しきった" in r, r)
+        _check("tool_overpay_explains", "のこりは 200円" in r, r)
+
+        # operation_key 無しは拒否（再送で二重に引かれるのを防ぐ）
+        r = m._do_contribute_to_goal({"name": "たろう", "goal_id": 1, "amount": 100})
+        _check("tool_requires_op_key", "うまくできなかった" in r, r)
+
+        # goal_id 無しは聞き返す材料を返す
+        r = m._do_contribute_to_goal(
+            {"name": "たろう", "amount": 100, "operation_key": "c9"})
+        _check("tool_requires_goal_id", "どの目標か" in r, r)
+
+        # 存在しない目標・完済済み・残高不足
+        r = m._do_contribute_to_goal(
+            {"name": "たろう", "goal_id": 99, "amount": 100, "operation_key": "c10"})
+        _check("tool_rejects_missing_goal", "見つからなかった" in r, r)
+        r = m._do_contribute_to_goal(
+            {"name": "たろう", "goal_id": 2, "amount": 100, "operation_key": "c11"})
+        _check("tool_rejects_done_goal", "もう終わっている" in r, r)
+        before = m._wallet.get_balance("たろう")
+        r = m._do_contribute_to_goal(
+            {"name": "たろう", "goal_id": 1, "amount": 999999, "operation_key": "c12"})
+        _check("tool_rejects_insufficient", "足りない" in r, r)
+        _check("tool_rejects_keeps_balance",
+               m._wallet.get_balance("たろう") == before, m._wallet.get_balance("たろう"))
+
+        # 一覧は accumulated ベースで出す（総残高ではない）
+        listing = m._do_get_savings_goals({"name": "たろう"})
+        _check("listing_uses_accumulated", "3000/150000" in listing, listing)
+        _check("listing_marks_done", "達成ずみ" in listing, listing)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     _test_normal_contribution()
     _test_idempotent_resend()
@@ -245,6 +320,7 @@ def main():
     _test_rejections()
     _test_ledger_record()
     _test_migration_three_cases()
+    _test_tool_layer()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

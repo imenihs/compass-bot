@@ -95,6 +95,8 @@ ALLOWED_WALLET_TOOLS = [
     "mcp__wallet__record_income",
     "mcp__wallet__get_savings_goals",
     "mcp__wallet__set_savings_goal",
+    # 目標への積立・立て替えの返済（貯金と返済は同じ構造なので同じtool）
+    "mcp__wallet__contribute_to_goal",
     # 査定は「提案」まで。残高は動かさず親の承認を待つ。実支給(grant_allowance)は親経路のみ
     "mcp__wallet__propose_allowance",
     # 約束も「提案」まで。確定は親の承認（子が勝手に約束を作れない・N-11.18）
