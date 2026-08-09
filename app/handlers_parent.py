@@ -693,6 +693,33 @@ async def maybe_handle_user_setting_change(message: discord.Message, content: st
     return True
 
 
+# 疑問・引用を示す語尾。これらが値に混ざっているものは「設定の指示」ではなく「質問」とみなす。
+# 設定を書き換える手前で弾くために使う（親の質問で実設定が変わるのを防ぐ）。
+_QUESTION_MARKERS = (
+    "？", "?", "っけ", "かな", "ですか", "でしたか", "だっけ",
+    "の？", "なの", "って言った", "って設定", "ってした", "とは",
+)
+
+
+def _looks_like_question(text: str) -> bool:
+    """値の部分が疑問文・引用に見えるかを判定する。
+
+    コマンドの引数は本来「軽め」「普通」のような短い値である。
+    そこに疑問の語尾が混ざっている場合、親は設定を指示したのではなく
+    現状を尋ねている可能性が高いため、設定変更として扱わない。
+
+    Args:
+        text: コマンドの値の部分。
+
+    Returns:
+        bool: 疑問・引用に見えるなら True。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(mark in t for mark in _QUESTION_MARKERS)
+
+
 async def maybe_handle_followup_policy(message: discord.Message, content: str) -> bool:
     """親がDiscordから子ども別AIフォロー方針を確認・変更する"""
     body = _command_body(content)
@@ -718,6 +745,14 @@ async def maybe_handle_followup_policy(message: discord.Message, content: str) -
     if not rest:
         await message.channel.send(_follow_policy_summary(target_name, current_policy))
         return True
+
+    # 疑問・引用の形は設定変更として扱わない（N-11.17）。
+    # 正規表現が DOTALL + (.+)$ で行末まで飲むため、
+    # 「フォロー方針 たろう 軽め って設定したっけ？」が値「軽め って設定したっけ？」として通り、
+    # 実設定が書き換わったうえ疑問文がそのまま parent_note（子のAIプロンプトに載る）へ入っていた。
+    # 該当する場合は False を返して会話層（AI 経路）へ流し、親には自然文で答える。
+    if _looks_like_question(rest):
+        return False
 
     updates, note = _parse_follow_policy_updates(rest)
     if strength_m:

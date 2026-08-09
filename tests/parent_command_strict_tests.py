@@ -81,19 +81,36 @@ def _run():
             asyncio.get_event_loop().run_until_complete(handlers_parent.maybe_handle_user_setting_change(msg, c))
             _check(f"block::{c[:20]}", bal() == before, f"balance moved {before}->{bal()} on: {c}")
 
-        # --- 厳密コマンドは実行される(支給) ---
+        # --- 厳密コマンドは「受理される」が、その場では実行せず確認を出す ---
+        # N-11.17 で経路をそろえた。以前はコマンドだけ即実行で、AI 経路にだけ確認があり、
+        # 「AI 経由なら桁の打ち間違いを親が捕まえられるが、コマンドなら素通り」だった。
+        from app import parent_confirm as pc
+
+        pc.clear_pending(999)
         before = bal()
         c = "支給 はな 200円"
         msg = _FakeMessage(c, 999)
         handled = asyncio.get_event_loop().run_until_complete(handlers_parent.maybe_handle_manual_grant(msg, c))
-        _check("exact_grant_applied", handled and bal() == before + 200, f"{before}->{bal()}")
+        _check("exact_grant_accepted", bool(handled), handled)
+        _check("exact_grant_defers_to_confirm", bal() == before, f"{before}->{bal()}")
+        rec = pc.take_pending(999)
+        _check("exact_grant_pending_values",
+               rec and rec["action"] == "parent_grant"
+               and rec["args"]["name"] == "はな" and rec["args"]["amount"] == 200, rec)
 
-        # --- 厳密コマンド(残高調整)は実行される ---
+        # --- 厳密コマンド(残高調整)も同じく確認を挟む ---
+        pc.clear_pending(999)
         before = bal()
         c = "残高調整 はな -100円"
         msg = _FakeMessage(c, 999)
         handled = asyncio.get_event_loop().run_until_complete(handlers_parent.maybe_handle_balance_adjustment(msg, c))
-        _check("exact_adjust_applied", handled and bal() == before - 100, f"{before}->{bal()}")
+        _check("exact_adjust_accepted", bool(handled), handled)
+        _check("exact_adjust_defers_to_confirm", bal() == before, f"{before}->{bal()}")
+        rec = pc.take_pending(999)
+        _check("exact_adjust_pending_values",
+               rec and rec["action"] == "parent_adjust_balance"
+               and rec["args"]["delta"] == -100, rec)
+        pc.clear_pending(999)
 
     # 固定コマンドが完全一致で判定され、順序依存が無いこと（N-11.17）
     from app import handlers_parent as _H
