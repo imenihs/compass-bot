@@ -189,6 +189,66 @@ def detect(text: str) -> dict | None:
     return best
 
 
+def summarize_long_term_signals(records: list, now_sec: float,
+                                window_days: int = 30) -> dict:
+    """過去の検知履歴から、長期の傾向を要約する（N-11.16 長期シグナル）。
+
+    1ターンだけを見ていると「先週殴ると言っていた子が今日カッターを買う」を捉えられない。
+    「死にたい」の1発言より、数週間かけて下がるトーンのほうが危険信号として正確である。
+    会話履歴（直近6ターン固定）では届かないため、検知の記録そのものを時系列で見る。
+
+    Args:
+        records: [{"ts_sec": float, "category": str, "urgency": str}, ...] の履歴。
+        now_sec: 現在時刻（epoch 秒）。
+        window_days: 集計する期間（日）。
+
+    Returns:
+        dict: {
+            "total": int,              # 期間内の検知総数
+            "by_category": dict,       # カテゴリ別の件数
+            "escalating": bool,        # 直近1週間が、その前の3週間の平均より増えているか
+            "recent_week": int,        # 直近1週間の件数
+            "distinct_categories": int,# 期間内に出たカテゴリの種類数
+            "notable": list,           # 注視すべき所見（日本語）
+        }
+    """
+    window_sec = window_days * 86400
+    recent = [r for r in (records or [])
+              if isinstance(r, dict) and (now_sec - float(r.get("ts_sec") or 0)) <= window_sec]
+    by_cat: dict[str, int] = {}
+    for r in recent:
+        c = str(r.get("category") or "")
+        if c:
+            by_cat[c] = by_cat.get(c, 0) + 1
+
+    week_sec = 7 * 86400
+    recent_week = sum(1 for r in recent if (now_sec - float(r.get("ts_sec") or 0)) <= week_sec)
+    older = len(recent) - recent_week
+    # 直近1週間の頻度が、それ以前の週あたり平均を上回っていれば増加傾向とみなす
+    older_weeks = max((window_days - 7) / 7.0, 1.0)
+    escalating = bool(recent_week > 0 and recent_week > (older / older_weeks))
+
+    notable = []
+    if escalating and recent_week >= 2:
+        notable.append(f"直近1週間で{recent_week}件と、以前より増えています。")
+    if len(by_cat) >= 2:
+        notable.append(f"種類の異なる訴えが{len(by_cat)}種類出ています（{', '.join(by_cat)}）。")
+    # 家庭内の訴えと家庭外の訴えが同時に出ている場合、どちらかが言い換えの可能性がある
+    if "abuse" in by_cat and "bullying" in by_cat:
+        notable.append("家庭内と家庭外の両方の訴えが出ています。どちらかが言いかえの可能性もあります。")
+    if by_cat.get("self_harm", 0) >= 2:
+        notable.append("つらさの訴えが繰り返されています。")
+
+    return {
+        "total": len(recent),
+        "by_category": by_cat,
+        "escalating": escalating,
+        "recent_week": recent_week,
+        "distinct_categories": len(by_cat),
+        "notable": notable,
+    }
+
+
 def build_ai_judge_prompt(text: str, age: int | None) -> str:
     """AI に危険信号を意味で判定させるための指示文を組み立てる（判定の主）。
 
@@ -695,6 +755,11 @@ def build_parent_notification(child_name: str, judgment: dict, raw_text: str,
         "**■ どういう状況か**",
         f"{judgment.get('ai_reason') or '会話の中に気になる内容がありました。'}",
     ]
+
+    # 長期の傾向（数週間の蓄積）を添える。1ターンだけでは見えない変化を親へ渡す
+    lt = judgment.get("long_term") or {}
+    for line in (lt.get("notable") or []):
+        lines.append(f"※ {line}")
 
     # 直近に同種の訴えが繰り返されていた場合は件数を伝える（頻度そのものが重要な情報）
     if repeated_count > 0:

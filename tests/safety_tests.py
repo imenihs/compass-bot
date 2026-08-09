@@ -389,6 +389,49 @@ def _test_safety_notice():
     safety._NOTICE_DONE.discard("テスト子")
 
 
+def _test_long_term_signals():
+    """長期の傾向が要約され、通知へ載ること。履歴が無いときは黙ること。"""
+    now, D = 1_000_000.0, 86400
+    recs = [
+        {"ts_sec": now - 25 * D, "category": "bullying", "urgency": "high"},
+        {"ts_sec": now - 18 * D, "category": "bullying", "urgency": "high"},
+        {"ts_sec": now - 5 * D, "category": "self_harm", "urgency": "high"},
+        {"ts_sec": now - 3 * D, "category": "self_harm", "urgency": "urgent"},
+        {"ts_sec": now - 1 * D, "category": "substance", "urgency": "medium"},
+    ]
+    r = safety.summarize_long_term_signals(recs, now)
+    _check("longterm_counts_total", r["total"] == 5, r)
+    _check("longterm_recent_week", r["recent_week"] == 3, r)
+    _check("longterm_detects_escalation", r["escalating"] is True, r)
+    _check("longterm_counts_categories", r["distinct_categories"] == 3, r)
+    _check("longterm_notes_repeated_self_harm",
+           any("つらさの訴えが繰り返され" in n for n in r["notable"]), r["notable"])
+
+    # 家庭内と家庭外が同時に出ていれば、言いかえの可能性を示唆する
+    r2 = safety.summarize_long_term_signals([
+        {"ts_sec": now - 2 * D, "category": "abuse", "urgency": "urgent"},
+        {"ts_sec": now - 1 * D, "category": "bullying", "urgency": "high"},
+    ], now)
+    _check("longterm_notes_abuse_and_bullying",
+           any("家庭内と家庭外" in n for n in r2["notable"]), r2["notable"])
+
+    # 期間外は数えない
+    r3 = safety.summarize_long_term_signals(
+        [{"ts_sec": now - 60 * D, "category": "bullying", "urgency": "high"}], now)
+    _check("longterm_excludes_old", r3["total"] == 0, r3)
+
+    # 履歴が無ければ何も言わない（根拠のない警告を出さない）
+    r4 = safety.summarize_long_term_signals([], now)
+    _check("longterm_silent_without_history", r4["notable"] == [], r4)
+
+    # 通知本文へ反映される
+    body = safety.build_parent_notification(
+        "たろう", {"category": "self_harm", "urgency": "urgent", "confidence": 0.9,
+                   "ai_reason": "つらさの訴え", "long_term": r},
+        "もうしんどい", child_consent="unknown")
+    _check("longterm_appears_in_notification", "以前より増えています" in body, body[:300])
+
+
 def main():
     _test_python_floor()
     _test_merge_abuse_never_to_parent()
@@ -399,6 +442,7 @@ def main():
     _test_consent_flow()
     _test_post_notification_care()
     _test_safety_notice()
+    _test_long_term_signals()
     _test_notification_content()
     _test_hotlines_are_constants()
     _test_routing()
