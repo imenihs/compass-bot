@@ -1692,8 +1692,11 @@ def _do_parent_confirm_money_action(args: dict) -> str:
     parent_id = int(os.environ.get("COMPASS_PARENT_DISCORD_ID", "0") or 0)
     if parent_id <= 0:
         return "確認を出せなかったよ。もう一度話しかけてね。"
-    pc.put_pending(parent_id, exec_action, exec_args)
-    return pc.build_confirmation(action, name, amount, extra=str(args.get("reason") or ""))
+    _token, superseded = pc.put_pending(parent_id, exec_action, exec_args)
+    # 古い確認を破棄した場合は、それも親へ伝える（どれに答えているかを一意にする）
+    return (pc.describe_superseded(superseded)
+            + pc.build_confirmation(action, name, amount,
+                                    extra=str(args.get("reason") or "")))
 
 
 _HANDLERS = {

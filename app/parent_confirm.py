@@ -73,8 +73,11 @@ def _save(doc: dict) -> None:
         raise
 
 # 同意・拒否とみなす返事。完全一致で見る（「はい、でも金額は…」のような曖昧な返事は同意にしない）
-_YES = ("はい", "OK", "ok", "オッケー", "うん", "そう", "実行", "お願い", "おねがい")
-_NO = ("いいえ", "no", "やめる", "キャンセル", "cancel", "ちがう", "違う", "だめ", "ダメ")
+_YES = ("はい", "OK", "ok", "Ok", "yes", "Yes", "オッケー", "うん", "そう",
+        "実行", "お願い", "おねがい", "お願いします", "おねがいします",
+        "いいよ", "了解", "りょうかい", "そうして")
+_NO = ("いいえ", "no", "No", "やめる", "やめて", "キャンセル", "cancel",
+       "ちがう", "違う", "だめ", "ダメ", "取り消し", "とりけし")
 
 
 def build_confirmation(action: str, child_name: str, amount, extra: str = "") -> str:
@@ -116,7 +119,7 @@ def build_confirmation(action: str, child_name: str, amount, extra: str = "") ->
 
 
 def put_pending(parent_id: int, action: str, args: dict,
-                now: datetime | None = None) -> str:
+                now: datetime | None = None) -> tuple[str, dict | None]:
     """確認待ちを登録する。1人につき1件だけ保持する。
 
     Args:
@@ -126,18 +129,23 @@ def put_pending(parent_id: int, action: str, args: dict,
         now: 現在時刻（テスト用）。
 
     Returns:
-        str: 確認 ID。
+        tuple[str, dict | None]: (確認 ID, 破棄した古い確認)。
+            古い確認があった場合、呼び出し側は親へ「前の確認は取り消した」と伝える。
     """
     stamp = (now or datetime.now(JST)).timestamp()
     token = uuid.uuid4().hex[:8]
     with _LOCK, _interprocess_lock():
         doc = _load()
-        # 古い確認は破棄する。複数保持すると「どれへの返事か」が曖昧になる
+        # 古い確認は破棄する。複数保持すると「どれへの返事か」が曖昧になる。
+        # 破棄したものは呼び出し側へ返し、**親に知らせられるようにする**。
+        # Discord では古い確認文も画面に残るため、黙って捨てると
+        # 親が上の確認に「はい」と答えたつもりで別の操作が走る（有識者の反証で判明）。
+        superseded = doc.get(str(int(parent_id)))
         doc[str(int(parent_id))] = {
             "token": token, "action": action, "args": dict(args or {}), "ts": stamp,
         }
         _save(doc)
-    return token
+    return token, superseded
 
 
 def classify_reply(text: str) -> str:
@@ -147,6 +155,9 @@ def classify_reply(text: str) -> str:
     同意とみなすと、確認の意味が無くなるため。
     """
     t = (text or "").strip()
+    # 末尾の句読点・感嘆符は落とす。「はい。」「はい!」を other にすると
+    # 確認が保持されたまま残り、親が後で別の文脈で言った「はい」で実行されうる
+    t = t.rstrip("。．.!！、,　 ")
     if not t:
         return "other"
     if t in _YES:
@@ -188,3 +199,34 @@ def clear_pending(parent_id: int) -> None:
         doc = _load()
         if doc.pop(str(int(parent_id)), None) is not None:
             _save(doc)
+
+
+# 操作名 → 親へ見せる日本語。破棄した確認を伝えるときに使う
+_ACTION_LABELS = {
+    "parent_grant": "支給",
+    "parent_adjust_balance": "残高の調整",
+    "bulk_grant": "全員への一括支給",
+}
+
+
+def describe_superseded(superseded: dict | None) -> str:
+    """破棄した古い確認を親へ伝える一文を作る。
+
+    Discord では古い確認文も画面に残るため、黙って捨てると
+    親が上の確認に「はい」と答えたつもりで別の操作が走る。
+    「前のは取り消した」と明示して、どれに答えているかを一意にする。
+
+    Args:
+        superseded: put_pending が返した、破棄された古い確認（無ければ None）。
+
+    Returns:
+        str: 親へ添える一文。破棄が無ければ空文字。
+    """
+    if not superseded:
+        return ""
+    action = str(superseded.get("action", ""))
+    label = _ACTION_LABELS.get(action, action)
+    args = superseded.get("args") or {}
+    name = str(args.get("name", "")).strip()
+    who = f"{name}への" if name else ""
+    return f"※ さっきの「{who}{label}」の確認は取り消したよ。こっちに答えてね。\n\n"

@@ -246,9 +246,12 @@ async def _handle_parent_confirmation_reply(system_conf, message, input_block: s
     # 冪等キーは確認 ID から作る。同じ確認が二重に実行されないようにする
     args.setdefault("operation_key", f"confirm-{rec.get('token')}")
 
-    # 一括支給は wallet tool ではなく Discord 側の処理なので、tool 経由の実行と分ける
+    # 一括支給は wallet tool ではなく Discord 側の処理なので、tool 経由の実行と分ける。
+    # 確認時点の内訳と確認 ID を渡す（読み直さない・二重実行しない）
     if action == "bulk_grant":
-        await handlers_parent.execute_bulk_grant(message)
+        await handlers_parent.execute_bulk_grant(
+            message, items=args.get("items") or [],
+            op_key_base=f"confirm-{rec.get('token')}")
         _log_runtime_event(system_conf, message, None, input_block,
                            "parent_confirm_executed", {"action": action})
         return True
@@ -1012,19 +1015,24 @@ async def _on_message_impl(message: discord.Message):
             )
             return
     elif is_parent(message.author.id):
+        # 確認待ちがあるなら、この発話を「はい/いいえ」の返事として先に処理する（N-11.17）。
+        # AI を通さず Python が保持した値をそのまま実行するため、
+        # 親が見た確認文の内容と、実際に動く値が必ず一致する。
+        #
+        # **チャンネルを問わず先に見る**。確認を積む maybe_handle_* 側はチャンネル非依存なのに、
+        # 以前はここが else 側（親専用チャンネル）にしかなく、
+        # 子ども用チャンネルで金額コマンドを打つと確認文は出るのに「はい」が永久に届かなかった
+        # （積む側と取り出す側で条件が非対称だった・有識者の反証で発見）。
+        if await _handle_parent_confirmation_reply(system_conf, message, input_block):
+            _mark_thinking_sent(message, True)
+            return
+
         # 親が子ども用チャンネルで自然言語入力した場合は、そのチャンネルの子を対象にする
         channel_child_conf = _find_channel_child_user_conf(message)
         if channel_child_conf is not None:
             user_conf = channel_child_conf
             selected_user_source = "parent_channel_context"
         else:
-            # 確認待ちがあるなら、この発話を「はい/いいえ」の返事として先に処理する（N-11.17）。
-            # AI を通さず Python が保持した値をそのまま実行するため、
-            # 親が見た確認文の内容と、実際に動く値が必ず一致する。
-            if await _handle_parent_confirmation_reply(system_conf, message, input_block):
-                _mark_thinking_sent(message, True)
-                return
-
             # 親が子チャンネル外（親専用チャンネル等）で自然文を送った → 親AI会話へ流す。
             # AI が親の意図を判断して親用 tool（支給・調整・承認等）を呼ぶ。金額・対象は AI に推測させず、
             # 親が明示した値だけを tool に渡す設計（mcp_wallet 側で PARENT_MODE・対象児実在・金額検証・冪等）。

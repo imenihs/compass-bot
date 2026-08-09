@@ -609,10 +609,11 @@ async def maybe_handle_manual_grant(message: discord.Message, content: str) -> b
     # 「AI 経由なら確認あり・コマンドなら即実行」という非対称が生まれ、
     # 桁の打ち間違いをコマンド側だけ捕まえられない。
     from app import parent_confirm as pc
-    pc.put_pending(int(message.author.id), "parent_grant",
-                   {"name": target_name, "amount": amount})
+    _token, superseded = pc.put_pending(int(message.author.id), "parent_grant",
+                                        {"name": target_name, "amount": amount})
     await message.channel.send(
-        pc.build_confirmation("grant", target_name, amount)
+        pc.describe_superseded(superseded)
+        + pc.build_confirmation("grant", target_name, amount)
     )
     return True
 
@@ -641,10 +642,11 @@ async def maybe_handle_balance_adjustment(message: discord.Message, content: str
 
     # 支給と同じく確認ステップを通す（N-11.17）。経路によって安全性を食い違わせない
     from app import parent_confirm as pc
-    pc.put_pending(int(message.author.id), "parent_adjust_balance",
-                   {"name": target_name, "delta": delta})
+    _token, superseded = pc.put_pending(int(message.author.id), "parent_adjust_balance",
+                                        {"name": target_name, "delta": delta})
     await message.channel.send(
-        pc.build_confirmation("adjust", target_name, delta)
+        pc.describe_superseded(superseded)
+        + pc.build_confirmation("adjust", target_name, delta)
     )
     return True
 
@@ -693,20 +695,31 @@ async def maybe_handle_user_setting_change(message: discord.Message, content: st
     return True
 
 
-# 疑問・引用を示す語尾。これらが値に混ざっているものは「設定の指示」ではなく「質問」とみなす。
-# 設定を書き換える手前で弾くために使う（親の質問で実設定が変わるのを防ぐ）。
-_QUESTION_MARKERS = (
-    "？", "?", "っけ", "かな", "ですか", "でしたか", "だっけ",
-    "の？", "なの", "って言った", "って設定", "ってした", "とは",
+# 疑問符はどこにあっても質問とみなす。
+_QUESTION_CHARS = ("？", "?")
+
+# 疑問・確認の語尾。**文末にあるときだけ**質問とみなす。
+# 部分一致で見ると誤爆する。例えば「勉強のことはあまり言わないで」は
+# 「こ*とは*あまり」が「とは」に、「元気なので」が「なの」に当たってしまい、
+# 正当な parent_note（自由文）を設定できなくなる。語尾判定にすればこれを避けられる。
+_QUESTION_SUFFIXES = (
+    "っけ", "かな", "ですか", "でしたか", "だっけ", "なの",
+    "って言った", "って設定", "ってした", "とは", "どう", "どうなってる",
 )
+
+# 引用・伝聞の形。過去の設定を話題にしているだけで、新しい指示ではない。
+_QUOTE_MARKERS = ("って設定した", "って言った", "ってしたっけ", "と設定した")
 
 
 def _looks_like_question(text: str) -> bool:
     """値の部分が疑問文・引用に見えるかを判定する。
 
-    コマンドの引数は本来「軽め」「普通」のような短い値である。
-    そこに疑問の語尾が混ざっている場合、親は設定を指示したのではなく
+    コマンドの引数は本来「軽め」「普通」、あるいは親からの指示文（parent_note）である。
+    そこに疑問の語尾が付いている場合、親は設定を指示したのではなく
     現状を尋ねている可能性が高いため、設定変更として扱わない。
+
+    語尾で判定するのは誤爆を避けるため。部分一致にすると
+    「勉強のことはあまり言わないで」のような正当な指示文まで弾いてしまう。
 
     Args:
         text: コマンドの値の部分。
@@ -717,7 +730,14 @@ def _looks_like_question(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
-    return any(mark in t for mark in _QUESTION_MARKERS)
+    # 疑問符は位置を問わず質問とみなす
+    if any(c in t for c in _QUESTION_CHARS):
+        return True
+    # 引用・伝聞は「過去の設定の話」であって指示ではない
+    if any(mark in t for mark in _QUOTE_MARKERS):
+        return True
+    # 語尾だけを見る（文中に同じ字面があっても誤爆しない）
+    return t.endswith(_QUESTION_SUFFIXES)
 
 
 async def maybe_handle_followup_policy(message: discord.Message, content: str) -> bool:
@@ -752,7 +772,14 @@ async def maybe_handle_followup_policy(message: discord.Message, content: str) -
     # 実設定が書き換わったうえ疑問文がそのまま parent_note（子のAIプロンプトに載る）へ入っていた。
     # 該当する場合は False を返して会話層（AI 経路）へ流し、親には自然文で答える。
     if _looks_like_question(rest):
-        return False
+        # 質問には現状を答える。黙って False を返すと親は
+        # 「設定できた」と誤解したまま何も変わらない、という一番まずい形になる
+        await message.channel.send(
+            _follow_policy_summary(target_name, current_policy)
+            + "\n\n（質問に見えたので設定は変えていないよ。変えるときは"
+            "「フォロー方針 " + target_name + " 軽め」のように送ってね）"
+        )
+        return True
 
     updates, note = _parse_follow_policy_updates(rest)
     if strength_m:
@@ -786,37 +813,52 @@ async def maybe_handle_followup_policy(message: discord.Message, content: str) -
     return True
 
 
-async def execute_bulk_grant(message: discord.Message) -> None:
+async def execute_bulk_grant(message: discord.Message, items: list | None = None,
+                             op_key_base: str = "") -> None:
     """全員への一括支給を実行する（確認で「はい」を受けてから呼ばれる）。
 
-    コマンド経路と AI 経路のどちらから来ても同じ処理を通すため関数に切り出す。
-    ここに来る時点で親の同意は取れている前提。
+    **確認した時点の内訳（items）だけを使う**。ここで load_all_users を読み直すと、
+    確認から「はい」までの間に固定額が変わったり子が追加された場合に、
+    親が見た確認文と実際に動く金額がズレる。確認の価値は
+    「親が見た内容＝実行される内容」の保証なので、スナップショットを正とする。
+
+    Args:
+        message: 「はい」と答えた親のメッセージ（送信先チャンネルとして使う）。
+        items: 確認時点の [{"name":…, "amount":…}, …]。
+        op_key_base: 冪等キーの土台（確認 ID）。同じ確認が二重に実行されないようにする。
+            親が改めて一括支給し直した場合は別の確認 ID になるため、正しく通る。
     """
-    users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
     system_conf = load_system()
+    # 名前→設定を引くため一度だけ読む。金額は必ず items 側を使う（読み直した値は使わない）
+    conf_by_name = {str(u.get("name", "")): u for u in load_all_users()}
     lines = ["【一括支給完了】"]
-    # 全ユーザーを走査して fixed_allowance を残高に加算する
-    for u in users:
-        name = str(u.get("name", ""))
-        amount = int(u.get("fixed_allowance", 0))
-        # 固定お小遣いが設定されていないユーザーはスキップする
+    for item in (items or []):
+        name = str(item.get("name", ""))
+        amount = int(item.get("amount", 0))
+        user_conf = conf_by_name.get(name)
+        # 確認後に設定が消えた子は支給できない。黙って飛ばさず親に知らせる
+        if user_conf is None:
+            lines.append(f"・{name}: スキップ（確認後にユーザー設定が見つからなくなった）")
+            continue
         if amount <= 0:
-            lines.append(f"・{name}: スキップ（固定額未設定）")
             continue
         new_balance, achieved_goals = _wallet_service.update_balance(
-            user_conf=u,
+            user_conf=user_conf,
             system_conf=system_conf,
             delta=amount,
             action="allowance_monthly_auto_grant",
             note="bulk_grant_by_parent",
             extra={"granted_by": str(message.author.id)},
-            operation_key=_parent_op_key(message, "allowance_monthly_auto_grant", name),
+            # 確認 ID を土台にする。message.id だと「一括支給→はい」を繰り返したとき
+            # 毎回別 ID になり二重支給を防げない
+            operation_key=(f"{op_key_base}-{name}" if op_key_base
+                           else _parent_op_key(message, "allowance_monthly_auto_grant", name)),
         )
         lines.append(f"・{name}: +{amount}円 → {new_balance}円")
         # 支給により目標が達成された場合は祝福メッセージを送る
         for achieved_goal in achieved_goals:
             await message.channel.send(
-                _build_goal_achieved_message(user_conf=u, goal=achieved_goal)
+                _build_goal_achieved_message(user_conf=user_conf, goal=achieved_goal)
             )
     await message.channel.send("\n".join(lines))
 
@@ -843,6 +885,7 @@ async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> boo
 
     # 誰にいくら入るのかを先に見せる。金額の合計まで出して桁の異常に気づけるようにする
     detail_lines = []
+    snapshot = []  # 確認時点の (名前, 金額)。実行はこれだけを使う
     total = 0
     for u in users:
         name = str(u.get("name", ""))
@@ -851,15 +894,22 @@ async def maybe_handle_bulk_grant(message: discord.Message, content: str) -> boo
             detail_lines.append(f"{name}: スキップ（固定額未設定）")
             continue
         total += amount
+        snapshot.append({"name": name, "amount": amount})
         detail_lines.append(f"{name}: +{amount:,}円")
     if total <= 0:
         await message.channel.send("固定お小遣いが設定されている子がいないよ。")
         return True
 
+    # **確認した時点の内訳をそのまま保存する**（N-11.17・有識者反証）。
+    # 実行時に load_all_users を読み直すと、確認から「はい」までの間に固定額が変わったり
+    # 子が追加された場合に、親が見た確認文と実際に動く金額がズレる。
+    # 確認の価値は「親が見た内容＝実行される内容」の保証なので、ここで固定する。
     from app import parent_confirm as pc
-    pc.put_pending(int(message.author.id), "bulk_grant", {})
+    _token, superseded = pc.put_pending(int(message.author.id), "bulk_grant",
+                                        {"items": snapshot, "total": total})
     await message.channel.send(
-        pc.build_confirmation("bulk_grant", "", total, extra=" / ".join(detail_lines))
+        pc.describe_superseded(superseded)
+        + pc.build_confirmation("bulk_grant", "", total, extra=" / ".join(detail_lines))
     )
     return True
 

@@ -108,13 +108,50 @@ async def _run():
     _check("bulk_shows_each_child", "たろう" in body and "はな" in body, body[:200])
     _check("bulk_shows_total", "800" in body, body[:200])
 
-    # 4. 「はい」を受けてはじめて実際に動く
-    pc.take_pending(pid)
+    # 4. 「はい」を受けてはじめて実際に動く。
+    #    実行は **確認時点のスナップショット**（items）だけを使う。
+    rec = pc.take_pending(pid)
+    _check("bulk_pending_has_snapshot",
+           rec and isinstance(rec["args"].get("items"), list)
+           and len(rec["args"]["items"]) == 2, rec)
     ch2 = _Ch()
-    await H.execute_bulk_grant(_msg(ch2, pid))
+    await H.execute_bulk_grant(_msg(ch2, pid), items=rec["args"]["items"],
+                               op_key_base=f"confirm-{rec['token']}")
     _check("bulk_executes_after_yes",
            ws.get_balance("たろう") == b1 + 500 and ws.get_balance("はな") == b2 + 300,
            (ws.get_balance("たろう"), ws.get_balance("はな")))
+
+    # 5. 同じ確認 ID で再実行しても二重支給しない（冪等キーが確認 ID 由来であること）
+    again1, again2 = ws.get_balance("たろう"), ws.get_balance("はな")
+    await H.execute_bulk_grant(_msg(_Ch(), pid), items=rec["args"]["items"],
+                               op_key_base=f"confirm-{rec['token']}")
+    _check("bulk_idempotent_on_same_confirm",
+           ws.get_balance("たろう") == again1 and ws.get_balance("はな") == again2,
+           (ws.get_balance("たろう"), ws.get_balance("はな")))
+
+    # 6. 確認の後に固定額が変わっても、**親が見た金額どおり**に動く。
+    #    実行時に load_all_users を読み直すと確認文と実額がズレる（有識者反証）。
+    pc.clear_pending(pid)
+    ch3 = _Ch()
+    await H.maybe_handle_bulk_grant(_msg(ch3, pid), "一括支給")
+    rec2 = pc.take_pending(pid)
+    H.load_all_users = lambda: [{"name": "たろう", "fixed_allowance": 99999},
+                                {"name": "はな", "fixed_allowance": 300}]
+    base = ws.get_balance("たろう")
+    await H.execute_bulk_grant(_msg(_Ch(), pid), items=rec2["args"]["items"],
+                               op_key_base=f"confirm-{rec2['token']}")
+    _check("bulk_uses_snapshot_not_current_setting",
+           ws.get_balance("たろう") == base + 500, (base, ws.get_balance("たろう")))
+
+    # 7. 古い確認を上書きしたら、親へ「取り消した」と伝える材料が返る
+    pc.clear_pending(pid)
+    pc.put_pending(pid, "parent_grant", {"name": "たろう", "amount": 100})
+    _tok, superseded = pc.put_pending(pid, "bulk_grant", {"items": [], "total": 0})
+    _check("supersede_is_reported",
+           superseded is not None and superseded["action"] == "parent_grant", superseded)
+    _check("supersede_message_mentions_previous",
+           "取り消した" in pc.describe_superseded(superseded),
+           pc.describe_superseded(superseded))
     pc.clear_pending(pid)
 
     import shutil
