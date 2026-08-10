@@ -50,12 +50,16 @@ HOTLINES = {
 EMERGENCY_LINE = "いのちが今あぶないと思ったら、119番（救急）や110番（警察）にかけていいよ。"
 
 
-def hotlines_for(hotline_key: str | None, urgent: bool = False) -> str:
-    """子へ渡す公的窓口の案内文を組み立てる（LLM に番号を生成させないための定数経由）。
+def hotlines_for(hotline_key: str | None) -> str:
+    """相談窓口の案内文を返す。**緊急通報先を必ず添える。**
+
+    以前は `urgent: bool` で緊急先の有無を切り替えていたが、
+    危険度の判定機構を廃止した今、**誰が urgent を決めるのかが宙に浮く**。
+    AI に決めさせると番号の出し分けを AI が握ることになるため、常に添える形にした
+    （docs/設計_安全機能の再設計.md 2-3-c）。
 
     Args:
-        hotline_key: HOTLINES のキー。None なら窓口を出さない。
-        urgent: 切迫している場合は緊急通報先も添える。
+        hotline_key: HOTLINES のキー（abuse / self_harm / bullying）。
 
     Returns:
         str: 案内文。未知の種別でも、いちばん広く使える窓口を返す。
@@ -64,7 +68,6 @@ def hotlines_for(hotline_key: str | None, urgent: bool = False) -> str:
     # 未知の値や空が来ても、いちばん広く使える窓口を返す（黙るのが最悪）。
     lines = HOTLINES.get(hotline_key) or HOTLINES.get("bullying") or []
     if not lines:
-        return ""
+        return EMERGENCY_LINE
     body = "\n".join(f"・{x}" for x in lines)
-    tail = f"\n{EMERGENCY_LINE}" if urgent else ""
-    return f"{body}{tail}"
+    return f"{body}\n{EMERGENCY_LINE}"

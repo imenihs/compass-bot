@@ -571,6 +571,10 @@ def _wallet_gap_for_user(audit_state: dict | None, user_name: str, cutoff: datet
     dt = _parse_ts(gap.get("ts"))
     if dt is not None and dt < cutoff:
         return None
+    # 「お金を取られた」と申告している分は記録の問題ではない。
+    # 記録習慣のカードの材料にすると、被害者を責める形になる
+    if str(gap.get("type") or "") == "unrecorded_loss":
+        return None
     diff = _to_int(gap.get("diff"))
     return {
         "ts": gap.get("ts"),

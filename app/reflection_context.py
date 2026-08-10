@@ -456,7 +456,16 @@ def _wallet_gap_for_user(audit_state: dict, user_name: str, cutoff: datetime) ->
 
     reported = _to_int(note.get("reported"))
     expected = _to_int(note.get("expected"))
-    if diff < 0:
+    if str(note.get("type") or "") == "unrecorded_loss":
+        # お金を取られたと本人が申告している。**記録漏れとして扱わない。**
+        # 被害者を「記録していない」と責めると、次から言わなくなる
+        kind = "unrecorded_loss"
+        memo = (
+            f"本人が「お金がなくなった」と話していた分が、財布との差額（{abs(diff):,}円）に出ています。"
+            "記録のしかたの問題ではないので、責めないでください。"
+            "困っていることが続いていないか、様子を見てあげてください。"
+        )
+    elif diff < 0:
         kind = "spending_record_gap"
         memo = (
             f"財布チェックで支出の記録漏れがありそうでした（差額 {abs(diff):,}円）。"

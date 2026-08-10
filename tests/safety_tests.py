@@ -88,8 +88,16 @@ def _test_no_unkeepable_promises():
     # 禁止として書かれていることは確認する
     _check("forbids_secret_promise", "絶対に言ってはいけない" in prompt, "禁止の明記が無い")
 
+    # 「何も送らない」とは言えない（査定の理由は親チャンネルへ届く）。
+    # 送るものがあることを先に伝えているか
+    _check("discloses_what_is_forwarded", "その理由だけは伝えるよ" in prompt,
+           "査定の理由が親へ届くことを先に言っていない")
+    _check("no_absolute_no_forward",
+           "きみが話してくれたことを、私から別のチャンネルへ送ることはしないよ" not in prompt,
+           "守れない「何も送らない」が残っている")
+
     # 逆に、正直に伝えるルールが入っていること
-    for must in ("おうちの人も見ることがある", "守れない約束をしない"):
+    for must in ("おうちの人も見ることがある", "守れない約束をしない", "いつも見ているわけじゃない"):
         _check(f"has_honest_rule::{must[:14]}", must in prompt, must)
 
     # 低学年向けは肯定形にする（二重否定だと意味を逆に取る恐れがある）
@@ -168,6 +176,130 @@ def _test_money_safety_tool_exists():
            "mcp__wallet__get_hotlines" in ALLOWED_WALLET_TOOLS, "許可リストに無い")
 
 
+def _test_concern_writer_matches_reader():
+    """相談の記録が、ナッジ抑止（読む側）に**実際に届く**こと。
+
+    writer（tool）と reader（reminder_service）でキー名が食い違うと、
+    どちらのテストも単体では PASS するのに**結線だけが死ぬ**。
+    実際この形のバグが過去にあった（書き手が `selected_user` を出さず、
+    読み手がそれで絞っていたため一度も一致しなかった）。
+    ここでは writer で書いて reader で読む、通しで検証する。
+    """
+    import json as _json
+    import shutil
+    import tempfile
+    from datetime import datetime, timedelta, timezone
+
+    from app import config, mcp_wallet as m
+    from app.reminder_service import ReminderService
+
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "logs").mkdir()
+    (tmp / "settings").mkdir()
+    (tmp / "settings" / "system.json").write_text(
+        _json.dumps({"log_dir": str(tmp / "logs")}), encoding="utf-8")
+    (tmp / "settings" / "setting.json").write_text("{}", encoding="utf-8")
+
+    orig = (config.SYSTEM_PATH, config.SETTING_PATH, m._resolve_child)
+    config.SYSTEM_PATH = tmp / "settings" / "system.json"
+    config.SETTING_PATH = tmp / "settings" / "setting.json"
+    m._resolve_child = lambda n=None: {"name": "たろう"}
+    try:
+        service = ReminderService(
+            client=None, allowance_reminder_conf={}, wallet_audit_conf={},
+            load_all_users_fn=lambda: [], wallet_service=None, allow_channel_ids=set(),
+        )
+        now = datetime.now(timezone(timedelta(hours=9)))
+        logs = tmp / "logs"
+
+        # 何も無ければ通常どおり送る
+        _check("nudge_not_blocked_when_empty",
+               service._has_recent_safety_signal(logs, "たろう", now) is False, "空で True になった")
+
+        # ① お金の困りごと tool が書いたら、抑止が効く
+        m._do_record_money_safety_concern(
+            {"name": "たろう", "kind": "money_taken", "operation_key": "k1"})
+        _check("nudge_blocked_by_money_concern",
+               service._has_recent_safety_signal(logs, "たろう", now) is True,
+               "money_taken を書いても抑止が効かない")
+
+        # ② 窓口を渡した事実でも抑止が効く（つらさ・いじめ・家のこと）
+        shutil.rmtree(logs); logs.mkdir()
+        m._do_get_hotlines({"kind": "self_harm"})
+        _check("nudge_blocked_by_hotlines",
+               service._has_recent_safety_signal(logs, "たろう", now) is True,
+               "get_hotlines を呼んでも抑止が効かない（設計の結線漏れ）")
+
+        # ③ 別の子は巻き込まない
+        _check("nudge_not_blocked_for_other_child",
+               service._has_recent_safety_signal(logs, "はな", now) is False, "他の子まで止まる")
+    finally:
+        config.SYSTEM_PATH, config.SETTING_PATH, m._resolve_child = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_hotlines_always_include_emergency():
+    """緊急通報先（119/110）が**必ず**案内に含まれること。
+
+    以前は `urgent=True` のときだけ添える作りだったが、
+    危険度の判定機構を廃止した今「誰が urgent を決めるか」が宙に浮く。
+    実際 tool は urgent を渡しておらず、**119/110 が子に一度も届かなかった**。
+    """
+    from app import mcp_wallet as m, safety
+
+    for kind in ("abuse", "self_harm", "bullying", "unknown"):
+        out = safety.hotlines_for(kind)
+        _check(f"emergency_in_hotlines::{kind}", "119" in out and "110" in out, out[-40:])
+
+    tool_out = m._do_get_hotlines({"kind": "self_harm"})
+    _check("emergency_in_tool_output", "119" in tool_out and "110" in tool_out, tool_out[-40:])
+
+
+def _test_money_concern_moves_no_balance():
+    """お金の困りごとの記録が、残高を1円も動かさないこと。
+
+    「取られた」を支出として記録すると、被害者が金銭的にも二重に損をする。
+    """
+    import json as _json
+    import shutil
+    import tempfile
+
+    from app import config, mcp_wallet as m
+    import app.wallet_service as ws
+
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "logs").mkdir()
+    (tmp / "settings").mkdir()
+    (tmp / "settings" / "system.json").write_text(
+        _json.dumps({"log_dir": str(tmp / "logs")}), encoding="utf-8")
+    (tmp / "settings" / "setting.json").write_text("{}", encoding="utf-8")
+    (tmp / "w.json").write_text(_json.dumps(
+        {"users": {"たろう": {"expected_balance": 3000}}, "applied_operation_keys": {}},
+        ensure_ascii=False), encoding="utf-8")
+
+    orig = (config.SYSTEM_PATH, config.SETTING_PATH, m._wallet, m._resolve_child)
+    config.SYSTEM_PATH = tmp / "settings" / "system.json"
+    config.SETTING_PATH = tmp / "settings" / "setting.json"
+    w = ws.WalletService()
+    w.wallet_state_path = tmp / "w.json"
+    w.wallet_audit_state_path = tmp / "a.json"
+    m._wallet = w
+    m._resolve_child = lambda n=None: {"name": "たろう"}
+    try:
+        for kind in ("money_taken", "suspicious_offer", "illegal_work"):
+            m._do_record_money_safety_concern(
+                {"name": "たろう", "kind": kind, "operation_key": f"k-{kind}"})
+        _check("money_concern_keeps_balance", w.get_balance("たろう") == 3000,
+               w.get_balance("たろう"))
+        # 同じ相談は二度書かない
+        again = m._do_record_money_safety_concern(
+            {"name": "たろう", "kind": "money_taken", "operation_key": "k-money_taken"})
+        _check("money_concern_is_idempotent", "さっき聞いた" in again, again[:30])
+    finally:
+        config.SYSTEM_PATH, config.SETTING_PATH, m._wallet, m._resolve_child = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     """全テストを走らせて結果を出す。"""
     _test_hotlines_are_constants()
@@ -176,6 +308,9 @@ def main():
     _test_detection_machinery_is_gone()
     _test_no_orphaned_references()
     _test_money_safety_tool_exists()
+    _test_concern_writer_matches_reader()
+    _test_hotlines_always_include_emergency()
+    _test_money_concern_moves_no_balance()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

@@ -814,9 +814,8 @@ class ReminderService:
             days: さかのぼる日数。
 
         Returns:
-            bool: 直近に危険信号があれば True（ナッジを送らない）。
+            bool: 直近に重い相談があれば True（こちらから催促しない）。
         """
-        path = log_dir / "runtime_diagnostics.jsonl"
         # 【2026/08/11】読み取り元を変えた。
         # 旧: runtime_diagnostics.jsonl の safety_signal_detected を見ていたが、
         #     ①書き手が `selected_user` を出しておらず**一度も一致しなかった**（既存バグ）
@@ -824,7 +823,7 @@ class ReminderService:
         # 新: 金銭の困りごと tool（record_money_safety_concern）が書く
         #     money_safety_concern.jsonl を見る。原文は持たず kind と対象児だけ。
         try:
-            concern_path = path.parent / "money_safety_concern.jsonl"
+            concern_path = log_dir / "money_safety_concern.jsonl"
             if not concern_path.exists():
                 return False
             cutoff = now.timestamp() - days * 86400

@@ -1129,6 +1129,57 @@ def _do_contribute_to_goal(args: dict) -> str:
             f"\n残高は {balance}円。")
 
 
+def _align_item_with_recent_purchase(journal_path, item: str) -> str:
+    """感想の品目を、直近の買い物の表記へ寄せる。
+
+    learning_insights は**品目の完全一致**で支出と感想を紐づける。
+    日本語の正規化は効かないため、AI が「マンガ」を「まんが」「漫画」と書くだけで
+    突合が外れ、満足度が永久に null のままになる（3者レビューで指摘）。
+
+    直近36時間の買い物を見て、ゆるく一致するものがあればその表記を採用する。
+    空で来たときは直近の買い物をそのまま使う。
+
+    Args:
+        journal_path: pocket_journal のパス。
+        item: AI が渡した品目。
+
+    Returns:
+        str: 突合に使う品目。
+    """
+    def _norm(x: str) -> str:
+        return "".join(str(x or "").split()).lower()
+
+    recent = []
+    try:
+        if journal_path.exists():
+            lines = [x for x in journal_path.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()]
+            for line in reversed(lines[-30:]):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(row.get("action", "")) == "expense_supplement":
+                    continue
+                name = str(row.get("item", "") or "").strip()
+                if name:
+                    recent.append(name)
+    except OSError:
+        return item
+
+    if not recent:
+        return item
+    if not item:
+        return recent[0]
+
+    target = _norm(item)
+    for name in recent:
+        n = _norm(name)
+        # 完全一致・どちらかがどちらかを含む（「マンガ」と「マンガ本」）を同じ物とみなす
+        if n == target or (len(n) >= 2 and len(target) >= 2 and (n in target or target in n)):
+            return name
+    return item
+
+
 def _latest_purchase_item(journal_path) -> str:
     """お小遣い帳の直近の買い物から品目を1つ返す。無ければ空文字。
 
@@ -1191,6 +1242,8 @@ def _do_add_expense_detail(args: dict) -> str:
     if not op_key:
         return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
 
+    import hashlib
+
     reason = str(args.get("reason", "") or "").strip()
     raw_sat = args.get("satisfaction")
     satisfaction = None
@@ -1214,16 +1267,25 @@ def _do_add_expense_detail(args: dict) -> str:
     # 紐づける（_find_supplement_target）ため、ここが空だと永久にマージされない。
     # AI が省略したときは直近の支出から補う。
     item = str(args.get("item", "") or "").strip()
-    if not item:
-        item = _latest_purchase_item(journal)
+    # **表記ゆれで突合が外れるのを防ぐ。**
+    # learning_insights は品目の完全一致で紐づける（日本語の正規化は効かない）ので、
+    # AI が「マンガ」を「まんが」「漫画」と書くだけで永久にマージされない。
+    # 直近の買い物に近い品目があればそちらへ寄せる。
+    item = _align_item_with_recent_purchase(journal, item)
 
     # 残高を動かさない tool なので applied_operation_keys は使わない
     # （あれを消費すると、同じキーで残高操作が来たとき弾いてしまう）。
-    # 代わりに**直近の supplement 行と内容が同じか**で二重記録を防ぐ。
-    # AI が言い直しで2回呼んでも、同じ感想が2行並ぶことはない。
+    # 代わりに **operation_key のハッシュ**を行へ残し、それで冪等にする。
+    #
+    # 【2026/08/11 修正】当初は「直近5行の reason+satisfaction が同じか」で判定していたが、
+    # **別の買い物に同じ感想を付けると2件目が捨てられた**（実証済み）。
+    # 例: マンガに「よかった/9」→ おかしにも「よかった/9」→ おかしの分が記録されない。
+    # item が突合の鍵なのに、重複判定から抜けていたのが原因。
+    op_hash = hashlib.sha256(
+        _scoped_op_key(name, "expense_detail", op_key).encode()).hexdigest()[:16]
     try:
         if journal.exists():
-            tail = [x for x in journal.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()][-5:]
+            tail = [x for x in journal.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()][-20:]
             for line in tail:
                 try:
                     row = json.loads(line)
@@ -1231,7 +1293,13 @@ def _do_add_expense_detail(args: dict) -> str:
                     continue
                 if str(row.get("action", "")) != "expense_supplement":
                     continue
-                if str(row.get("reason", "")) == reason and row.get("satisfaction") == satisfaction:
+                # ① 同じ operation_key（AI の言い直し）は弾く
+                if row.get("op_hash") and row.get("op_hash") == op_hash:
+                    return "それはさっき教えてくれたね。おぼえてるよ。"
+                # ② 同じ買い物へ同じ感想も弾く（item まで見る）
+                if (str(row.get("item", "")) == item
+                        and str(row.get("reason", "")) == reason
+                        and row.get("satisfaction") == satisfaction):
                     return "それはさっき教えてくれたね。おぼえてるよ。"
     except OSError:
         pass
@@ -1252,15 +1320,58 @@ def _do_add_expense_detail(args: dict) -> str:
             "satisfaction": satisfaction,
             # 補足行なので金額は持たない（元の支出行が持っている）
             "amount": None,
+            # 冪等の判定に使う。生キーは残さない
+            "op_hash": op_hash,
         })
-    except Exception:  # noqa: BLE001 - 記録の失敗で会話を止めない
-        return "うんうん、教えてくれてありがとう。"
+    except Exception as exc:  # noqa: BLE001 - 会話は止めないが、成功と偽らない
+        _diag_tool_error("expense_detail_write_failed", name, exc)
+        return "ごめん、いまうまく記録できなかったよ。あとでもう一度おしえてくれる？"
 
     if satisfaction is not None and satisfaction <= 3:
         return "そっか、思ってたのとちがったんだね。それも大事な発見だよ。おぼえておくね。"
     if satisfaction is not None and satisfaction >= 8:
         return "いい買いものだったんだね！おぼえておくね。"
     return "教えてくれてありがとう。おぼえておくね。"
+
+
+def _has_recent_money_concern(name: str, days: int = 45) -> bool:
+    """直近に「お金を取られた」等を申告した子かを返す。
+
+    財布チェックで帳簿より少なかったとき、それを**記録漏れとして責めない**ために使う。
+    恐喝の被害者が翌月ペナルティを受け、次から言わなくなる連鎖を断つ。
+
+    Args:
+        name: 子どもの名前。
+        days: さかのぼる日数。月1回の財布チェックをまたげるよう既定を長めにする。
+
+    Returns:
+        bool: 直近に money_taken の申告があれば True。
+    """
+    try:
+        path = config.get_log_dir(_system_conf()) / "money_safety_concern.jsonl"
+        if not path.exists():
+            return False
+        cutoff = datetime.now(_JST) - timedelta(days=days)
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(row.get("child", "")) != name:
+                continue
+            # 取られた・脅されて渡した、のときだけ。怪しい誘いは実損ではない
+            if str(row.get("kind", "")) != "money_taken":
+                continue
+            try:
+                if datetime.fromisoformat(str(row.get("ts", ""))) >= cutoff:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    except OSError:
+        pass
+    return False
 
 
 def _do_report_wallet_balance(args: dict) -> str:
@@ -1317,6 +1428,21 @@ def _do_report_wallet_balance(args: dict) -> str:
         return (f"財布チェックOK！ぴったり合ってたよ。\n"
                 f"財布: {reported}円 / 帳簿: {expected}円")
 
+    # **大きすぎる補正は確定させない。**
+    # 起動条件が「残高報告 1234円」という明示コマンドから自由会話へ広がったため、
+    # 7歳が貯金箱を数えず財布の300円だけを見て報告すると、
+    # 帳簿の1.5万円が消えて誰にも通知されない——という事故が起きうる（3者レビューで指摘）。
+    # 残高の半分を超えて減る補正は、その場では確定せず親へ回す。
+    if diff < 0 and expected > 0 and abs(diff) > max(3000, expected // 2):
+        _wallet.save_audit_state(state)  # 報告を受けた事実（pending の解除）だけは残す
+        return (
+            f"ありがとう、数えてくれたんだね。\n"
+            f"財布: {reported}円 / 帳簿: {expected}円\n"
+            f"でも{abs(diff):,}円のちがいは大きいから、ここでは直さないでおくね。\n"
+            "貯金箱や別のおさいふに入っていないか、もう一度みてみて。\n"
+            "それでも合わないときは、おうちの人に直してもらってね。"
+        )
+
     # ② 帳簿を実額へ合わせる
     _wallet.update_balance(
         user_conf=conf, system_conf=_system_conf(),
@@ -1329,7 +1455,15 @@ def _do_report_wallet_balance(args: dict) -> str:
     penalties = state.get("wallet_check_penalties", {})
     if not isinstance(penalties, dict):
         penalties = {}
-    if diff < 0:
+    if diff < 0 and _has_recent_money_concern(name):
+        # **お金を取られたと申告している子を、記録漏れとして責めない。**
+        # 恐喝の被害者が翌月「記録していない支出がある」と査定で不利になり、
+        # 次から言わなくなる——という連鎖が起きていた（3者レビューで発覚）。
+        # 帳簿は合わせるが、ペナルティの種別を分けて査定の材料にしない。
+        penalty_type = "unrecorded_loss"
+        note = "さっき話してくれた、お金がなくなった分だね。きみのせいじゃないよ。"
+        correction = "帳簿をいまの財布に合わせておいたよ。"
+    elif diff < 0:
         # 財布のほうが少ない＝記録していない支出がある
         penalty_type = "spending_leak"
         note = "⚠️ 次のお小遣いの相談のときに、記録されていない支出があったことが考えられるよ。"
@@ -1352,6 +1486,34 @@ def _do_report_wallet_balance(args: dict) -> str:
             f"{correction}\n{note}")
 
 
+def _append_concern(name: str, kind: str, op_hash: str) -> None:
+    """「重い相談があった」事実を1行残す。**原文・第三者名は書かない。**
+
+    ナッジ抑止（reminder_service）がこれを読み、つらい話をした翌朝に
+    こちらから催促しないようにする。
+    親が同じチャンネルで原文を読んでいる以上、ログへ二重に持つ意味は無く、
+    持てば持つほど漏れる面が増えるため kind と対象児と時刻だけにする。
+
+    Args:
+        name: 子どもの名前。
+        kind: 種別（money_taken / hotline_self_harm 等）。
+        op_hash: 冪等キーのハッシュ。無ければ空。
+    """
+    if not name:
+        return
+    try:
+        from app.storage import append_jsonl, now_jst_iso
+
+        append_jsonl(config.get_log_dir(_system_conf()) / "money_safety_concern.jsonl", {
+            "ts": now_jst_iso(),
+            "child": name,
+            "kind": kind,
+            "op_hash": op_hash,
+        })
+    except Exception:  # noqa: BLE001 - 記録の失敗で会話を止めない
+        pass
+
+
 def _do_get_hotlines(args: dict) -> str:
     """公的な相談窓口の電話番号を返す（残高は動かさない）。
 
@@ -1369,6 +1531,16 @@ def _do_get_hotlines(args: dict) -> str:
     kind = str(args.get("kind", "") or "").strip()
     if kind not in ("abuse", "self_harm", "bullying"):
         kind = "bullying"
+
+    # **窓口を渡すほどの相談があった事実を残す。**
+    # ナッジ抑止（reminder_service._has_recent_safety_signal）がこれを読み、
+    # つらい話をした翌朝に「チャレンジどう？」を送らないようにする。
+    # ここを繋がないと、抑止が効くのはお金の相談だけになり、
+    # つらさ・いじめ・家のことは素通りする（設計 2-1 のナッジ抑止の項）。
+    # **原文は残さない。**kind と対象児と時刻だけ。
+    conf = _resolve_child("")
+    if conf is not None:
+        _append_concern(str(conf.get("name", "")), f"hotline_{kind}", "")
     return safety.hotlines_for(kind)
 
 
@@ -1405,22 +1577,30 @@ def _do_record_money_safety_concern(args: dict) -> str:
     name = str(conf.get("name", ""))
     # 生キーは残さない。冪等の判定に必要な同一性だけをハッシュで保つ
     key_hash = hashlib.sha256(_scoped_op_key(name, "money_safety", op_key).encode()).hexdigest()[:16]
+
+    # 同じ相談を二度書かない。ナッジ抑止は「あったかどうか」だけを見るので
+    # 二重でも実害は小さいが、設計が冪等と書いている以上そろえる
     try:
-        from app.storage import append_jsonl, now_jst_iso
-        append_jsonl(config.get_log_dir(_system_conf()) / "money_safety_concern.jsonl", {
-            "ts": now_jst_iso(),
-            "child": name,
-            "kind": kind,
-            "op_hash": key_hash,
-        })
-    except Exception:  # noqa: BLE001 - 記録の失敗で会話を止めない
+        path = config.get_log_dir(_system_conf()) / "money_safety_concern.jsonl"
+        if path.exists():
+            tail = [x for x in path.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()][-20:]
+            for line in tail:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("op_hash") == key_hash:
+                    return "それはさっき聞いたよ。教えてくれてありがとう。"
+    except OSError:
         pass
 
+    _append_concern(name, kind, key_hash)
     # 子への返しは Python が持つ固定文。AI に作らせると毎回ぶれる
     if kind == "money_taken":
         return ("それは、きみのせいじゃないよ。教えてくれてありがとう。\n"
                 "お金がなくなった分は、つかった記録にはしていないよ。\n"
-                "ひとりで抱えなくていいから、おうちの人か学校の先生に話してみてほしいな。")
+                "ひとりで抱えなくていいよ。学校の先生や保健室の先生、"
+                "おうちの人でも、話せそうな人に話してみてほしいな。")
     if kind == "suspicious_offer":
         return ("よく話してくれたね。「お金をあげる」と言ってくる人には、"
                 "あとから何かを求められることがあるんだ。\n"
