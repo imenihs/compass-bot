@@ -337,6 +337,25 @@ def _tool_defs() -> list[dict]:
             },
         },
         {
+            "name": "report_wallet_balance",
+            "description": (
+                "**財布チェック**。子が実際に財布を数えて「今いくら入っていたか」を報告したときに呼ぶ。"
+                "帳簿とズレていたら、帳簿を実際の金額に合わせる（記録漏れの修正）。\n"
+                "『財布に3000円あった』『数えたら1200円だった』のように、"
+                "**実際に数えた金額**を言われたときだけ呼ぶこと。"
+                "『残高いくら？』と聞かれただけのときは get_balance を使う（こちらは呼ばない）。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "子どもの名前"},
+                    "amount": {"type": "integer", "description": "財布に実際に入っていた金額（円・0以上）"},
+                    "operation_key": op_key,
+                },
+                "required": ["amount", "operation_key"],
+            },
+        },
+        {
             "name": "get_hotlines",
             "description": (
                 "子どもへ渡す**公的な相談窓口の電話番号**を返す。"
@@ -1082,6 +1101,95 @@ def _do_contribute_to_goal(args: dict) -> str:
                 f"\n{applied}円{verb}。残高は {balance}円。{extra}")
     return (f"{applied}円{verb}よ。「{title}」は {accumulated}/{target}円になった。"
             f"\n残高は {balance}円。")
+
+
+def _do_report_wallet_balance(args: dict) -> str:
+    """財布チェック。実際に数えた金額を受け取り、帳簿をそれに合わせる。
+
+    **この機能は一度失われていた**（2026/08/11 復旧）。
+    文字列一致ハンドラの中に実装されており、intent 方式への移行で到達不能になったあと
+    削除された。その結果:
+      ・報告を受け取る手段そのものが無くなった
+      ・`pending_by_user` から名前を消す経路も一緒に消え、
+        リマインダーが毎月積むだけになり、**全員が永久に「未報告」**になっていた
+
+    やること（旧実装と同じ）:
+      ① `pending_by_user` と `wallet_check_pending_by_user` から名前を外す
+      ② 差分があれば帳簿を実額へ合わせる（`wallet_check_correction`）
+      ③ 次回の査定で参照するペナルティノートを残す
+         diff < 0（財布が少ない）＝記録漏れの支出 / diff > 0（多い）＝記録漏れの収入
+
+    Args:
+        args: name（子どもの名前）、amount（実際に数えた金額）、operation_key。
+
+    Returns:
+        str: 子への案内文。
+    """
+    conf = _resolve_child(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
+    # 財布が空（0円）も正当な報告なので _parse_amount（1以上）は使わない
+    try:
+        reported = int(args.get("amount"))
+    except (TypeError, ValueError):
+        return f"きんがくがうまく読めなかったよ。0円から{MAX_AMOUNT}円までの数字で教えてね。"
+    if reported < 0 or reported > MAX_AMOUNT:
+        return f"きんがくがうまく読めなかったよ。0円から{MAX_AMOUNT}円までの数字で教えてね。"
+    op_key = str(args.get("operation_key") or "").strip()
+    if not op_key:
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
+
+    name = str(conf.get("name", ""))
+    eff_key = _scoped_op_key(name, "wallet_check", op_key)
+    if _wallet.is_operation_applied(eff_key):
+        return f"この財布チェックはさっき受け取ったよ（残高は変わっていないよ）。今の残高は {_wallet.get_balance(name)}円。"
+
+    expected = _wallet.get_balance(name)
+    diff = reported - expected
+
+    # ① 報告済みにする（積む側は reminder_service、消す側がここ）
+    state = _wallet.load_audit_state()
+    state.get("pending_by_user", {}).pop(name, None)
+    state.get("wallet_check_pending_by_user", {}).pop(name, None)
+
+    if diff == 0:
+        _wallet.save_audit_state(state)
+        return (f"財布チェックOK！ぴったり合ってたよ。\n"
+                f"財布: {reported}円 / 帳簿: {expected}円")
+
+    # ② 帳簿を実額へ合わせる
+    _wallet.update_balance(
+        user_conf=conf, system_conf=_system_conf(),
+        delta=diff, action="wallet_check_correction",
+        note=f"財布チェック修正 差分{diff}円",
+        operation_key=eff_key,
+    )
+
+    # ③ ペナルティノート。差分の向きで意味が変わる
+    penalties = state.get("wallet_check_penalties", {})
+    if not isinstance(penalties, dict):
+        penalties = {}
+    if diff < 0:
+        # 財布のほうが少ない＝記録していない支出がある
+        penalty_type = "spending_leak"
+        note = "⚠️ 次のお小遣いの相談のときに、記録されていない支出があったことが考えられるよ。"
+        correction = "記録もれの支出があったみたいだね。帳簿をなおしたよ。"
+    else:
+        # 財布のほうが多い＝記録していない収入がある
+        penalty_type = "income_leak"
+        note = "📝 もらったお金が記録されていないよ。もらったときに教えてくれると、ぴったり合うようになるよ。"
+        correction = "記録もれの入金があったみたいだね。帳簿にたしたよ。"
+    from app.storage import now_jst_iso
+    penalties[name] = {
+        "ts": now_jst_iso(), "type": penalty_type, "diff": diff,
+        "reported": reported, "expected": expected,
+    }
+    state["wallet_check_penalties"] = penalties
+    _wallet.save_audit_state(state)
+
+    return (f"財布と帳簿がずれてたよ。\n"
+            f"財布: {reported}円 / 帳簿: {expected}円（{abs(diff)}円{'多い' if diff > 0 else '少ない'}）\n"
+            f"{correction}\n{note}")
 
 
 def _do_get_hotlines(args: dict) -> str:
@@ -2284,6 +2392,7 @@ _HANDLERS = {
     "get_savings_goals": _do_get_savings_goals,
     "get_dashboard_url": _do_get_dashboard_url,
     "reissue_dashboard_url": _do_reissue_dashboard_url,
+    "report_wallet_balance": _do_report_wallet_balance,
     "get_hotlines": _do_get_hotlines,
     "record_money_safety_concern": _do_record_money_safety_concern,
     "set_savings_goal": _do_set_savings_goal,

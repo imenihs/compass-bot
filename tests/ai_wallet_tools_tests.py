@@ -149,6 +149,84 @@ def _test_expense_writes_pocket_journal():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_wallet_check_clears_pending():
+    """財布チェックが「報告済み」にすること（2026/08/11 の回帰）。
+
+    `pending_by_user` は reminder_service が毎月積むが、**消す経路が失われていた**。
+    財布チェックを受け取る実装が文字列一致ハンドラの中にあり、
+    intent 方式への移行で到達不能になったあと削除されたため。
+    結果、実児3人が全員「未報告」のまま固定され、何をしても変わらなかった。
+    """
+    import tempfile
+
+    from app import config, mcp_wallet as m
+    import app.wallet_service as ws
+
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "logs").mkdir()
+    (tmp / "settings").mkdir()
+    (tmp / "settings" / "system.json").write_text(
+        json.dumps({"log_dir": str(tmp / "logs")}), encoding="utf-8")
+    (tmp / "settings" / "setting.json").write_text("{}", encoding="utf-8")
+    (tmp / "wallet.json").write_text(json.dumps(
+        {"users": {"たろう": {"expected_balance": 3000}}, "applied_operation_keys": {}},
+        ensure_ascii=False), encoding="utf-8")
+
+    def reset_audit():
+        (tmp / "audit.json").write_text(json.dumps(
+            {"pending_by_user": {"たろう": "2026-08"},
+             "wallet_check_pending_by_user": {"たろう": "2026-08"}},
+            ensure_ascii=False), encoding="utf-8")
+
+    orig = (config.SYSTEM_PATH, config.SETTING_PATH, m._wallet, m._resolve_child)
+    config.SYSTEM_PATH = tmp / "settings" / "system.json"
+    config.SETTING_PATH = tmp / "settings" / "setting.json"
+    w = ws.WalletService()
+    w.wallet_state_path = tmp / "wallet.json"
+    w.wallet_audit_state_path = tmp / "audit.json"
+    m._wallet = w
+    m._resolve_child = lambda n=None: {"name": "たろう"}
+    try:
+        # ① ぴったり合っている: 報告済みになり、残高は動かない
+        reset_audit()
+        msg = m._do_report_wallet_balance({"name": "たろう", "amount": 3000, "operation_key": "k1"})
+        st = w.load_audit_state()
+        _check("check_ok_clears_pending", "たろう" not in st.get("pending_by_user", {}),
+               list(st.get("pending_by_user", {}).keys()))
+        _check("check_ok_clears_wallet_pending",
+               "たろう" not in st.get("wallet_check_pending_by_user", {}), "残っている")
+        _check("check_ok_keeps_balance", w.get_balance("たろう") == 3000, w.get_balance("たろう"))
+        _check("check_ok_message", "ぴったり" in msg, msg[:40])
+
+        # ② 財布が少ない: 帳簿を実額へ合わせ、記録漏れの支出としてペナルティを残す
+        reset_audit()
+        w.wallet_state_path.write_text(json.dumps(
+            {"users": {"たろう": {"expected_balance": 3000}}, "applied_operation_keys": {}},
+            ensure_ascii=False), encoding="utf-8")
+        m._do_report_wallet_balance({"name": "たろう", "amount": 2500, "operation_key": "k2"})
+        st = w.load_audit_state()
+        _check("check_diff_clears_pending", "たろう" not in st.get("pending_by_user", {}),
+               list(st.get("pending_by_user", {}).keys()))
+        _check("check_diff_fixes_balance", w.get_balance("たろう") == 2500, w.get_balance("たろう"))
+        pen = st.get("wallet_check_penalties", {}).get("たろう", {})
+        _check("check_diff_penalty_type", pen.get("type") == "spending_leak", pen.get("type"))
+        _check("check_diff_penalty_diff", pen.get("diff") == -500, pen.get("diff"))
+
+        # ③ 冪等: 同じ operation_key では二度目は動かない
+        before = w.get_balance("たろう")
+        again = m._do_report_wallet_balance({"name": "たろう", "amount": 100, "operation_key": "k2"})
+        _check("check_idempotent", w.get_balance("たろう") == before, w.get_balance("たろう"))
+        _check("check_idempotent_message", "さっき受け取った" in again, again[:40])
+
+        # ④ 0円（財布が空）も正当な報告として受ける
+        reset_audit()
+        zero = m._do_report_wallet_balance({"name": "たろう", "amount": 0, "operation_key": "k3"})
+        _check("check_accepts_zero", "うまく読めなかった" not in zero, zero[:40])
+    finally:
+        config.SYSTEM_PATH, config.SETTING_PATH, m._wallet, m._resolve_child = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> None:
     tmp = Path(tempfile.mkdtemp())
     _setup(tmp)
@@ -294,6 +372,7 @@ def main() -> None:
     # 結果出力（1行1 JSON）
     _test_expense_writes_pocket_journal()
 
+    _test_wallet_check_clears_pending()
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))
