@@ -73,7 +73,6 @@ def _usage_guide_text_parent() -> str:
         "・代理投稿: `@compass-bot たろうの代理 内容`\n"
         "\n"
         "■ 管理・メンテナンス\n"
-        "・全チャンネルに一斉アナウンス: `アナウンス [本文]`\n"
         "・使い方を全チャンネルに通知: `使い方の説明と初期設定`\n"
         "・リマインダーテスト: `@compass-bot reminder test`"
     )
