@@ -249,6 +249,18 @@ def _test_simulator_explains_itself():
     # 目安であることを伝える（達成日を約束のように見せない）
     _check("sim_says_estimate", "目やす" in html, "")
 
+    # **目標が無い子**への配慮（実データで4人中3人が目標なし）。
+    # 根拠のない初期値（旧: 10000円）を黙って置くと「なぜこの金額？」になる
+    _check("sim_handles_no_goal",
+           "ほしいものの ねだんを入れてみてね" in html,
+           "目標が無い子への案内が無い")
+    _check("sim_no_hardcoded_default",
+           "else 10000" not in html,
+           "目標が無い子に根拠のない初期値が入っている")
+    _check("sim_shows_goal_source",
+           "まで あと" in html,
+           "初期値がどの目標の残額か示されていない")
+
 
 def main():
     _test_operational_notes_are_hidden()

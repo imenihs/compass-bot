@@ -203,17 +203,32 @@
   <section class="card sim">
     <h2>ためる計画をたててみよう</h2>
     <p class="sim-lead">
-      「毎月いくらためたら、いつごろとどくか」を計算できるよ。<br>
-      金額をかえてみると、かかる時間がどう変わるか見られる。
+      {% if goals %}
+        「毎月いくらためたら、いつごろとどくか」を計算できるよ。<br>
+        金額をかえてみると、かかる時間がどう変わるか見られる。
+      {% else %}
+        ほしいものがあったら、ここで「どれくらいでとどくか」を計算できるよ。<br>
+        ねだんを入れて、毎月ためる金額をかえてみてね。
+      {% endif %}
     </p>
 
     <label>
       いくらためる？（円）
       {% if goals %}
-        <span class="sim-hint">← いまは「{{ goals[0].title }}」のこりの金額が入ってるよ</span>
+        {# 目標がある子には、その目標の残額を初期値にする。
+           どこから来た数字かを添えないと「なぜこの金額？」になる #}
+        <span class="sim-hint">＝「{{ goals[0].title }}」まで あと{{ "{:,}".format(goals[0].remaining) }}円</span>
+      {% else %}
+        {# 目標が無い子のほうが多い（実データで4人中3人）。
+           根拠のない初期値を黙って置くと「なぜ1万円？」になるため、
+           **自分で入れてもらう**形にする。ここが目標を持つきっかけになる #}
+        <span class="sim-hint">ほしいものの ねだんを入れてみてね</span>
       {% endif %}
     </label>
-    <input type="number" id="target" value="{{ goals[0].remaining if goals else 10000 }}" min="1">
+    <input type="number" id="target"
+           value="{{ goals[0].remaining if goals else '' }}"
+           placeholder="れい: 3000"
+           min="1">
 
     <label>どっちから考える？</label>
     <select id="mode">
@@ -257,7 +272,9 @@
     function calc() {
       const t = Math.max(parseInt(target.value || "0", 10), 0);
       const v = Math.max(parseInt(value.value || "0", 10), 0);
-      if (!t || !v) { result.textContent = "—"; return ""; }
+      // 目標が無い子は金額が空で始まる。何をすればいいかを結果欄で案内する
+      if (!t) { result.textContent = "ほしいものの ねだんを入れてみてね"; return ""; }
+      if (!v) { result.textContent = "毎月ためる金額を入れてみてね"; return ""; }
 
       if (mode.value === "per") {
         lbl.textContent = "1回にためる金額（円）";
