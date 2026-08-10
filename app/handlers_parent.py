@@ -724,7 +724,8 @@ def _find_user_file_stem(discord_user_id: int, want_role: str) -> str | None:
     return None
 
 
-async def _send_dashboard_url(message: discord.Message, token: str, role: str) -> None:
+async def _send_dashboard_url(message: discord.Message, token: str, role: str,
+                              reissued: bool = False) -> None:
     """発行した URL を本人へ届ける。**まず DM、届かなければそのチャンネルへ**。
 
     親チャンネルは夫婦2人が見ているため、そこへ流すと相手の URL も見えてしまう。
@@ -740,8 +741,13 @@ async def _send_dashboard_url(message: discord.Message, token: str, role: str) -
     """
     base_url = get_web_base_url().rstrip("/")
     url = f"{base_url}/compass-bot/d/{token}"
+    if reissued:
+        head = ("あたらしいダッシュボードのURLだよ。ひらいてブックマークしてね。\n"
+                "（まえのURLはもう使えなくなったよ）")
+    else:
+        head = "きみのダッシュボードのURLだよ。ひらいてブックマークしてね。"
     body = (
-        "あたらしいダッシュボードのURLだよ。ひらいてブックマークしてね。\n"
+        f"{head}\n"
         # 山括弧で囲むと Discord がリンクプレビューを作らない。
         # プレビューのために Discord 側が URL をクロールし、UUID がログに残るのを避ける
         f"<{url}>\n"
@@ -749,7 +755,8 @@ async def _send_dashboard_url(message: discord.Message, token: str, role: str) -
     )
     try:
         await message.author.send(body)
-        await message.channel.send("あたらしいURLをDMで送ったよ。")
+        await message.channel.send(
+            "あたらしいURLをDMで送ったよ。" if reissued else "URLをDMで送ったよ。")
         return
     except discord.Forbidden:
         # DM が拒否設定のとき。親チャンネル（子から分離済み）へ出す
@@ -780,8 +787,21 @@ async def maybe_handle_url_reissue(message: discord.Message, content: str) -> bo
     from app import dashboard_token
     from app.config import is_parent_channel
 
-    body = _command_body(content)
-    if body.strip() not in {"URL再発行", "url再発行", "URLさいはっこう", "ダッシュボードURL"}:
+    body = _command_body(content).strip()
+    # **「見たい」と「作り直したい」を分ける**（2026/08/10）。
+    # 見たいだけなのに再発行すると、他の端末で開いていた古いURLが無効になる。
+    # 「ダッシュボードURL」を再発行に含めていたのは誤りだった。
+    reissue_words = {"URL再発行", "url再発行", "URLさいはっこう", "URLをさいはっこう"}
+    show_words = {
+        "ダッシュボード", "ダッシュボードURL", "ダッシュボードみたい",
+        "ダッシュボード見たい", "だっしゅぼーど", "URL", "url", "URLおしえて",
+        "URL教えて", "じぶんのURL", "自分のURL",
+    }
+    if body in reissue_words:
+        want_reissue = True
+    elif body in show_words:
+        want_reissue = False
+    else:
         return False
 
     # 兼務アカウント（親IDが子としても登録されている）があるため、
@@ -799,8 +819,18 @@ async def maybe_handle_url_reissue(message: discord.Message, content: str) -> bo
         return True
 
     user_key = dashboard_token.build_user_key(role, stem)
-    token = dashboard_token.issue(user_key, role, issued_by=str(message.author.id))
-    await _send_dashboard_url(message, token, role)
+    if want_reissue:
+        # 作り直す。古いURLはその場で無効になる
+        token = dashboard_token.issue(user_key, role, issued_by=str(message.author.id))
+        await _send_dashboard_url(message, token, role, reissued=True)
+        return True
+
+    # 見たいだけ。**今のURLをそのまま教える**（再発行しない）
+    token = dashboard_token.find_active_token(user_key)
+    if token is None:
+        # まだ一度も発行されていない場合だけ、ここで発行する
+        token = dashboard_token.issue(user_key, role, issued_by=str(message.author.id))
+    await _send_dashboard_url(message, token, role, reissued=False)
     return True
 
 

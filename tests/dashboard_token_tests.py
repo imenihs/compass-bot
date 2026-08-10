@@ -353,6 +353,103 @@ def _test_money_ops_notify_discord():
            "通知先が親チャンネル優先になっていない（子チャンネルへ流れる）")
 
 
+def _test_show_url_does_not_reissue():
+    """「見たい」と「作り直したい」が分かれていること。
+
+    「ダッシュボードURL」を再発行コマンドに含めていたため、
+    **見たいだけなのに古いURLが無効になる**状態だった。
+    他の端末で開いていたURLが使えなくなり、子が困る。
+    """
+    import asyncio
+
+    from app import config, dashboard_token as dt, handlers_parent as H
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dt.TOKENS_PATH = tmp / "tokens.json"
+        sent, dms = [], []
+
+        class _Ch:
+            def __init__(self, cid):
+                self.id = cid
+
+            async def send(self, msg, **kw):
+                sent.append(msg)
+
+        class _Author:
+            def __init__(self, uid):
+                self.id = uid
+
+            async def send(self, msg, **kw):
+                dms.append(msg)
+
+        orig_client, orig_extract = H._client, H.extract_input_from_mention
+        H._client = type("C", (), {"user": type("U", (), {
+            "id": 1, "name": "compass-bot", "discriminator": "0"})()})()
+        H.extract_input_from_mention = lambda t, u: None
+        try:
+            child_ch = sorted(config.get_allow_channel_ids() or {0})[0]
+            dual_id = 111
+
+            def _run(text):
+                sent.clear()
+                dms.clear()
+                msg = type("M", (), {"channel": _Ch(child_ch),
+                                     "author": _Author(dual_id), "id": 1})()
+                asyncio.new_event_loop().run_until_complete(
+                    H.maybe_handle_url_reissue(msg, text))
+                return dms[0].split("/d/")[1].split(">")[0] if dms else None
+
+            # 見たいだけ: 何度聞いても同じURL
+            first = _run("ダッシュボード")
+            second = _run("ダッシュボードURL")
+            third = _run("URL")
+            _check("show_returns_same_url", first == second == third,
+                   (first, second, third))
+            _check("show_says_not_reissued",
+                   dms and "まえのURL" not in dms[0], dms[:1])
+
+            # 作り直す: URLが変わり、その旨を伝える
+            reissued = _run("URL再発行")
+            _check("reissue_changes_url", reissued != first, (first, reissued))
+            _check("reissue_explains_old_is_dead",
+                   dms and "まえのURLはもう使えなくなった" in dms[0], dms[:1])
+        finally:
+            H._client, H.extract_input_from_mention = orig_client, orig_extract
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_dashboard_url_tool_does_not_reissue():
+    """AI 経由（tool）でURLを聞いても再発行されないこと。"""
+    from app import dashboard_token as dt, mcp_wallet as m
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dt.TOKENS_PATH = tmp / "tokens.json"
+        orig_resolve = m._resolve_child
+        m._resolve_child = lambda n=None: {"name": "テスト"}
+        try:
+            first = m._do_get_dashboard_url({"name": "テスト"})
+            token_after_first = dt.find_active_token(
+                dt.build_user_key(dt.ROLE_CHILD, "test"))
+            second = m._do_get_dashboard_url({"name": "テスト"})
+            token_after_second = dt.find_active_token(
+                dt.build_user_key(dt.ROLE_CHILD, "test"))
+
+            _check("tool_returns_url", "/compass-bot/d/" in first, first[:80])
+            _check("tool_same_url_twice", first == second, (first[:40], second[:40]))
+            _check("tool_does_not_reissue",
+                   token_after_first == token_after_second,
+                   (token_after_first, token_after_second))
+            # リンクプレビュー抑止（UUIDがDiscord側ログに残るのを防ぐ）
+            _check("tool_suppresses_preview", "<http" in first, first[:60])
+        finally:
+            m._resolve_child = orig_resolve
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     _test_issue_and_resolve()
     _test_invalid_tokens_are_rejected()
@@ -365,6 +462,8 @@ def main():
     _test_logout_clears_uuid_cookie()
     _test_admin_check_always_uses_token()
     _test_money_ops_notify_discord()
+    _test_show_url_does_not_reissue()
+    _test_dashboard_url_tool_does_not_reissue()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

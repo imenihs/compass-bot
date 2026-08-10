@@ -311,6 +311,23 @@ def _tool_defs() -> list[dict]:
             },
         },
         {
+            "name": "get_dashboard_url",
+            "description": (
+                "自分のダッシュボード（カレンダー・目標のグラフ・シミュレータが見られるページ）の"
+                "URLを教える。子が『ダッシュボード見たい』『じぶんのページある？』"
+                "『グラフ見たい』のように聞いたら呼ぶ。"
+                "**再発行はしない**（見たいだけなのに作り直すと、ほかの端末で開いていた"
+                "URLが使えなくなる）。作り直したいときは『URL再発行』と打つよう案内すること。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "子どもの名前"},
+                },
+                "required": ["name"],
+            },
+        },
+        {
             "name": "contribute_to_goal",
             "description": (
                 "目標へ積み立てる／立て替えを返す。残高が減り、その目標の進み具合が増える。"
@@ -868,6 +885,59 @@ def _do_contribute_to_goal(args: dict) -> str:
                 f"\n{applied}円{verb}。残高は {balance}円。{extra}")
     return (f"{applied}円{verb}よ。「{title}」は {accumulated}/{target}円になった。"
             f"\n残高は {balance}円。")
+
+
+def _do_get_dashboard_url(args: dict) -> str:
+    """自分のダッシュボードURLを教える。**再発行はしない**。
+
+    子が「ダッシュボード見たい」「じぶんのページある？」のように
+    自然な言い方で聞いたときに使う。固定コマンドを覚えなくても案内できるようにする。
+
+    **見たいだけなのに再発行してはいけない**。
+    他の端末で開いていた古いURLが無効になり、子が困る。
+    作り直したいときだけ「URL再発行」と打ってもらう。
+
+    Args:
+        args: name（子の名前）。
+
+    Returns:
+        str: URL を含む案内文。
+    """
+    conf = _resolve_child(str(args.get("name", "")))
+    if conf is None:
+        return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
+    name = str(conf.get("name", ""))
+
+    from app import config as _config
+    from app import dashboard_token as _dt
+
+    # user_key は設定ファイル名。名前から引き直す
+    stem = None
+    for path in sorted(_config.CHILDREN_DIR.glob("*.json")):
+        if path.name.endswith(".example.json"):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                if str(json.load(f).get("name", "")).strip() == name:
+                    stem = path.stem
+                    break
+        except (OSError, json.JSONDecodeError):
+            continue
+    if stem is None:
+        return "ごめん、きみの登録が見つからなかったよ。おうちの人に聞いてみてね。"
+
+    user_key = _dt.build_user_key(_dt.ROLE_CHILD, stem)
+    token = _dt.find_active_token(user_key)
+    if token is None:
+        # まだ発行されていないときだけ作る（見るたびに作り直さない）
+        token = _dt.issue(user_key, _dt.ROLE_CHILD, issued_by="chat")
+    base_url = _config.get_web_base_url().rstrip("/")
+    # 山括弧で囲んで Discord のリンクプレビューを抑止する（UUIDがDiscord側ログに残るのを防ぐ）
+    return (
+        f"きみのダッシュボードだよ。ひらいてブックマークしてね。\n"
+        f"<{base_url}/compass-bot/d/{token}>\n"
+        "（このURLは自分専用だよ。ほかの人に見せないでね）"
+    )
 
 
 def _do_get_savings_goals(args: dict) -> str:
@@ -1728,6 +1798,7 @@ _HANDLERS = {
     "record_income": _do_record_income,
     "set_initial_balance": _do_set_initial_balance,
     "get_savings_goals": _do_get_savings_goals,
+    "get_dashboard_url": _do_get_dashboard_url,
     "set_savings_goal": _do_set_savings_goal,
     "contribute_to_goal": _do_contribute_to_goal,
     "propose_allowance": _do_propose_allowance,
