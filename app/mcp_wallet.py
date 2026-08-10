@@ -249,7 +249,13 @@ def _tool_defs() -> list[dict]:
         },
         {
             "name": "record_expense",
-            "description": "子どもの支出を記録し、残高を減らす。金額は必ず正の整数（円）。子どもが「◯円つかった／買った」と言ったら、雑談で流さず必ずこのツールを呼ぶこと。",
+            "description": (
+                "子どもの支出を記録し、残高を減らす。金額は必ず正の整数（円）。"
+                "子どもが「◯円つかった／買った」と言ったら、雑談で流さず必ずこのツールを呼ぶこと。"
+                "**ただし「取られた」「盗まれた」「なくした」は支出ではない。**"
+                "本人が『自分で買った／自分で払った』と明示したときだけ呼ぶこと。"
+                "お金を取られた・脅されて渡した場合は record_money_safety_concern を呼ぶ。"
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -328,6 +334,54 @@ def _tool_defs() -> list[dict]:
                     "name": {"type": "string", "description": "子どもの名前"},
                 },
                 "required": ["name"],
+            },
+        },
+        {
+            "name": "get_hotlines",
+            "description": (
+                "子どもへ渡す**公的な相談窓口の電話番号**を返す。"
+                "つらい気持ち・いじめ・家のことで困っている、といった話が出て、"
+                "外の人に相談したほうがよさそうなときに呼ぶ。"
+                "**番号を自分で書いてはいけない。必ずこの道具が返した文字列をそのまま使うこと。**"
+                "残高は変わらない。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["abuse", "self_harm", "bullying"],
+                        "description": (
+                            "abuse=家の人にたたかれる等／self_harm=死にたい・消えたい等／"
+                            "bullying=いじめ。迷ったら bullying"
+                        ),
+                    },
+                },
+                "required": ["kind"],
+            },
+        },
+        {
+            "name": "record_money_safety_concern",
+            "description": (
+                "**お金にまつわる困りごと**を記録する。残高は動かさない。"
+                "次の3つのときに呼ぶ:\n"
+                "・money_taken … お金を取られた・脅されて渡した（自分で使ったのではない）\n"
+                "・suspicious_offer … 知らない人などから『お金をあげる』と誘われた\n"
+                "・illegal_work … あやしい仕事・簡単に稼げる話をもちかけられた\n"
+                "『自分で買った』『落とした』『貸した』は**これではない**（それぞれ record_expense か、記録しない）。"
+                "呼んでも子の残高は1円も変わらない。安心して呼んでよい。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["money_taken", "suspicious_offer", "illegal_work"],
+                        "description": "困りごとの種類",
+                    },
+                    "operation_key": op_key,
+                },
+                "required": ["kind", "operation_key"],
             },
         },
         {
@@ -687,6 +741,22 @@ def _do_record_expense(args: dict) -> str:
         delta=-amount, action="spending_record", note=item,
         operation_key=eff_key, aux_operation_keys=[dup_key], aux_dedup_window_sec=DEDUP_WINDOW_SEC,
     )
+    # お小遣い帳（pocket_journal）にも記録する。
+    # **wallet_ledger と両方に書く**理由: ledger は金額と品目しか持たないが、
+    # journal は item / reason / satisfaction を持ち、learning_insights の会話カード
+    # （高い買い物で満足度が低かった等）と AI フォロー方針「満足度の振り返り」が
+    # これを判定の軸にしている。ledger だけでは代替できない。
+    #
+    # 【2026/08/10 修正】文字列一致ハンドラを intent 方式へ移した際に
+    # journal への書き込みが失われ、**2〜5か月ぶん記録が空**だった。
+    # そのため親ダッシュボードの「今月支出」が常に 0円（0件）、
+    # 「最終支出日」が常に「—」、支出傾向分析が「記録なし」になっていた。
+    #
+    # satisfaction / reason はこの時点では分からないので空で入れる。
+    # AI が会話で「使ってみてどうだった？」と聞いたときに
+    # learning_insights の SUPPLEMENT_ACTIONS（pocket_journal_supplement）で後から補える。
+    _append_pocket_journal(name, item, amount)
+
     # 残高が閾値を割ったら親へ知らせるよう依頼する（Feature 2）。
     # 旧経路（handlers_child の到達不能ハンドラ）から呼ばれていたため長らく死んでいた。
     # tool は Discord を持たないのでキューへ積み、bot プロセスが送る
@@ -695,6 +765,34 @@ def _do_record_expense(args: dict) -> str:
         f"支出を記録したよ。\n- 金額: {amount}円\n- 何に: {item if item else 'なし'}\n"
         f"残高: {before}円 → {after}円"
     )
+
+
+def _append_pocket_journal(name: str, item: str, amount: int) -> None:
+    """お小遣い帳へ1件追記する。失敗しても支出の記録自体は止めない。
+
+    **discord_user_id は書かない。**既存レコードには入っているが、実 ID を
+    ログへ増やす必要は無く、name で十分に特定できる（規約: 実 ID を残さない）。
+
+    Args:
+        name: 子どもの名前。
+        item: 何に使ったか。空でもよい。
+        amount: 使った金額（正の整数）。
+    """
+    try:
+        from app.storage import append_jsonl, now_jst_iso
+
+        append_jsonl(config.get_log_dir(_system_conf()) / f"{name}_pocket_journal.jsonl", {
+            "ts": now_jst_iso(),
+            "name": name,
+            "item": str(item or ""),
+            "reason": "",
+            "reason_word_count": 0,
+            # 会話の中で「どうだった？」と聞けたときに supplement で埋まる
+            "satisfaction": None,
+            "amount": int(amount),
+        })
+    except Exception:  # noqa: BLE001 - お小遣い帳の失敗で残高の記録を巻き戻さない
+        pass
 
 
 def _request_low_balance_alert_if_needed(name: str, balance: int) -> None:
@@ -984,6 +1082,84 @@ def _do_contribute_to_goal(args: dict) -> str:
                 f"\n{applied}円{verb}。残高は {balance}円。{extra}")
     return (f"{applied}円{verb}よ。「{title}」は {accumulated}/{target}円になった。"
             f"\n残高は {balance}円。")
+
+
+def _do_get_hotlines(args: dict) -> str:
+    """公的な相談窓口の電話番号を返す（残高は動かさない）。
+
+    **AI に番号を書かせない**ための道具。自殺予防やいじめ相談の文脈で
+    存在しない番号を子に渡すのは最悪の失敗であり、定数から返すことで構造的に防ぐ。
+
+    Args:
+        args: kind（abuse / self_harm / bullying）。
+
+    Returns:
+        str: 窓口の一覧。未知の kind でも bullying 相当を返して無言にしない。
+    """
+    from app import safety
+
+    kind = str(args.get("kind", "") or "").strip()
+    if kind not in ("abuse", "self_harm", "bullying"):
+        kind = "bullying"
+    return safety.hotlines_for(kind)
+
+
+def _do_record_money_safety_concern(args: dict) -> str:
+    """お金にまつわる困りごとを記録する。**残高は1円も動かさない**。
+
+    社長の判断「いじめを受けて支出する可能性は否定できないから、その程度はあってもいい」
+    に対応する。辞書ではなく AI が意味で判断して呼ぶ。
+    「お金取られた」と「お金なくした」「お金貸した」は単語では区別できず、文脈が要るため。
+
+    **監査ログに原文・第三者の名前・生の operation_key を残さない**（codex 指摘）。
+    残すのは kind・対象児・時刻・ハッシュ化した冪等キーだけ。
+    親が読める場所に既に原文がある以上、ログへ二重に持つ意味は無く、
+    持てば持つほど漏れる面が増える。
+
+    Args:
+        args: kind（money_taken / suspicious_offer / illegal_work）、operation_key。
+
+    Returns:
+        str: 子への案内文（Python が持つ固定文）。
+    """
+    import hashlib
+
+    conf = _resolve_child(str(args.get("name", "")))
+    if conf is None:
+        return "ごめん、うまく記録できなかったよ。もう一度おしえてくれる？"
+    kind = str(args.get("kind", "") or "").strip()
+    if kind not in ("money_taken", "suspicious_offer", "illegal_work"):
+        return "ごめん、うまく記録できなかったよ。もう一度おしえてくれる？"
+    op_key = str(args.get("operation_key") or "").strip()
+    if not op_key:
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
+
+    name = str(conf.get("name", ""))
+    # 生キーは残さない。冪等の判定に必要な同一性だけをハッシュで保つ
+    key_hash = hashlib.sha256(_scoped_op_key(name, "money_safety", op_key).encode()).hexdigest()[:16]
+    try:
+        from app.storage import append_jsonl, now_jst_iso
+        append_jsonl(config.get_log_dir(_system_conf()) / "money_safety_concern.jsonl", {
+            "ts": now_jst_iso(),
+            "child": name,
+            "kind": kind,
+            "op_hash": key_hash,
+        })
+    except Exception:  # noqa: BLE001 - 記録の失敗で会話を止めない
+        pass
+
+    # 子への返しは Python が持つ固定文。AI に作らせると毎回ぶれる
+    if kind == "money_taken":
+        return ("それは、きみのせいじゃないよ。教えてくれてありがとう。\n"
+                "お金がなくなった分は、つかった記録にはしていないよ。\n"
+                "ひとりで抱えなくていいから、おうちの人か学校の先生に話してみてほしいな。")
+    if kind == "suspicious_offer":
+        return ("よく話してくれたね。「お金をあげる」と言ってくる人には、"
+                "あとから何かを求められることがあるんだ。\n"
+                "返事をする前に、おうちの人に相談してからにしよう。")
+    return ("それ、あぶない話かもしれない。教えてくれてよかった。\n"
+            "かんたんにたくさん稼げる話は、あとで大変なことになることが多いんだ。\n"
+            "ぜったいに一人で返事をしないで、おうちの人に相談してね。")
 
 
 def _do_reissue_dashboard_url(args: dict) -> str:
@@ -2108,6 +2284,8 @@ _HANDLERS = {
     "get_savings_goals": _do_get_savings_goals,
     "get_dashboard_url": _do_get_dashboard_url,
     "reissue_dashboard_url": _do_reissue_dashboard_url,
+    "get_hotlines": _do_get_hotlines,
+    "record_money_safety_concern": _do_record_money_safety_concern,
     "set_savings_goal": _do_set_savings_goal,
     "contribute_to_goal": _do_contribute_to_goal,
     "propose_allowance": _do_propose_allowance,

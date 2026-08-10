@@ -10,6 +10,7 @@ claude CLI を起動せず、mcp_wallet の tool 関数を直接呼んで金額�
 隔離環境（一時ディレクトリ）で実データに触れない。結果は1行1 JSON で出力し、集計する。
 """
 import json
+import shutil
 import os
 import sys
 import tempfile
@@ -78,6 +79,74 @@ _results: list[dict] = []
 
 def _check(name: str, passed: bool, detail: str = "") -> None:
     _results.append({"name": name, "passed": bool(passed), "detail": detail})
+
+
+def _test_expense_writes_pocket_journal():
+    """record_expense が **お小遣い帳にも** 記録すること（2026/08/10 の回帰）。
+
+    文字列一致ハンドラを intent 方式へ移した際に journal への書き込みが失われ、
+    **2〜5か月ぶん記録が空**になっていた。その結果:
+      ・親ダッシュボードの「今月支出」が常に 0円（0件）
+      ・「最終支出日」が常に「—」
+      ・支出傾向分析が「記録なし」
+      ・learning_insights の会話カード（満足度を軸に判定）が出ない
+    残高（wallet_ledger）だけは正しく動いていたため、
+    「お金は減っているのに支出0円」という食い違いが画面に出ていた。
+    """
+    import datetime
+    import tempfile
+
+    from app import config, mcp_wallet as m
+    import app.wallet_service as ws
+
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "logs").mkdir()
+    (tmp / "settings").mkdir()
+    (tmp / "settings" / "system.json").write_text(
+        json.dumps({"log_dir": str(tmp / "logs")}), encoding="utf-8")
+    (tmp / "settings" / "setting.json").write_text("{}", encoding="utf-8")
+    state = tmp / "wallet_state.json"
+    state.write_text(json.dumps(
+        {"users": {"たろう": {"expected_balance": 3000}}, "applied_operation_keys": {}},
+        ensure_ascii=False), encoding="utf-8")
+
+    orig = (config.SYSTEM_PATH, config.SETTING_PATH, m._wallet, m._resolve_child)
+    config.SYSTEM_PATH = tmp / "settings" / "system.json"
+    config.SETTING_PATH = tmp / "settings" / "setting.json"
+    w = ws.WalletService()
+    w.wallet_state_path = state
+    w.wallet_audit_state_path = tmp / "audit.json"
+    m._wallet = w
+    m._resolve_child = lambda n=None: {"name": "たろう"}
+    try:
+        m._do_record_expense({"name": "たろう", "amount": 300,
+                              "item": "おかし", "operation_key": "k1"})
+
+        journal = tmp / "logs" / "たろう_pocket_journal.jsonl"
+        _check("journal_file_created", journal.exists(), str(journal))
+        if not journal.exists():
+            return
+        rows = [json.loads(x) for x in journal.read_text(encoding="utf-8").splitlines() if x.strip()]
+        _check("journal_has_one_row", len(rows) == 1, len(rows))
+        row = rows[0] if rows else {}
+        _check("journal_amount", row.get("amount") == 300, row.get("amount"))
+        _check("journal_item", row.get("item") == "おかし", row.get("item"))
+        # 満足度は会話の中で後から supplement される想定なので、この時点では空でよい
+        _check("journal_satisfaction_empty", row.get("satisfaction") is None, row.get("satisfaction"))
+        # 実 Discord ID をログへ増やさない（規約）
+        _check("journal_has_no_discord_id", "discord_user_id" not in row, sorted(row.keys()))
+
+        # ダッシュボードの当月集計が 0 にならないこと（これが表に出ていた症状）
+        month = datetime.datetime.now().strftime("%Y-%m")
+        total = sum(int(r.get("amount") or 0) for r in rows
+                    if str(r.get("ts", "")).startswith(month))
+        _check("dashboard_month_spending_not_zero", total == 300, total)
+
+        # 残高側（ledger）は従来どおり動く
+        _check("balance_still_moves", w.get_balance("たろう") == 2700, w.get_balance("たろう"))
+    finally:
+        config.SYSTEM_PATH, config.SETTING_PATH, m._wallet, m._resolve_child = orig
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main() -> None:
@@ -223,6 +292,8 @@ def main() -> None:
     _check("dup_different_amount_applied", w.get_balance("たろう") == bal_after_dup - 120 and "記録したよ" in r, r)
 
     # 結果出力（1行1 JSON）
+    _test_expense_writes_pocket_journal()
+
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))
