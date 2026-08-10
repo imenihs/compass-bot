@@ -178,7 +178,7 @@ def get_discord_id_conflicts() -> list[dict]:
 def get_web_base_url() -> str:
     """WebダッシュボードのベースURL（URLのハードコードを避けるため設定から読む）"""
     setting = load_setting()
-    return setting.get("web_base_url", "https://example.com")
+    return setting.get("web_base_url", "http://localhost:8765")
 
 def get_parent_channel_id() -> int | None:
     """親専用チャンネルの ID を返す。未設定なら None。
