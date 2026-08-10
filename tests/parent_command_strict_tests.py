@@ -215,6 +215,42 @@ def _test_tool_descriptions_use_criteria_not_phrases():
                not phrase_driven.search(desc), desc[:80])
 
 
+def _test_tools_say_what_to_do_when_unsure():
+    """迷ったときの動きが、道具ごとに書かれていること。
+
+    **確定も無視も、どちらも間違い**（社長指摘・2026/08/11）。
+    「たぶんこれだろう」で実行するのも、黙って流すのも害がある。
+    前者は勝手にお金が動き、後者は子が言ったことを無かったことにする。
+
+    分け方は「取り消せるか」。
+      ・お金や設定が動く → 迷ったら**聞き返す**（あいまいなまま実行しない）
+      ・記録するだけ     → 迷ったら**呼んでよい**（呼んでも誰も損をしない）
+    """
+    from app import mcp_wallet as m
+
+    # 何かが動く道具。迷ったら聞き返す指示があること
+    mutating = ["record_expense", "record_income", "contribute_to_goal",
+                "report_wallet_balance", "reissue_dashboard_url"]
+    # 記録・参照だけの道具。迷っても呼んでよい指示があること
+    harmless = ["add_expense_detail", "record_money_safety_concern"]
+
+    defs = {d["name"]: d.get("description", "") for d in m._tool_defs()}
+    for name in mutating:
+        desc = defs.get(name, "")
+        _check(f"asks_when_unsure::{name}",
+               ("聞き返す" in desc or "get_dashboard_url を選ぶ" in desc), desc[-70:])
+    for name in harmless:
+        desc = defs.get(name, "")
+        _check(f"may_call_when_unsure::{name}", "迷ったら呼んでよい" in desc, desc[-70:])
+
+    # 会話プロンプトにも原則が入っていること
+    prompt = (Path(__file__).resolve().parents[1] / "app/conv/ai_conversation.py").read_text(encoding="utf-8")
+    _check("prompt_has_unsure_principle", "確定も無視も、どちらも間違い" in prompt,
+           "迷ったときの原則がプロンプトに無い")
+    _check("prompt_tells_to_ask_back", "それって〇〇ってこと？" in prompt,
+           "聞き返し方の具体例がプロンプトに無い")
+
+
 def main():
     """全テストを走らせて結果を出す。"""
     _test_no_string_match_handlers()
@@ -223,6 +259,7 @@ def main():
     _test_quoted_command_cannot_move_balance()
     _test_settings_info_reads_real_keys()
     _test_tool_descriptions_use_criteria_not_phrases()
+    _test_tools_say_what_to_do_when_unsure()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
