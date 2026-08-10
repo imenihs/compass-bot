@@ -165,27 +165,6 @@ def _is_exact_command(content: str, *forms: str) -> bool:
     return any(normalized == f for f in forms)
 
 
-def _parent_op_key(message: discord.Message, action: str, target: str) -> str:
-    """親のテキストコマンド用の冪等キーを作る。
-
-    Discord のメッセージ ID はメッセージごとに一意なので、同じメッセージが再配信されても
-    同じキーになり二重適用されない。親が意図して2回打った場合は別 ID になるため通る
-    （「同じ操作の再送」だけを弾き、「本当に2回やりたい」は妨げない）。
-
-    親テキスト経路はこれまで operation_key を渡しておらず、Discord の再送や親の連打で
-    そのまま二重支給になっていた（有識者の反証で判明・2026/08/09）。AI 経路は
-    _scoped_op_key で冪等化済みだったため、経路によって安全性が食い違っていた。
-
-    Args:
-        message: 親のメッセージ。
-        action: 操作種別（allowance_manual_grant 等）。
-        target: 対象児の名前。
-
-    Returns:
-        str: 冪等キー。
-    """
-    mid = int(getattr(message, "id", 0) or 0)
-    return f"{target}:{action}:msg{mid}"
 
 
 def _command_body(content: str) -> str:
@@ -210,67 +189,8 @@ def _normalize_follow_policy(raw_policy: dict | None) -> dict:
     return policy
 
 
-def _follow_policy_note_error(note: str) -> str | None:
-    """親メモが罰・比較・人格評価に寄りすぎていないか確認する"""
-    text = (note or "").strip()
-    if len(text) > 300:
-        return "AIフォロー方針は300文字以内で入力してね。"
-    if any(word in text for word in _FOLLOW_POLICY_UNSAFE_WORDS):
-        return "叱責・兄弟比較・罰を前提にした方針は保存しないよ。買う前チェック、記録習慣、親子で一緒に確認する表現に直してね。"
-    return None
 
 
-def _parse_follow_policy_updates(text: str) -> tuple[dict, str]:
-    """自然文に近い親コマンドから方針フィールドを抽出する"""
-    body = (text or "").strip()
-    normalized = _normalize_japanese_command(body)
-    updates: dict = {}
-
-    if any(token in normalized for token in ("無効", "オフ", "off", "OFF")):
-        updates["enabled"] = False
-    elif any(token in normalized for token in ("有効", "オン", "on", "ON")):
-        updates["enabled"] = True
-
-    for needle, value in _FOLLOW_POLICY_FOCUS_ALIASES.items():
-        if needle in body or needle in normalized:
-            updates["focus_area"] = value
-            break
-
-    # 設定語は文中どこにあっても拾う。
-    # 「とりあえず軽めで」「今日から軽めにして」のように、
-    # 親は設定語を文頭に置くとは限らないため（先頭限定にすると大量に取りこぼす）。
-    # 質問・回想との切り分けは _looks_like_question と、
-    # 呼び出し側の「変化が無ければ保存しない」で担保する。
-    for needle, value in _FOLLOW_POLICY_STRENGTH_ALIASES.items():
-        if needle in body or needle in normalized:
-            updates["nudge_strength"] = value
-            break
-
-    for needle, value in _FOLLOW_POLICY_FREQUENCY_ALIASES.items():
-        if needle in body or needle in normalized:
-            updates["frequency"] = value
-            break
-
-    # 申し送り（parent_note）は、設定語を取り除いた**残りの文**とする。
-    # 取り除かないと「軽め」だけ送ったときに parent_note が文字列 "軽め" で
-    # 上書きされ、それまでの申し送りが壊れる（有識者反証で判明）。
-    # 残りが空なら「申し送りの指定なし」として空文字を返し、
-    # 呼び出し側が現在の申し送りを保つ。
-    note = body
-    note = re.sub(r"\b(enabled|focus|strength|frequency)\s*=\s*\S+", "", note, flags=re.IGNORECASE)
-    for word in ("有効", "無効", "オン", "オフ"):
-        note = note.replace(word, "")
-    # 実際に採用した設定語だけを消す（別の意味で使われた語まで消さない）
-    for alias_map, key in ((_FOLLOW_POLICY_STRENGTH_ALIASES, "nudge_strength"),
-                           (_FOLLOW_POLICY_FREQUENCY_ALIASES, "frequency"),
-                           (_FOLLOW_POLICY_FOCUS_ALIASES, "focus_area")):
-        if key not in updates:
-            continue
-        for needle, value in alias_map.items():
-            if value == updates[key] and needle in note:
-                note = note.replace(needle, "", 1)
-                break
-    return updates, note.strip()
 
 
 def _follow_policy_summary(name: str, policy: dict) -> str:
@@ -292,311 +212,15 @@ def _follow_policy_summary(name: str, policy: dict) -> str:
 # 親専用コマンドハンドラ
 # ------------------------------------------------------------------
 
-async def maybe_handle_parent_broadcast_guide(message: discord.Message, content: str) -> bool:
-    """「使い方の説明と初期設定」コマンドで全チャンネルに使い方を一斉通知する（親のみ）"""
-    if not _is_parent(message.author.id):
-        return False
-
-    # 完全一致で判定する（N-11.17）。部分一致だと文中にこの語があるだけで一斉送信が走る
-    if not _is_exact_command(content, "使い方の説明と初期設定",
-                             "つかいかたのせつめいとしょきせってい"):
-        return False
-
-    channel_ids = get_allow_channel_ids()
-    if not channel_ids:
-        await message.channel.send(
-            "`settings/setting.json` の `allow_channel_ids` が未設定なので一斉通知できないよ。"
-        )
-        return True
-
-    sent = 0
-    failed: list[str] = []
-    text = _usage_guide_text()
-    for cid in sorted(channel_ids):
-        try:
-            channel = _client.get_channel(int(cid))
-            if channel is None:
-                channel = await _client.fetch_channel(int(cid))
-            await channel.send(text)
-            sent += 1
-        except Exception as e:
-            failed.append(f"{cid}({type(e).__name__})")
-
-    msg = f"使い方と初期設定のアナウンスを {sent}/{len(channel_ids)} チャネルに送信したよ。"
-    if failed:
-        msg += f"\n送信失敗: {', '.join(str(x) for x in failed)}"
-    await message.channel.send(msg)
-    return True
 
 
-async def maybe_handle_safety_setup_check(message: discord.Message, content: str) -> bool:
-    """「安全設定チェック」で、危険信号の通知先が正しいかを実際に送信して確かめる（親のみ）。
-
-    設定ミスは仕様やコードでは防げない。「親だけが見えるはずのチャンネル」が実は子にも
-    見えている、という取り違えは、実際に送ってみて初めて分かる。
-    自傷やいじめの通知が子に見えてしまう事故を、運用開始前に発見できるようにする。
-
-    やること。
-      ① 危険信号の通知先チャンネルを解決し、そこへ「確認用メッセージ」を送る。
-      ② そのチャンネルに誰が入れるか（子が見えていないか）を親自身に目視確認してもらう。
-      ③ 子ども用チャンネルにも確認用メッセージを送り、どの子のチャンネルかを取り違えていないか見せる。
-    実際に送るのが要点で、設定値を表示するだけでは「見えるかどうか」は分からない。
-
-    Args:
-        message: 親からのメッセージ。
-        content: 生の本文。
-
-    Returns:
-        bool: このコマンドとして処理したら True。
-    """
-    if not _is_parent(message.author.id):
-        return False
-    # 完全一致で判定する（N-11.17）
-    if not _is_exact_command(content, "安全設定チェック", "あんぜんせっていちぇっく"):
-        return False
-
-    from app.config import get_safety_alert_setting, get_allowance_reminder_setting, load_all_users
-
-    safety_conf = get_safety_alert_setting() or {}
-    parent_conf = get_allowance_reminder_setting() or {}
-    # 実際に使われる宛先を、本番と同じ解決順で求める（表示だけの確認にしない）
-    target_id = safety_conf.get("channel_id") or parent_conf.get("channel_id")
-    lines = ["**安全設定チェックを実行したよ。**", ""]
-
-    if not safety_conf.get("enabled", True):
-        lines.append("⚠️ `safety_alert.enabled` が false だよ。危険信号の通知は送られないよ。")
-    if safety_conf.get("channel_id"):
-        lines.append(f"・危険信号の通知先: 専用設定のチャンネル（ID {safety_conf['channel_id']}）")
-    elif target_id:
-        lines.append(f"・危険信号の通知先: 査定と同じ親チャンネル（ID {target_id}）へフォールバック中")
-        lines.append("　→ 分けたいときは `safety_alert.channel_id` を設定してね。")
-    else:
-        lines.append("❌ 通知先が未設定だよ。危険信号を検知しても**どこにも通知できない**。")
-        lines.append("　→ `safety_alert.channel_id` か `allowance_reminder.channel_id` を設定してね。")
-
-    # ① 通知先へ実際に送る。届くかどうかは送ってみないと分からない
-    delivered = False
-    if target_id:
-        try:
-            ch = _client.get_channel(int(target_id))
-            if ch is None:
-                ch = await _client.fetch_channel(int(target_id))
-            await ch.send(
-                "🔔 **【安全設定チェック】ここは危険信号の通知先です**\n"
-                "お子さんの安全に関わる連絡（いじめ・つらい気持ちの訴えなど）は、このチャンネルに届きます。\n"
-                "**このメッセージがお子さんから見えていないか、必ず確認してください。**\n"
-                "見えている場合は、チャンネルの権限設定を見直すか、"
-                "`safety_alert.channel_id` に大人だけのチャンネルを指定してください。\n"
-                "※ 家庭内の虐待が疑われる内容は、この経路では通知しません（お子さんへ公的窓口を案内します）。"
-            )
-            delivered = True
-        except Exception as e:
-            lines.append(f"❌ 通知先への送信に失敗したよ: {type(e).__name__}")
-            lines.append("　→ チャンネルIDが正しいか、Botに送信権限があるか確認してね。")
-
-    if delivered:
-        lines.append("✅ 通知先へ確認用メッセージを送ったよ。**子どもに見えていないか確認してね。**")
-
-    # ③ 子ども用チャンネルにも送り、どの子のチャンネルかの取り違えを見つける。
-    #    宛先解決は査定 F/B と同じ _resolve_child_channels_strict を使う（入口ごとに解決方法を変えない）。
-    #    候補が複数ある子（共有チャンネル）は送らず警告する。他の子に見える事故を防ぐため。
-    sent_children = []
-    try:
-        channels, counts = await _resolve_child_channels_strict()
-    except Exception as e:
-        channels, counts = {}, {}
-        lines.append(f"⚠️ 子ども用チャンネルの解決に失敗したよ: {type(e).__name__}")
-    for user in load_all_users():
-        name = str(user.get("name", ""))
-        if not name:
-            continue
-        n = counts.get(name, 0)
-        if n == 0:
-            lines.append(f"⚠️ {name} さんのチャンネルが見つからないよ（発言がないと判定できないことがあるよ）。")
-            continue
-        if n > 1:
-            lines.append(
-                f"⚠️ {name} さんのチャンネル候補が {n} 件あるよ。"
-                "1つのチャンネルに複数の子がいると、通知が他の子に見えてしまうよ。"
-            )
-            continue
-        ch = channels.get(name)
-        if ch is None:
-            continue
-        try:
-            await ch.send(
-                f"🔔 **【安全設定チェック】ここは {name} さん用のチャンネルです**\n"
-                "名前が合っているか、おうちの人に教えてね。"
-            )
-            sent_children.append(name)
-        except Exception as e:
-            lines.append(f"⚠️ {name} さんのチャンネルへ送れなかったよ: {type(e).__name__}")
-
-    if sent_children:
-        lines.append(
-            f"✅ 子ども用チャンネルへも確認用メッセージを送ったよ（{', '.join(sent_children)}）。\n"
-            "　**表示された名前がそのチャンネルの子と合っているか確認してね。**"
-        )
-    lines.append("")
-    lines.append("設定を直したら、Botを再起動してからもう一度このコマンドを実行してね。")
-    await message.channel.send("\n".join(lines))
-    return True
 
 
-async def maybe_handle_parent_usage_single(message: discord.Message, content: str) -> bool:
-    """「使い方の説明」コマンドでコマンドを送ったチャンネル1つだけに使い方を送信する（親のみ）。
-    「使い方の説明と初期設定」（全チャンネル一斉）より後に判定すること。"""
-    if not _is_parent(message.author.id):
-        return False
-
-    # 完全一致なので「使い方の説明と初期設定」とは自然に区別される（N-11.17）。
-    # 従来は部分一致＋否定条件で除外しており、bot.py の呼び出し順に依存していた。
-    if not _is_exact_command(content, "使い方の説明", "つかいかたのせつめい"):
-        return False
-
-    # コマンドを送ったチャンネルに直接送信する
-    await message.channel.send(_usage_guide_text())
-    await message.channel.send("（このチャンネル単体への送信だよ。全チャンネルへ送る場合は「使い方の説明と初期設定」を使ってね）")
-    return True
 
 
-async def maybe_handle_parent_dashboard(message: discord.Message, content: str) -> bool:
-    """親向けダッシュボード: 全ユーザーの残高・状況を一覧表示する（Feature 1）"""
-    # 親以外はこのコマンドを使えない
-    if not _is_parent(message.author.id):
-        return False
-
-    # 「全体確認」「ぜんたいかくにん」に**完全一致**したときだけ反応する（N-11.17）。
-    # 部分一致だと「全体確認ってどうやるの？」のような疑問文でも発火する
-    if not _is_exact_command(content, "全体確認", "ぜんたいかくにん"):
-        return False
-
-    # ユーザー一覧・残高監査状態・ログディレクトリを取得する
-    system_conf = load_system()
-    log_dir = get_log_dir(system_conf)
-    # ユーザーを名前順にソートして表示順を安定させる
-    users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-    audit_state = _wallet_service.load_audit_state()
-    # pending_by_user に名前があれば残高報告が未完了である
-    pending_by_user = audit_state.get("pending_by_user", {})
-
-    lines = ["【全体確認ダッシュボード】"]
-    for u in users:
-        name = str(u.get("name", ""))
-        fixed = int(u.get("fixed_allowance", 0))
-        balance = _wallet_service.get_balance(name)
-        # 監査の pending 状態で報告済/未報告を判定する
-        report_status = "未報告" if name in pending_by_user else "報告済"
-
-        # 支出記録JSONL の末尾レコードから最終支出日を取得する
-        journal_path = log_dir / f"{name}_pocket_journal.jsonl"
-        journal_rows = _load_jsonl(journal_path)
-        last_spending_date = "なし"
-        if journal_rows:
-            last_ts = journal_rows[-1].get("ts")
-            if last_ts:
-                try:
-                    dt = datetime.fromisoformat(str(last_ts))
-                    # 月/日の形式で表示する（年は省略）
-                    last_spending_date = dt.strftime("%m/%d")
-                except Exception:
-                    pass
-
-        lines.append(
-            f"・{name}: 固定{fixed}円 / 残高{balance}円 / 残高報告:{report_status} / 最終支出:{last_spending_date}"
-        )
-
-    await message.channel.send("\n".join(lines))
-    return True
 
 
-async def maybe_handle_user_setting_change(message: discord.Message, content: str) -> bool:
-    """親が固定お小遣い・臨時上限に触れたとき、Web ダッシュボードへ案内する（親のみ）。
 
-    **チャットで金額の設定を受け付けるのをやめた**（N-11.17）。
-    固定お小遣いは毎月効き続ける設定で、桁を間違えると気づきにくい。
-    Web には数値入力のフォームが既にあり、値が曖昧にならないうえ
-    一覧で見比べられる。フォロー方針と同じ方針にそろえる。
-
-    現在値の確認だけはその場で答える（見るだけなら曖昧さが無いため）。
-    """
-    if not _is_parent(message.author.id):
-        return False
-    body = _command_body(content)
-    m = re.match(r"^設定変更(?:\s+(\S+))?", body)
-    if not m:
-        return False
-
-    base_url = get_web_base_url().rstrip("/")
-    target_name = (m.group(1) or "").strip()
-    if target_name:
-        target_conf = find_child_user_by_name(target_name)
-        if target_conf is None:
-            await message.channel.send(f"`{target_name}` は子どもユーザー設定に見つからなかったよ。")
-            return True
-        fixed = int(target_conf.get("fixed_allowance", 0) or 0)
-        temp = int(target_conf.get("temporary_max", 0) or 0)
-        await message.channel.send(
-            f"{target_name}の今の設定だよ。"
-            f"\n- 固定お小遣い: {fixed:,}円"
-            f"\n- 臨時の上限: {temp:,}円"
-            f"\n\n変更は Web から → {base_url}"
-        )
-        return True
-
-    await message.channel.send(
-        f"お小遣いの設定は Web からお願いね → {base_url}"
-        "\n今の設定を見るなら「設定変更 <名前>」だよ。"
-    )
-    return True
-
-async def maybe_handle_followup_policy(message: discord.Message, content: str) -> bool:
-    """親が AI フォロー方針に触れたとき、Web ダッシュボードへ案内する（親のみ）。
-
-    **チャットで細かい設定を受け付けるのをやめた**（N-11.17）。理由は3つ。
-
-    1. 言葉から「指示」と「質問」を見分けるのは実務上できない。
-       「軽めだっけ」で設定が変わる、逆に「とりあえず軽めで」が無視される、を
-       語彙の調整で4周往復して、どちらかに必ず倒れることが分かった。
-    2. 実ログでは親はこのコマンドをほぼ使わない（親の発話48件中0件）。
-       親は自然文で話すか、Web を使う。
-    3. Web ダッシュボードに同じ設定のフォームが既にある。
-       選択式なので値が曖昧にならず、パースも要らない。
-
-    設定の変更は確実な Web へ寄せ、チャットは案内に徹する。
-    現在値の確認だけはその場で答える（見るだけなら曖昧さが無いため）。
-    """
-    body = _command_body(content)
-    m = re.match(r"^(?:AI)?フォロー(?:方針|設定|強さ|頻度)(?:\s+(\S+))?", body, re.IGNORECASE)
-    if not m:
-        return False
-
-    # 親以外は無視する
-    if not _is_parent(message.author.id):
-        await message.channel.send("AIフォロー方針の変更は親のみできるよ。")
-        return True
-
-    target_name = (m.group(1) or "").strip()
-    base_url = get_web_base_url().rstrip("/")
-
-    # 対象が分かるなら現在値を見せる（確認だけなら曖昧さが無い）
-    if target_name:
-        target_conf = find_user_by_name(target_name)
-        if target_conf is None:
-            await message.channel.send(f"`{target_name}` はユーザー設定に見つからなかったよ。")
-            return True
-        current_policy = _normalize_follow_policy(target_conf.get("ai_follow_policy"))
-        await message.channel.send(
-            _follow_policy_summary(target_name, current_policy)
-            + f"\n\n変更は Web から → {base_url}"
-        )
-        return True
-
-    await message.channel.send(
-        f"AIフォロー方針は Web から設定してね → {base_url}"
-        "\n今の設定を見るなら「フォロー方針 <名前>」だよ。"
-    )
-    return True
 
 
 async def _resolve_child_channels_strict() -> tuple[dict, dict]:
@@ -690,147 +314,241 @@ async def _drive_assessment_feedback() -> None:
             pass
 
 
-def _find_user_file_stem(discord_user_id: int, want_role: str) -> str | None:
-    """Discord ID と役割から、設定ファイル名（拡張子なし）を引く。
 
-    トークンのキーは user_key（`child:<ファイル名>` / `parent:<ファイル名>`）である。
-    **discord_user_id はキーにできない**。実データで子「テスト」と親「とうちゃん」が
-    同一 ID を持つ（兼務アカウント）ため、ID だけでは一意に定まらない。
-    そこで「どのチャンネルで打たれたか」で役割を先に決め、この関数で絞り込む。
 
-    Args:
-        discord_user_id: 打った人の Discord ID。
-        want_role: dashboard_token.ROLE_CHILD / ROLE_PARENT。
+async def _drive_dashboard_dm() -> None:
+    """tool が積んだ「URLをDMして」を取り出し、本人へ DM で届ける。
 
-    Returns:
-        str | None: 設定ファイル名。見つからなければ None。
+    **なぜキュー経由なのか**: tool（mcp_wallet）は別プロセスで動き Discord を持たない。
+    そして AI の応答は必ずチャンネルへ出るため、tool に URL を返させると
+    親チャンネルの相方にも自分専用 URL が見えてしまう。
+    そこで tool は「送って」と積むだけにし、実際の DM はこのプロセスが行う。
+
+    DM が拒否設定なら諦める（チャンネルへは絶対に出さない）。
+    親チャンネルは夫婦2人が見ており、そこへ出すと相方に URL が渡るため。
+    届かなかった旨だけ診断ログに残す。
     """
     from app import dashboard_token
-    from app.config import CHILDREN_DIR, PARENTS_DIR
 
-    base = (PARENTS_DIR if want_role == dashboard_token.ROLE_PARENT else CHILDREN_DIR)
-    if not base.exists():
-        return None
-    for path in sorted(base.glob("*.json")):
-        if path.name.endswith(".example.json"):
+    try:
+        requests = dashboard_token.take_dm_requests()
+    except Exception:  # noqa: BLE001 - キューの不調で会話を止めない
+        return
+    if not requests:
+        return
+
+    base_url = get_web_base_url().rstrip("/")
+    for req in requests:
+        uid = int(req.get("discord_user_id", 0) or 0)
+        user_key = str(req.get("user_key", ""))
+        if uid <= 0 or not user_key:
+            continue
+        token = dashboard_token.find_active_token(user_key)
+        if not token:
+            continue
+        # 山括弧で囲むと Discord がリンクプレビューを作らない。
+        # プレビューのために Discord 側が URL をクロールし、UUID が外部に出るのを避ける
+        body = (
+            "ダッシュボードのURLだよ。ひらいてブックマークしてね。\n"
+            f"<{base_url}/compass-bot/d/{token}>\n"
+            "（このURLは自分専用だよ。ほかの人に見せないでね）"
+        )
+        try:
+            user = _client.get_user(uid) or await _client.fetch_user(uid)
+            await user.send(body)
+        except Exception as exc:  # noqa: BLE001 - 1人失敗しても他を止めない
+            _log_dashboard_event("dashboard_url_dm_failed",
+                                 {"discord_user_id": uid, "error": f"{type(exc).__name__}: {exc}"})
+
+
+async def _drive_bot_actions() -> None:
+    """tool が積んだ「bot にしかできない送信処理」を実行する。
+
+    一斉通知と安全設定チェックは Discord への送信そのものが目的のため、
+    別プロセスの tool では実行できない。ここで消化する。
+    """
+    from app import dashboard_token
+
+    try:
+        actions = dashboard_token.take_bot_actions()
+    except Exception:  # noqa: BLE001 - キューの不調で会話を止めない
+        return
+    for action in actions:
+        kind = str(action.get("kind", ""))
+        try:
+            if kind == "broadcast_usage_guide":
+                await _broadcast_usage_guide()
+            elif kind == "safety_setup_check":
+                await _run_safety_setup_check()
+        except Exception as exc:  # noqa: BLE001 - 1件失敗しても他を止めない
+            _log_dashboard_event("bot_action_failed",
+                                 {"kind": kind, "error": f"{type(exc).__name__}: {exc}"})
+
+
+async def _broadcast_usage_guide() -> None:
+    """使い方の説明を全チャンネルへ一斉送信し、結果を親チャンネルへ報告する。"""
+    channel_ids = get_allow_channel_ids()
+    if not channel_ids:
+        await _notify_parent_channel(
+            "`settings/setting.json` の `allow_channel_ids` が未設定なので一斉通知できないよ。")
+        return
+
+    text = _usage_guide_text()
+    sent, failed = 0, []
+    for cid in sorted(channel_ids):
+        try:
+            channel = _client.get_channel(int(cid)) or await _client.fetch_channel(int(cid))
+            await channel.send(text)
+            sent += 1
+        except Exception as exc:  # noqa: BLE001 - 1チャンネル失敗しても続ける
+            failed.append(f"{cid}({type(exc).__name__})")
+
+    msg = f"使い方と初期設定のアナウンスを {sent}/{len(channel_ids)} チャネルに送信したよ。"
+    if failed:
+        msg += f"\n送信失敗: {', '.join(failed)}"
+    await _notify_parent_channel(msg)
+
+
+async def _notify_parent_channel(text: str) -> None:
+    """親チャンネルへ報告を送る。解決できなければ診断ログだけ残す。
+
+    tool 経由の依頼は「どのメッセージから来たか」を持たないため、
+    報告先は設定で決まる親チャンネルに固定する。
+    子チャンネルへ流すと、一斉通知の失敗内容などが子に見えてしまう。
+    """
+    from app.config import get_parent_channel_id
+
+    cid = get_parent_channel_id()
+    if cid:
+        try:
+            channel = _client.get_channel(int(cid)) or await _client.fetch_channel(int(cid))
+            await channel.send(text)
+            return
+        except Exception as exc:  # noqa: BLE001 - 送信失敗は診断ログへ
+            _log_dashboard_event("parent_channel_notify_failed",
+                                 {"channel_id": int(cid), "error": f"{type(exc).__name__}: {exc}"})
+            return
+    _log_dashboard_event("parent_channel_unset", {"text": text[:100]})
+
+
+async def _run_safety_setup_check() -> None:
+    """危険信号の通知先が正しいかを、実際に送信して確かめる。
+
+    設定ミスは仕様やコードでは防げない。「親だけが見えるはずのチャンネル」が実は子にも
+    見えている、という取り違えは、実際に送ってみて初めて分かる。
+    自傷やいじめの通知が子に見えてしまう事故を、運用開始前に発見できるようにする。
+
+    やること。
+      ① 危険信号の通知先チャンネルを解決し、そこへ「確認用メッセージ」を送る。
+      ② そのチャンネルに誰が入れるかを親自身に目視確認してもらう。
+      ③ 子ども用チャンネルにも送り、どの子のチャンネルかを取り違えていないか見せる。
+    実際に送るのが要点で、設定値を表示するだけでは「見えるかどうか」は分からない。
+    """
+    from app.config import get_safety_alert_setting, get_allowance_reminder_setting, load_all_users
+
+    safety_conf = get_safety_alert_setting() or {}
+    parent_conf = get_allowance_reminder_setting() or {}
+    # 実際に使われる宛先を、本番と同じ解決順で求める（表示だけの確認にしない）
+    target_id = safety_conf.get("channel_id") or parent_conf.get("channel_id")
+    lines = ["**安全設定チェックを実行したよ。**", ""]
+
+    if not safety_conf.get("enabled", True):
+        lines.append("⚠️ `safety_alert.enabled` が false だよ。危険信号の通知は送られないよ。")
+    if safety_conf.get("channel_id"):
+        lines.append(f"・危険信号の通知先: 専用設定のチャンネル（ID {safety_conf['channel_id']}）")
+    elif target_id:
+        lines.append(f"・危険信号の通知先: 査定と同じ親チャンネル（ID {target_id}）へフォールバック中")
+        lines.append("　→ 分けたいときは `safety_alert.channel_id` を設定してね。")
+    else:
+        lines.append("❌ 通知先が未設定だよ。危険信号を検知しても**どこにも通知できない**。")
+        lines.append("　→ `safety_alert.channel_id` か `allowance_reminder.channel_id` を設定してね。")
+
+    # ① 通知先へ実際に送る。届くかどうかは送ってみないと分からない
+    delivered = False
+    if target_id:
+        try:
+            ch = _client.get_channel(int(target_id)) or await _client.fetch_channel(int(target_id))
+            await ch.send(
+                "🔔 **【安全設定チェック】ここは危険信号の通知先です**\n"
+                "お子さんの安全に関わる連絡（いじめ・つらい気持ちの訴えなど）は、このチャンネルに届きます。\n"
+                "**このメッセージがお子さんから見えていないか、必ず確認してください。**\n"
+                "見えている場合は、チャンネルの権限設定を見直すか、"
+                "`safety_alert.channel_id` に大人だけのチャンネルを指定してください。\n"
+                "※ 家庭内の虐待が疑われる内容は、この経路では通知しません（お子さんへ公的窓口を案内します）。"
+            )
+            delivered = True
+        except Exception as e:  # noqa: BLE001 - 送信失敗を親へ伝えて続ける
+            lines.append(f"❌ 通知先への送信に失敗したよ: {type(e).__name__}")
+            lines.append("　→ チャンネルIDが正しいか、Botに送信権限があるか確認してね。")
+
+    if delivered:
+        lines.append("✅ 通知先へ確認用メッセージを送ったよ。**子どもに見えていないか確認してね。**")
+
+    # ③ 子ども用チャンネルにも送り、どの子のチャンネルかの取り違えを見つける。
+    #    宛先解決は査定 F/B と同じ _resolve_child_channels_strict を使う（入口ごとに解決方法を変えない）。
+    #    候補が複数ある子（共有チャンネル）は送らず警告する。他の子に見える事故を防ぐため。
+    sent_children = []
+    try:
+        channels, counts = await _resolve_child_channels_strict()
+    except Exception as e:  # noqa: BLE001 - 解決失敗でも通知先の確認結果は返す
+        channels, counts = {}, {}
+        lines.append(f"⚠️ 子ども用チャンネルの解決に失敗したよ: {type(e).__name__}")
+    for user in load_all_users():
+        name = str(user.get("name", ""))
+        if not name:
+            continue
+        n = counts.get(name, 0)
+        if n == 0:
+            lines.append(f"⚠️ {name} さんのチャンネルが見つからないよ（発言がないと判定できないことがあるよ）。")
+            continue
+        if n > 1:
+            lines.append(
+                f"⚠️ {name} さんのチャンネル候補が {n} 件あるよ。"
+                "1つのチャンネルに複数の子がいると、通知が他の子に見えてしまうよ。"
+            )
+            continue
+        ch = channels.get(name)
+        if ch is None:
             continue
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            continue
-        if int(data.get("discord_user_id", 0) or 0) == int(discord_user_id):
-            return path.stem
-    return None
+            await ch.send(
+                f"🔔 **【安全設定チェック】ここは {name} さん用のチャンネルです**\n"
+                "名前が合っているか、おうちの人に教えてね。"
+            )
+            sent_children.append(name)
+        except Exception as e:  # noqa: BLE001 - 1人失敗しても他を続ける
+            lines.append(f"⚠️ {name} さんのチャンネルへ送れなかったよ: {type(e).__name__}")
 
-
-async def _send_dashboard_url(message: discord.Message, token: str, role: str,
-                              reissued: bool = False) -> None:
-    """発行した URL を本人へ届ける。**まず DM、届かなければそのチャンネルへ**。
-
-    親チャンネルは夫婦2人が見ているため、そこへ流すと相手の URL も見えてしまう。
-    DM なら打った本人にだけ届く。
-    ただし DM は相手の設定次第で `discord.Forbidden` になるため、
-    **届かなかったときはチャンネルへ出す**（親チャンネルは子から分離済みなので、
-    最悪ここへ出しても子には見えない）。片方が失敗しても詰まらない構成にする。
-
-    Args:
-        message: コマンドを打ったメッセージ。
-        token: 発行された UUID。
-        role: child / parent。
-    """
-    base_url = get_web_base_url().rstrip("/")
-    url = f"{base_url}/compass-bot/d/{token}"
-    if reissued:
-        head = ("あたらしいダッシュボードのURLだよ。ひらいてブックマークしてね。\n"
-                "（まえのURLはもう使えなくなったよ）")
-    else:
-        head = "きみのダッシュボードのURLだよ。ひらいてブックマークしてね。"
-    body = (
-        f"{head}\n"
-        # 山括弧で囲むと Discord がリンクプレビューを作らない。
-        # プレビューのために Discord 側が URL をクロールし、UUID がログに残るのを避ける
-        f"<{url}>\n"
-        "（このURLは自分専用だよ。ほかの人に見せないでね）"
-    )
-    try:
-        await message.author.send(body)
-        await message.channel.send(
-            "あたらしいURLをDMで送ったよ。" if reissued else "URLをDMで送ったよ。")
-        return
-    except discord.Forbidden:
-        # DM が拒否設定のとき。親チャンネル（子から分離済み）へ出す
-        await message.channel.send(body)
-    except Exception as exc:  # noqa: BLE001 - 送信失敗で処理を止めない
-        _log_parent_handler_error(message, "dashboard_url_dm_failed", exc)
-        await message.channel.send(body)
-
-
-async def maybe_handle_url_reissue(message: discord.Message, content: str) -> bool:
-    """「URL再発行」コマンド。**打った本人のダッシュボードURLだけ**を再発行する（親子共通）。
-
-    再発行の入口を Web に置かない理由（docs/設計_UUID認証方式.md）:
-      URL が漏れた場合、Web に入口があると**盗んだ側も同じ画面から再発行できる**。
-      盗った側が先に再発行すると、正規の本人が締め出される。
-      Discord のアカウントは本人確認済みの独立した経路なので、
-      URL を盗んだだけの相手は再発行できず、正規の本人はいつでも取り戻せる。
-
-    **他人の UUID は誰も再発行できない**（本人の Discord アカウントからのみ）。
-
-    Args:
-        message: Discord メッセージ。
-        content: 発話本文。
-
-    Returns:
-        bool: このコマンドとして処理したら True。
-    """
-    from app import dashboard_token
-    from app.config import is_parent_channel
-
-    body = _command_body(content).strip()
-    # **「見たい」と「作り直したい」を分ける**（2026/08/10）。
-    # 見たいだけなのに再発行すると、他の端末で開いていた古いURLが無効になる。
-    # 「ダッシュボードURL」を再発行に含めていたのは誤りだった。
-    reissue_words = {"URL再発行", "url再発行", "URLさいはっこう", "URLをさいはっこう"}
-    show_words = {
-        "ダッシュボード", "ダッシュボードURL", "ダッシュボードみたい",
-        "ダッシュボード見たい", "だっしゅぼーど", "URL", "url", "URLおしえて",
-        "URL教えて", "じぶんのURL", "自分のURL",
-    }
-    if body in reissue_words:
-        want_reissue = True
-    elif body in show_words:
-        want_reissue = False
-    else:
-        return False
-
-    # 兼務アカウント（親IDが子としても登録されている）があるため、
-    # **どのチャンネルで打たれたか**で役割を決める
-    if is_parent_channel(message.channel.id):
-        role = dashboard_token.ROLE_PARENT
-    else:
-        role = dashboard_token.ROLE_CHILD
-
-    stem = _find_user_file_stem(message.author.id, role)
-    if stem is None:
-        await message.channel.send(
-            "ごめん、あなたの登録が見つからなかったよ。おうちの人に伝えてね。"
+    if sent_children:
+        lines.append(
+            f"✅ 子ども用チャンネルへも確認用メッセージを送ったよ（{', '.join(sent_children)}）。\n"
+            "　**表示された名前がそのチャンネルの子と合っているか確認してね。**"
         )
-        return True
+    lines.append("")
+    lines.append("設定を直したら、Botを再起動してからもう一度たのんでね。")
+    await _notify_parent_channel("\n".join(lines))
 
-    user_key = dashboard_token.build_user_key(role, stem)
-    if want_reissue:
-        # 作り直す。古いURLはその場で無効になる
-        token = dashboard_token.issue(user_key, role, issued_by=str(message.author.id))
-        await _send_dashboard_url(message, token, role, reissued=True)
-        return True
 
-    # 見たいだけ。**今のURLをそのまま教える**（再発行しない）
-    token = dashboard_token.find_active_token(user_key)
-    if token is None:
-        # まだ一度も発行されていない場合だけ、ここで発行する
-        token = dashboard_token.issue(user_key, role, issued_by=str(message.author.id))
-    await _send_dashboard_url(message, token, role, reissued=False)
-    return True
+def _log_dashboard_event(event: str, detail: dict) -> None:
+    """ダッシュボード・キュー処理の診断ログを残す。
+
+    _log_parent_handler_error は message を必須とするが、tool 経由の依頼には
+    元メッセージが無いため、こちらは message 抜きで書ける形にする。
+    ログの失敗で本処理を落とさない。
+
+    Args:
+        event: 事象名。
+        detail: 付随情報。
+    """
+    try:
+        append_jsonl(get_log_dir(load_system()) / "runtime_diagnostics.jsonl", {
+            "ts": now_jst_iso(),
+            "event": event,
+            "details": detail or {},
+        })
+    except Exception as log_error:  # noqa: BLE001 - ログ失敗は標準出力へ逃がす
+        print(f"[handlers_parent] log failed: {type(log_error).__name__}: {log_error}")
+
+
 
 

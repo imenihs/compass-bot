@@ -816,6 +816,24 @@ async def on_message(message: discord.Message):
         _mark_thinking_sent(message, False)
 
 
+async def _drive_queued_bot_work() -> None:
+    """tool が積んだ「bot にしかできない仕事」をまとめて消化する。
+
+    tool（mcp_wallet）は別プロセスで動き Discord を持たない。
+    さらに AI の応答は必ずチャンネルへ出るため、ダッシュボードURLのように
+    本人だけに見せたいものを tool に返させることもできない。
+    そこで tool は依頼を積むだけにし、送信はこのプロセスが行う。
+
+    ここで例外を投げると会話全体が落ちるため、失敗しても握りつぶす
+    （それぞれの driver が内部で診断ログを残す）。
+    """
+    for driver in (handlers_parent._drive_dashboard_dm, handlers_parent._drive_bot_actions):
+        try:
+            await driver()
+        except Exception as e:  # noqa: BLE001 - 送信失敗で会話を止めない
+            print(f"[bot] queued work failed: {type(e).__name__}: {e}")
+
+
 async def _on_message_impl(message: discord.Message):
     _mark_thinking_sent(message, False)
     if message.author.bot:
@@ -842,18 +860,11 @@ async def _on_message_impl(message: discord.Message):
             pass
         return
 
-    # 「使い方の説明と初期設定」は全チャンネルへの一斉通知のため最優先で処理する
-    if await handlers_parent.maybe_handle_parent_broadcast_guide(message, content):
-        return
-
-    # 「安全設定チェック」は通知先の設定ミスを実際に送って確かめる（N-11.16）。
-    # 設定ミスはコードでは防げず、送ってみて初めて「子に見えている」が分かる。
-    if await handlers_parent.maybe_handle_safety_setup_check(message, content):
-        return
-
-    # 「使い方の説明」は単体チャンネルへの送信（一斉送信より後に判定する）
-    if await handlers_parent.maybe_handle_parent_usage_single(message, content):
-        return
+    # 【2026/08/10】ここにあった文字列一致のコマンド判定は全廃した。
+    # 「使い方の説明」「安全設定チェック」を一字一句打てる人しか使えず、
+    # 「ダッシュボードを見たい」が一致せず AI 経路へ落ちて DM が永久に届かない、という事故が起きた。
+    # 意図の解釈は AI に任せ、実処理は tool（parent_get_usage_guide 等）が担う。
+    # Discord 送信が要るものは bot_action キュー経由でこのプロセスが実行する。
 
     # 親チャンネルは allow_channel_ids に含めない（子に親URLを見せないため・2026/08/10）。
     # そのぶんここで明示的に通す。含めてしまうと子も入れるチャンネルになる
@@ -864,22 +875,6 @@ async def _on_message_impl(message: discord.Message):
 
     if content.startswith("[#SH-"):
         await message.channel.send("`[#SH-xxx]`形式は非対応です。`@compass-bot 内容` で送ってね。")
-        return
-
-    if await handlers_parent.maybe_handle_parent_dashboard(message, content):
-        return
-
-    # 親による設定変更コマンド（「設定変更 たろう 固定 800円」）
-    if await handlers_parent.maybe_handle_user_setting_change(message, content):
-        return
-
-    # 親によるAIフォロー方針変更（「フォロー方針 たろう 記録習慣を重視」）
-    if await handlers_parent.maybe_handle_followup_policy(message, content):
-        return
-
-
-    # URL再発行（親子共通）。Web に入口を置かず Discord からのみ再発行できる
-    if await handlers_parent.maybe_handle_url_reissue(message, content):
         return
 
     mention_input = bot_mention_input
@@ -919,12 +914,16 @@ async def _on_message_impl(message: discord.Message):
             # 親が子チャンネル外（親専用チャンネル等）で自然文を送った → 親AI会話へ流す。
             # AI が親の意図を判断して親用 tool（支給・調整・承認等）を呼ぶ。金額・対象は AI に推測させず、
             # 親が明示した値だけを tool に渡す設計（mcp_wallet 側で PARENT_MODE・対象児実在・金額検証・冪等）。
-            # 明示コマンド（maybe_handle_*）は既に上で処理済みなので、ここに来るのはコマンド以外の自然文。
+            # 文字列一致のコマンド判定は全廃したので、親の発話はすべてここへ来る（2026/08/10）。
             from app.conv.ai_conversation import handle_parent_conversation
             from app.config import load_all_users
             child_names = [str(u.get("name", "")) for u in load_all_users() if u.get("name")]
             await handle_parent_conversation(message.channel, message.author.id, input_block, child_names)
             _mark_thinking_sent(message, True)
+            # tool は別プロセスで Discord を持たないため、送信系は「依頼」だけ積んでいる。
+            # ここで消化する（URLのDM送信・一斉通知・安全設定チェック）。
+            # AI の応答は必ずチャンネルへ出るので、URL は tool に返させず必ずDMで届ける
+            await _drive_queued_bot_work()
             # 親 AI 会話で承認/却下された場合、mcp_wallet が feedback_pending へ積む。bot 側で取り出して
             # 子へ opener を届ける（入口差を作らない・テキストコマンドと同じ driver）。
             try:
@@ -1115,6 +1114,9 @@ async def _on_message_impl(message: discord.Message):
             with contextlib.suppress(Exception):
                 await safety_task
     _mark_thinking_sent(message, True)
+
+    # 子も tool 経由でダッシュボードURLを要求するため、同じくここで消化する
+    await _drive_queued_bot_work()
 
     # 査定提案が出ていたら「親チャンネルのみ」へ通知する（是正設計①・N-11.14）。
     # 以前は発話チャンネル（＝子のチャンネル）へ送っており、提案額・理由・承認/却下コマンド等の

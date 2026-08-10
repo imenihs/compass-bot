@@ -21,6 +21,47 @@ sys.path.insert(0, str(ROOT))
 
 _results = []
 
+# テスト用のダミー Discord ID。**実 ID は書かない**（Git 履歴に残るため）。
+# 兼務アカウント（同じ人が親としても子としても登録されている）を再現するため、
+# 親と子で同じ値を使う
+_PARENT_ID = 111
+
+
+def _sandbox_users(tmp):
+    """設定ディレクトリをテスト用へ差し替え、親1人・子1人を置く。
+
+    `_do_get_dashboard_url` は設定ファイルを走査して Discord ID を引くため、
+    本番の settings/ を読ませない。実 ID をテストに書かないためでもある。
+
+    Args:
+        tmp: 一時ディレクトリ。
+
+    Returns:
+        tuple: 差し替え前の (PARENTS_DIR, CHILDREN_DIR)。復元に使う。
+    """
+    from app import config
+
+    parents, children = tmp / "parents", tmp / "children"
+    parents.mkdir(parents=True, exist_ok=True)
+    children.mkdir(parents=True, exist_ok=True)
+    # 兼務アカウント: 親「とうちゃん」と子「テスト」が同じ Discord ID を持つ
+    (parents / "toucyan.json").write_text(
+        json.dumps({"name": "とうちゃん", "discord_user_id": _PARENT_ID}, ensure_ascii=False),
+        encoding="utf-8")
+    (children / "test.json").write_text(
+        json.dumps({"name": "テスト", "discord_user_id": _PARENT_ID}, ensure_ascii=False),
+        encoding="utf-8")
+
+    orig = (config.PARENTS_DIR, config.CHILDREN_DIR)
+    config.PARENTS_DIR, config.CHILDREN_DIR = parents, children
+    return orig
+
+
+def _restore_users(orig):
+    """_sandbox_users で差し替えた設定ディレクトリを戻す。"""
+    from app import config
+    config.PARENTS_DIR, config.CHILDREN_DIR = orig
+
 
 def _check(name, passed, detail=""):
     _results.append({"test": name, "passed": bool(passed), "detail": str(detail)[:220]})
@@ -169,99 +210,145 @@ def _test_user_key_split():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _test_url_reissue_command():
-    """URL再発行コマンドが、打ったチャンネルで役割を正しく分けること。
+def _test_show_and_reissue_are_separate_tools():
+    """「見たいだけ」と「作り直したい」が別の tool に分かれていること。
 
-    実データで子「テスト」と親「とうちゃん」が同一 Discord ID を持つ（兼務アカウント）。
-    ID だけでは親か子か決まらないため、**どのチャンネルで打たれたか**で決める。
-    親チャンネル → parent、子チャンネル → child。
+    以前は「ダッシュボードURL」という語も再発行コマンドに含めており、
+    **見たいだけなのに古いURLが無効になった**。他の端末で開いていたURLが
+    使えなくなり、子が困る。
 
-    また DM が拒否設定のときは、チャンネルへフォールバックする
-    （親チャンネルは子から分離済みなので、最悪ここへ出しても子には見えない）。
+    さらに 2026/08/10、文字列一致そのものを全廃した。
+    「ダッシュボードを見たい」が `show_words` の完全一致に当たらず AI 経路へ落ち、
+    そこでは案内文しか返らないため **DM が永久に届かなかった**ため。
+    いまは AI が意図を汲み、見たいだけなら get_dashboard_url、
+    作り直しなら reissue_dashboard_url を呼ぶ。
     """
-    import asyncio
-
-    import discord
-
-    from app import config, dashboard_token as dt, handlers_parent as H
+    from app import dashboard_token as dt, mcp_wallet as m
 
     tmp = Path(tempfile.mkdtemp())
     try:
         dt.TOKENS_PATH = tmp / "tokens.json"
-        sent, dms = [], []
+        dt.DM_QUEUE_PATH = tmp / "dm_queue.json"
+        orig_dirs = _sandbox_users(tmp)
+        key = dt.build_user_key(dt.ROLE_CHILD, "test")
 
-        class _Ch:
-            def __init__(self, cid):
-                self.id = cid
-
-            async def send(self, msg, **kw):
-                sent.append(msg)
-                return type("M", (), {"id": 1})()
-
-        class _Author:
-            def __init__(self, uid, dm_ok=True):
-                self.id = uid
-                self._ok = dm_ok
-
-            async def send(self, msg, **kw):
-                if not self._ok:
-                    raise discord.Forbidden(type("R", (), {"status": 403})(), "blocked")
-                dms.append(msg)
-
-        orig_client = H._client
-        H._client = type("C", (), {"user": type("U", (), {
-            "id": 1, "name": "compass-bot", "discriminator": "0"})()})()
-        orig_extract = H.extract_input_from_mention
-        H.extract_input_from_mention = lambda t, u: None
+        orig_resolve, orig_mode = m._resolve_child, m.PARENT_MODE
+        m._resolve_child = lambda n=None: {"name": "テスト"}
+        m.PARENT_MODE = False
         try:
-            # **本番設定を読まない**（設定変更でテストが落ちないようにする）。
-            # 判定に必要なのは「親チャンネルか否か」だけなので、
-            # is_parent_channel を差し替えて固定値で判別させる
-            parent_ch, child_ch = 9001, 9002
-            orig_is_parent_ch = H.is_parent_channel if hasattr(H, "is_parent_channel") else None
-            config.get_parent_channel_id = lambda: parent_ch
-            config.is_parent_channel = lambda cid: int(cid or 0) == parent_ch
-            # 実データの兼務 ID（子「テスト」と親のどちらにも登録されている）
-            dual_id = 111
+            # 見るだけ: 何回呼んでも同じトークン
+            m._do_get_dashboard_url({"name": "テスト"})
+            first = dt.find_active_token(key)
+            m._do_get_dashboard_url({"name": "テスト"})
+            m._do_get_dashboard_url({"name": "テスト"})
+            _check("show_keeps_same_token", dt.find_active_token(key) == first,
+                   (str(first)[:8], str(dt.find_active_token(key))[:8]))
 
-            def _run(channel_id, dm_ok=True):
-                sent.clear()
-                dms.clear()
-                msg = type("M", (), {"channel": _Ch(channel_id),
-                                     "author": _Author(dual_id, dm_ok), "id": 1})()
-                return asyncio.new_event_loop().run_until_complete(
-                    H.maybe_handle_url_reissue(msg, "URL再発行"))
-
-            def _role_of(text):
-                token = text.split("/d/")[1].split(">")[0]
-                resolved = dt.resolve(token)
-                return resolved["user_key"] if resolved else None
-
-            handled = _run(parent_ch)
-            _check("reissue_handled_in_parent_channel", handled is True, handled)
-            _check("reissue_sends_dm", bool(dms), sent)
-            _check("reissue_parent_role",
-                   dms and _role_of(dms[0]).startswith("parent:"), dms[:1])
-
-            handled = _run(child_ch)
-            _check("reissue_handled_in_child_channel", handled is True, handled)
-            _check("reissue_child_role",
-                   dms and _role_of(dms[0]).startswith("child:"), dms[:1])
-
-            # DM 拒否時はチャンネルへ出す（詰まらない構成）
-            _run(parent_ch, dm_ok=False)
-            _check("reissue_falls_back_to_channel",
-                   any("/d/" in m for m in sent), sent[:1])
-
-            # リンクプレビューを抑止するため山括弧で囲む
-            _run(parent_ch)
-            _check("reissue_suppresses_preview",
-                   dms and "<http" in dms[0], dms[:1])
+            # 作り直す: トークンが変わり、前のものは失効する
+            msg = m._do_reissue_dashboard_url({"name": "テスト"})
+            second = dt.find_active_token(key)
+            _check("reissue_changes_token", second != first,
+                   (str(first)[:8], str(second)[:8]))
+            _check("reissue_kills_old_token", dt.resolve(first) is None, first)
+            _check("reissue_explains_old_is_dead", "まえのURLはもう使えない" in msg, msg)
+            _check("reissue_returns_no_url", "/compass-bot/d/" not in msg, msg[:60])
         finally:
-            H._client = orig_client
-            H.extract_input_from_mention = orig_extract
+            m._resolve_child, m.PARENT_MODE = orig_resolve, orig_mode
+            _restore_users(orig_dirs)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_dm_is_requested_not_returned():
+    """URL は tool の戻り値ではなく、**DM 要求キュー**で届くこと。
+
+    tool（mcp_wallet）は別プロセスで Discord を持たないため、自分では送れない。
+    そして AI の応答は必ずチャンネルへ出るため、tool に URL を返させると
+    親チャンネルの相方にも自分専用URLが見えてしまう。
+    そこで tool は「この人へ送って」と積み、bot プロセスが DM を送る。
+    """
+    import os
+
+    from app import dashboard_token as dt, mcp_wallet as m
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dt.TOKENS_PATH = tmp / "tokens.json"
+        dt.DM_QUEUE_PATH = tmp / "dm_queue.json"
+        orig_dirs = _sandbox_users(tmp)
+
+        orig_mode = m.PARENT_MODE
+        orig_env = os.environ.get("COMPASS_PARENT_DISCORD_ID")
+        orig_resolve = m._resolve_child
+        try:
+            # --- 親が聞いたとき: 親自身のURLがDM要求として積まれる ---
+            m.PARENT_MODE = True
+            os.environ["COMPASS_PARENT_DISCORD_ID"] = str(_PARENT_ID)
+            parent_msg = m._do_get_dashboard_url({})
+            _check("parent_msg_has_no_url", "/compass-bot/d/" not in parent_msg,
+                   parent_msg[:60])
+            _check("parent_msg_says_dm", "DM" in parent_msg, parent_msg[:60])
+            # 親が「誰のを出す？」と聞き返す事故（実機で発生）が再発しないこと
+            _check("parent_does_not_ask_which_child", "誰の" not in parent_msg,
+                   parent_msg[:60])
+
+            reqs = dt.take_dm_requests()
+            _check("parent_dm_queued", len(reqs) == 1, reqs)
+            _check("parent_dm_target_is_parent",
+                   reqs and reqs[0]["user_key"].startswith("parent:"), reqs[:1])
+            parent_key = reqs[0]["user_key"] if reqs else ""
+
+            # --- 同じ Discord ID の子として聞くと、子のURLが積まれる（兼務の解決） ---
+            m.PARENT_MODE = False
+            m._resolve_child = lambda n=None: {"name": "テスト"}
+            child_msg = m._do_get_dashboard_url({"name": "テスト"})
+            _check("child_msg_has_no_url", "/compass-bot/d/" not in child_msg,
+                   child_msg[:60])
+
+            reqs = dt.take_dm_requests()
+            _check("child_dm_queued", len(reqs) == 1, reqs)
+            _check("child_dm_target_is_child",
+                   reqs and reqs[0]["user_key"].startswith("child:"), reqs[:1])
+            _check("dual_role_gets_different_keys",
+                   reqs and reqs[0]["user_key"] != parent_key,
+                   (parent_key, reqs[0]["user_key"] if reqs else None))
+
+            # 取り出したらキューは空になる（同じDMを二度送らない）
+            _check("queue_is_drained", dt.take_dm_requests() == [], "not drained")
+        finally:
+            m.PARENT_MODE, m._resolve_child = orig_mode, orig_resolve
+            if orig_env is None:
+                os.environ.pop("COMPASS_PARENT_DISCORD_ID", None)
+            else:
+                os.environ["COMPASS_PARENT_DISCORD_ID"] = orig_env
+            _restore_users(orig_dirs)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_bot_action_queue_roundtrip():
+    """bot にしかできない依頼（一斉通知・安全設定チェック）が積んで取り出せること。
+
+    tool は Discord を持たないため、送信そのものは bot プロセスが行う。
+    積んだ順に取り出せ、取り出したら空になることを確認する。
+    """
+    from app import dashboard_token as dt
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dt.ACTION_QUEUE_PATH = tmp / "actions.json"
+        dt.request_bot_action("broadcast_usage_guide", {})
+        dt.request_bot_action("safety_setup_check", {})
+        actions = dt.take_bot_actions()
+        _check("actions_queued_in_order",
+               [a["kind"] for a in actions] == ["broadcast_usage_guide", "safety_setup_check"],
+               actions)
+        _check("actions_drained", dt.take_bot_actions() == [], "not drained")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+
 
 
 def _test_discord_id_cannot_be_changed_from_web():
@@ -353,129 +440,8 @@ def _test_money_ops_notify_discord():
            "通知先が親チャンネル優先になっていない（子チャンネルへ流れる）")
 
 
-def _test_show_url_does_not_reissue():
-    """「見たい」と「作り直したい」が分かれていること。
-
-    「ダッシュボードURL」を再発行コマンドに含めていたため、
-    **見たいだけなのに古いURLが無効になる**状態だった。
-    他の端末で開いていたURLが使えなくなり、子が困る。
-    """
-    import asyncio
-
-    from app import config, dashboard_token as dt, handlers_parent as H
-
-    tmp = Path(tempfile.mkdtemp())
-    try:
-        dt.TOKENS_PATH = tmp / "tokens.json"
-        sent, dms = [], []
-
-        class _Ch:
-            def __init__(self, cid):
-                self.id = cid
-
-            async def send(self, msg, **kw):
-                sent.append(msg)
-
-        class _Author:
-            def __init__(self, uid):
-                self.id = uid
-
-            async def send(self, msg, **kw):
-                dms.append(msg)
-
-        orig_client, orig_extract = H._client, H.extract_input_from_mention
-        H._client = type("C", (), {"user": type("U", (), {
-            "id": 1, "name": "compass-bot", "discriminator": "0"})()})()
-        H.extract_input_from_mention = lambda t, u: None
-        try:
-            child_ch = sorted(config.get_allow_channel_ids() or {0})[0]
-            dual_id = 111
-
-            def _run(text):
-                sent.clear()
-                dms.clear()
-                msg = type("M", (), {"channel": _Ch(child_ch),
-                                     "author": _Author(dual_id), "id": 1})()
-                asyncio.new_event_loop().run_until_complete(
-                    H.maybe_handle_url_reissue(msg, text))
-                return dms[0].split("/d/")[1].split(">")[0] if dms else None
-
-            # 見たいだけ: 何度聞いても同じURL
-            first = _run("ダッシュボード")
-            second = _run("ダッシュボードURL")
-            third = _run("URL")
-            _check("show_returns_same_url", first == second == third,
-                   (first, second, third))
-            _check("show_says_not_reissued",
-                   dms and "まえのURL" not in dms[0], dms[:1])
-
-            # 作り直す: URLが変わり、その旨を伝える
-            reissued = _run("URL再発行")
-            _check("reissue_changes_url", reissued != first, (first, reissued))
-            _check("reissue_explains_old_is_dead",
-                   dms and "まえのURLはもう使えなくなった" in dms[0], dms[:1])
-        finally:
-            H._client, H.extract_input_from_mention = orig_client, orig_extract
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _test_parent_gets_own_dashboard_url():
-    """**親**が「ダッシュボード見たい」と言ったとき、親のURLが返ること。
-
-    当初 tool を子経路にしか渡しておらず、実装も子専用だったため、
-    親が聞くと AI が「ダッシュボードURLは子ども1人ずつなんだ。誰のを出す？」
-    「親用のまとめページはこの道具にはないよ」と答えてしまっていた（実機で発覚）。
-    親にも自分のダッシュボードがあるのに、案内できていなかった。
-    """
-    import os
-
-    from app import dashboard_token as dt, mcp_wallet as m
-
-    tmp = Path(tempfile.mkdtemp())
-    try:
-        dt.TOKENS_PATH = tmp / "tokens.json"
-        orig_mode = m.PARENT_MODE
-        orig_env = os.environ.get("COMPASS_PARENT_DISCORD_ID")
-        try:
-            # 実データの親（兼務IDでもある）で試す
-            m.PARENT_MODE = True
-            os.environ["COMPASS_PARENT_DISCORD_ID"] = "111"
-            parent_msg = m._do_get_dashboard_url({})
-            _check("parent_gets_url", "/compass-bot/d/" in parent_msg, parent_msg[:80])
-            _check("parent_msg_is_for_parent",
-                   "全員の残高" in parent_msg, parent_msg[:60])
-            _check("parent_does_not_ask_which_child",
-                   "誰の" not in parent_msg, parent_msg[:60])
-
-            token = parent_msg.split("/d/")[1].split(">")[0]
-            resolved = dt.resolve(token)
-            _check("parent_token_is_parent_role",
-                   resolved and resolved["role"] == dt.ROLE_PARENT, resolved)
-
-            # 同じ Discord ID の子として聞くと、**子の**URLが返る（兼務の解決）
-            m.PARENT_MODE = False
-            orig_resolve = m._resolve_child
-            m._resolve_child = lambda n=None: {"name": "テスト"}
-            try:
-                child_msg = m._do_get_dashboard_url({"name": "テスト"})
-                child_token = child_msg.split("/d/")[1].split(">")[0]
-                child_resolved = dt.resolve(child_token)
-                _check("child_token_is_child_role",
-                       child_resolved and child_resolved["role"] == dt.ROLE_CHILD,
-                       child_resolved)
-                _check("dual_role_gets_different_urls", token != child_token,
-                       (token[:8], child_token[:8]))
-            finally:
-                m._resolve_child = orig_resolve
-        finally:
-            m.PARENT_MODE = orig_mode
-            if orig_env is None:
-                os.environ.pop("COMPASS_PARENT_DISCORD_ID", None)
-            else:
-                os.environ["COMPASS_PARENT_DISCORD_ID"] = orig_env
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _test_dashboard_url_tool_does_not_reissue():
@@ -537,21 +503,45 @@ def _test_url_never_posted_to_channel():
     _check("keeps_normal_text", _strip_dashboard_url(normal) == normal, normal)
 
     # tool 自体も URL を返さない（返すと出口で落とされ、案内が壊れるため）
-    from app import mcp_wallet as m
+    import os
 
+    from app import dashboard_token as dt, mcp_wallet as m
+
+    tmp = Path(tempfile.mkdtemp())
     orig_mode = m.PARENT_MODE
+    orig_env = os.environ.get("COMPASS_PARENT_DISCORD_ID")
+    orig_tokens, orig_queue = dt.TOKENS_PATH, dt.DM_QUEUE_PATH
     try:
-        m.PARENT_MODE = True
-        parent_msg = m._do_get_dashboard_url({})
-        _check("tool_returns_no_url", "/compass-bot/d/" not in parent_msg,
-               parent_msg[:60])
-        _check("tool_explains_dm", "DM" in parent_msg, parent_msg[:60])
-        m.PARENT_MODE = False
-        child_msg = m._do_get_dashboard_url({})
-        _check("tool_child_returns_no_url", "/compass-bot/d/" not in child_msg,
-               child_msg[:60])
+        dt.TOKENS_PATH = tmp / "tokens.json"
+        dt.DM_QUEUE_PATH = tmp / "dm_queue.json"
+        orig_dirs = _sandbox_users(tmp)
+        try:
+            m.PARENT_MODE = True
+            os.environ["COMPASS_PARENT_DISCORD_ID"] = str(_PARENT_ID)
+            parent_msg = m._do_get_dashboard_url({})
+            _check("tool_returns_no_url", "/compass-bot/d/" not in parent_msg,
+                   parent_msg[:60])
+            _check("tool_explains_dm", "DM" in parent_msg, parent_msg[:60])
+
+            m.PARENT_MODE = False
+            orig_resolve = m._resolve_child
+            m._resolve_child = lambda n=None: {"name": "テスト"}
+            try:
+                child_msg = m._do_get_dashboard_url({"name": "テスト"})
+                _check("tool_child_returns_no_url", "/compass-bot/d/" not in child_msg,
+                       child_msg[:60])
+            finally:
+                m._resolve_child = orig_resolve
+        finally:
+            _restore_users(orig_dirs)
     finally:
         m.PARENT_MODE = orig_mode
+        dt.TOKENS_PATH, dt.DM_QUEUE_PATH = orig_tokens, orig_queue
+        if orig_env is None:
+            os.environ.pop("COMPASS_PARENT_DISCORD_ID", None)
+        else:
+            os.environ["COMPASS_PARENT_DISCORD_ID"] = orig_env
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -561,12 +551,13 @@ def main():
     _test_same_discord_id_coexists()
     _test_broken_file_does_not_crash()
     _test_user_key_split()
-    _test_url_reissue_command()
+    _test_show_and_reissue_are_separate_tools()
     _test_discord_id_cannot_be_changed_from_web()
     _test_logout_clears_uuid_cookie()
     _test_admin_check_always_uses_token()
     _test_money_ops_notify_discord()
-    _test_show_url_does_not_reissue()
+    _test_dm_is_requested_not_returned()
+    _test_bot_action_queue_roundtrip()
     _test_dashboard_url_tool_does_not_reissue()
     _test_url_never_posted_to_channel()
 

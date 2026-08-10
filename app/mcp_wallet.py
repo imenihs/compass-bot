@@ -331,6 +331,23 @@ def _tool_defs() -> list[dict]:
             },
         },
         {
+            "name": "reissue_dashboard_url",
+            "description": (
+                "ダッシュボードのURLを**作り直す**。前のURLはその場で使えなくなる。"
+                "『URLを人に見られた』『前のURLを無効にしたい』『作り直して』のように、"
+                "**作り直したいと明確に言われたときだけ**呼ぶ。"
+                "単に『ダッシュボードを見たい』ときは get_dashboard_url を使うこと。"
+                "新しいURLはDMで届く。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "子どもの名前（子モードのときだけ使う）"},
+                },
+                "required": [],
+            },
+        },
+        {
             "name": "contribute_to_goal",
             "description": (
                 "目標へ積み立てる／立て替えを返す。残高が減り、その目標の進み具合が増える。"
@@ -553,6 +570,54 @@ def _tool_defs() -> list[dict]:
                 "name": "parent_get_pending",
                 "description": "承認待ちの査定提案の一覧を返す（残高は変えない）。親が『承認待ちは？』等と聞いたら呼ぶ。",
                 "inputSchema": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "parent_list_overview",
+                "description": (
+                    "全員の子どもの状況一覧（固定お小遣い・残高・残高報告の有無・最終支出日）を返す。"
+                    "親が『全体を見たい』『みんなの状況は』『一覧』などと聞いたら呼ぶ。何も変えない。"
+                ),
+                "inputSchema": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "parent_get_usage_guide",
+                "description": (
+                    "このボットの使い方の説明文を返す。親が『使い方を教えて』『どう使うの』等と聞いたら呼ぶ。"
+                    "**返した文をそのまま出すこと**（要約や言い換えをしない）。何も変えない。"
+                ),
+                "inputSchema": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "parent_broadcast_usage_guide",
+                "description": (
+                    "使い方の説明を**全チャンネルへ一斉送信**する。"
+                    "親が『みんなに使い方を送って』『全体にアナウンスして』と**明確に依頼したときだけ**呼ぶ。"
+                    "子のチャンネルにも届くため、単に『使い方を教えて』のときは parent_get_usage_guide を使うこと。"
+                ),
+                "inputSchema": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "parent_safety_setup_check",
+                "description": (
+                    "危険信号（自傷・いじめ等）の通知先が正しく親だけに届くかを、実際に確認メッセージを送って確かめる。"
+                    "親が『安全設定を確認したい』『通知先が合ってるか見て』等と言ったら呼ぶ。残高は変えない。"
+                ),
+                "inputSchema": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "parent_get_settings_info",
+                "description": (
+                    "固定お小遣い・臨時上限・AIフォロー方針の**現在値**と、変更用のWebダッシュボードの案内を返す。"
+                    "親がこれらの設定に触れたら呼ぶ。"
+                    "**変更はチャットでは受け付けない**（桁の取り違えに気づけないため）。Webへ案内すること。"
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "子どもの名前（省略で全員の案内）"},
+                    },
+                    "required": [],
+                },
             },
         ]
         return base_defs + parent_defs
@@ -890,36 +955,107 @@ def _do_contribute_to_goal(args: dict) -> str:
             f"\n残高は {balance}円。")
 
 
+def _do_reissue_dashboard_url(args: dict) -> str:
+    """ダッシュボードURLを作り直して DM 送信を要求する。
+
+    前の URL はその場で失効する（issue() が同 user_key の旧トークンを失効させる）。
+    Web に再発行の入口を置くと盗んだ側も再発行できてしまうため、Discord からのみ行う。
+
+    Args:
+        args: name（子モードのときの子の名前）。
+
+    Returns:
+        str: 案内文。**URL は含まない**。
+    """
+    return _dashboard_url_flow(args, reissue=True)
+
+
 def _do_get_dashboard_url(args: dict) -> str:
-    """ダッシュボードの見方を案内する。**URL 自体はここでは返さない**。
+    """ダッシュボードURLの **DM送信を要求する**。URL 自体はここでは返さない。
 
     **なぜ URL を返さないのか**（2026/08/10・実機で発覚）:
     AI の応答は必ずチャンネルへ出る。親チャンネルは夫婦2人が見ているため、
     ここで URL を返すと**相手にも自分専用 URL が見えてしまう**。
-    1人1UUID にした意味（片方だけ失効できる・誰が操作したか分かる）が失われる。
 
-    URL の配布は **DM を使うコマンド経路**（handlers_parent の
-    maybe_handle_url_reissue → _send_dashboard_url）に任せる。
-    この tool は「どうやって受け取るか」を伝えるだけにする。
+    tool は Discord を持たない別プロセスで動くため、自分では DM を送れない。
+    そこで「この人へ送って」をファイルへ積み、bot プロセスが拾って送る
+    （parent_confirm で同じ問題を踏んだときと同じ形）。
 
     Args:
-        args: 使わない（互換のため受ける）。
+        args: name（子モードのときの子の名前。親モードでは使わない）。
 
     Returns:
-        str: 受け取り方の案内文。**URL は含まない**。
+        str: 「DMで送るね」という案内文。**URL は含まない**。
     """
+    return _dashboard_url_flow(args, reissue=False)
+
+
+def _dashboard_url_flow(args: dict, reissue: bool) -> str:
+    """ダッシュボードURLの発行／再発行と DM 要求をまとめて行う。
+
+    発行と再発行は「既存トークンを使うか作り直すか」だけが違うため、
+    分岐を1か所に閉じ込める（片方だけ直して食い違う事故を避ける）。
+
+    Args:
+        args: name（子モードのときの子の名前）。
+        reissue: True なら必ず作り直す。False なら既存があればそれを使う。
+
+    Returns:
+        str: 案内文。**URL は含まない**。
+    """
+    from app import config as _config
+    from app import dashboard_token as _dt
+
     if PARENT_MODE:
-        return (
-            "ダッシュボードのURLは、**DMで**お送りします。\n"
-            "このチャンネルに出すと、もう一人の親にも自分専用URLが見えてしまうためです。\n"
-            "「ダッシュボード」とだけ送ってください。DMで届きます。\n"
-            "（作り直したいときは「URL再発行」と送ってください）"
-        )
-    return (
-        "ダッシュボードのURLは、じぶんだけに見えるように**DMでおくるね**。\n"
-        "「ダッシュボード」とだけ送ってみて。\n"
-        "（あたらしくしたいときは「URL再発行」だよ）"
-    )
+        target_id = int(os.environ.get("COMPASS_PARENT_DISCORD_ID", "0") or 0)
+        base_dir, role = _config.PARENTS_DIR, _dt.ROLE_PARENT
+        match = lambda data: int(data.get("discord_user_id", 0) or 0) == target_id
+        ok_msg = ("ダッシュボードのURLをDMで送りました。\n"
+                  "全員の残高・設定・立て替えの登録ができます。\n"
+                  "（作り直したいときは「URL再発行」と送ってください）")
+        ng_msg = "あなたの登録が見つかりませんでした。設定ファイルを確認してください。"
+    else:
+        conf = _resolve_child(str(args.get("name", "")))
+        if conf is None:
+            return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
+        child_name = str(conf.get("name", ""))
+        target_id = int(conf.get("discord_user_id", 0) or 0)
+        base_dir, role = _config.CHILDREN_DIR, _dt.ROLE_CHILD
+        match = lambda data: str(data.get("name", "")).strip() == child_name
+        ok_msg = ("ダッシュボードのURLをDMでおくったよ。ひらいてブックマークしてね。\n"
+                  "（あたらしくしたいときは「URL再発行」だよ）")
+        ng_msg = "ごめん、きみの登録が見つからなかったよ。おうちの人に聞いてみてね。"
+
+    stem = None
+    for path in sorted(base_dir.glob("*.json")):
+        if path.name.endswith(".example.json"):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if match(data):
+                stem = path.stem
+                if not target_id:
+                    target_id = int(data.get("discord_user_id", 0) or 0)
+                break
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+    if stem is None or target_id <= 0:
+        return ng_msg
+
+    user_key = _dt.build_user_key(role, stem)
+    if reissue:
+        # 作り直し。issue() が同 user_key の旧トークンを失効させるので、前のURLは即使えなくなる
+        _dt.issue(user_key, role, issued_by="chat")
+        ok_msg = ("あたらしいダッシュボードのURLをDMでおくったよ。まえのURLはもう使えないよ。"
+                  if not PARENT_MODE else
+                  "あたらしいダッシュボードのURLをDMで送りました。前のURLはもう使えません。")
+    elif _dt.find_active_token(user_key) is None:
+        # まだ発行されていないときだけ作る（見るたびに作り直さない）
+        _dt.issue(user_key, role, issued_by="chat")
+    # bot プロセスへ「DMを送って」と積む
+    _dt.request_dm(target_id, user_key, role)
+    return ok_msg
 
 def _do_get_savings_goals(args: dict) -> str:
     """貯金目標一覧。残高を変えない。"""
@@ -1773,6 +1909,139 @@ def _do_parent_record_promise_progress(args: dict) -> str:
 
 
 
+
+def _do_parent_list_overview(args: dict) -> str:
+    """全員の状況一覧を返す（旧「全体確認」コマンド）。
+
+    文字列一致のコマンドを廃止し、AI が意図を汲んで呼ぶ tool にした（2026/08/10）。
+    「全体確認」と一字一句打てる人しか使えない作りは、利用者に暗記を強いていた。
+
+    Returns:
+        str: 子ごとの固定額・残高・残高報告の有無・最終支出日。
+    """
+    if not PARENT_MODE:
+        return "この操作は親だけができるよ。"
+    from datetime import datetime
+    from app import wallet_service as _ws
+    from app.config import load_all_users, load_system, get_log_dir
+
+    log_dir = get_log_dir(load_system())
+    users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
+    # 残高報告が未完了の子は pending_by_user に名前が入る
+    pending = _ws.load_audit_state().get("pending_by_user", {})
+
+    lines = ["【全体の状況】"]
+    for u in users:
+        name = str(u.get("name", ""))
+        if not name:
+            continue
+        fixed = int(u.get("fixed_allowance", 0) or 0)
+        balance = _ws.get_balance(name)
+        report = "未報告" if name in pending else "報告済"
+        # 支出ログの最終行から最終支出日を取る（無ければ「なし」）
+        last = "なし"
+        path = log_dir / f"{name}_pocket_journal.jsonl"
+        try:
+            if path.exists():
+                rows = [x for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+                if rows:
+                    ts = json.loads(rows[-1]).get("ts")
+                    if ts:
+                        last = datetime.fromisoformat(str(ts)).strftime("%m/%d")
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            pass
+        lines.append(f"・{name}: 固定{fixed}円 / 残高{balance}円 / 残高報告:{report} / 最終支出:{last}")
+    return "\n".join(lines)
+
+
+def _do_parent_get_usage_guide(args: dict) -> str:
+    """使い方の説明文を返す（旧「使い方の説明」コマンド）。
+
+    Returns:
+        str: 使い方の本文。
+    """
+    if not PARENT_MODE:
+        return "この操作は親だけができるよ。"
+    from app.bot_utils import _usage_guide_text
+    return _usage_guide_text()
+
+
+def _do_parent_broadcast_usage_guide(args: dict) -> str:
+    """使い方の説明を全チャンネルへ一斉送信するよう bot へ依頼する。
+
+    tool は Discord を持たないため、送信そのものは bot プロセスが行う。
+
+    Returns:
+        str: 受け付けた旨の案内。
+    """
+    if not PARENT_MODE:
+        return "この操作は親だけができるよ。"
+    from app import dashboard_token as _dt
+    _dt.request_bot_action("broadcast_usage_guide", {})
+    return "使い方の説明を全チャンネルへ送ります。結果はこのあと報告します。"
+
+
+def _do_parent_safety_setup_check(args: dict) -> str:
+    """危険信号の通知先を実際に送って確かめるよう bot へ依頼する。
+
+    設定ミスはコードでは防げず、送ってみて初めて「子に見えている」が分かる。
+
+    Returns:
+        str: 受け付けた旨の案内。
+    """
+    if not PARENT_MODE:
+        return "この操作は親だけができるよ。"
+    from app import dashboard_token as _dt
+    _dt.request_bot_action("safety_setup_check", {})
+    return "安全設定のチェックを始めます。確認用のメッセージを送るので、届いた場所を見てください。"
+
+
+def _do_parent_get_settings_info(args: dict) -> str:
+    """設定の現在値と、変更用 Web の案内を返す。
+
+    **変更はチャットでは受け付けない**。固定お小遣いは毎月効き続ける設定で、
+    桁を間違えても気づきにくい。Web には数値入力のフォームがあり値が曖昧にならない。
+
+    Args:
+        args: name（子どもの名前。省略で全員）。
+
+    Returns:
+        str: 現在値と Web の案内。
+    """
+    if not PARENT_MODE:
+        return "この操作は親だけができるよ。"
+    from app.config import load_all_users, get_web_base_url
+    from app.handlers_parent import _normalize_follow_policy, _follow_policy_summary
+
+    base_url = get_web_base_url().rstrip("/")
+    target = str(args.get("name", "") or "").strip()
+    users = load_all_users()
+
+    if target:
+        conf = next((u for u in users if str(u.get("name", "")).strip() == target), None)
+        if conf is None:
+            return f"「{target}」はユーザー設定に見つからなかったよ。"
+        policy = _normalize_follow_policy(conf.get("ai_follow_policy"))
+        return (
+            f"【{target} の設定】\n"
+            f"・固定お小遣い: {int(conf.get('fixed_allowance', 0) or 0)}円\n"
+            f"・臨時上限: {int(conf.get('temporary_allowance_max', 0) or 0)}円\n"
+            + _follow_policy_summary(target, policy)
+            + f"\n\n変更は Web から → {base_url}"
+        )
+
+    lines = ["【いまの設定】"]
+    for u in sorted(users, key=lambda x: str(x.get("name", ""))):
+        name = str(u.get("name", ""))
+        if not name:
+            continue
+        lines.append(f"・{name}: 固定{int(u.get('fixed_allowance', 0) or 0)}円 / "
+                     f"臨時上限{int(u.get('temporary_allowance_max', 0) or 0)}円")
+    lines.append(f"\n変更は Web から → {base_url}")
+    lines.append("（金額の設定はチャットでは受け付けていません。桁の取り違えに気づけないためです）")
+    return "\n".join(lines)
+
+
 _HANDLERS = {
     "get_balance": _do_get_balance,
     "record_expense": _do_record_expense,
@@ -1780,6 +2049,7 @@ _HANDLERS = {
     "set_initial_balance": _do_set_initial_balance,
     "get_savings_goals": _do_get_savings_goals,
     "get_dashboard_url": _do_get_dashboard_url,
+    "reissue_dashboard_url": _do_reissue_dashboard_url,
     "set_savings_goal": _do_set_savings_goal,
     "contribute_to_goal": _do_contribute_to_goal,
     "propose_allowance": _do_propose_allowance,
@@ -1796,6 +2066,11 @@ _HANDLERS = {
     "parent_list_promises": _do_parent_list_promises,
     "parent_approve_promise": _do_parent_approve_promise,
     "parent_record_promise_progress": _do_parent_record_promise_progress,
+    "parent_list_overview": _do_parent_list_overview,
+    "parent_get_usage_guide": _do_parent_get_usage_guide,
+    "parent_broadcast_usage_guide": _do_parent_broadcast_usage_guide,
+    "parent_safety_setup_check": _do_parent_safety_setup_check,
+    "parent_get_settings_info": _do_parent_get_settings_info,
 }
 
 

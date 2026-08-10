@@ -179,3 +179,140 @@ def split_user_key(user_key: str) -> tuple[str, str]:
         return "", ""
     role, _, stem = raw.partition(":")
     return role.strip(), stem.strip()
+
+
+# DM送信の要求キュー。
+# tool は別プロセス（mcp_wallet）で動き Discord を持たないため、
+# 「この人へURLをDMして」をファイルへ積み、bot プロセスが拾って送る。
+# parent_confirm で同じ問題を踏んでおり、そのときと同じくファイル＋flock を使う。
+DM_QUEUE_PATH = ROOT / "data" / "dashboard_dm_queue.json"
+# bot プロセスにしかできない送信処理（一斉通知・安全設定チェック）の依頼キュー
+ACTION_QUEUE_PATH = ROOT / "data" / "bot_action_queue.json"
+
+
+def _dm_queue_lock():
+    """DMキュー用のプロセス間ロック。"""
+    from app.wallet_service import _interprocess_lock as _lk
+    return _lk(DM_QUEUE_PATH.with_suffix(".json.lock"))
+
+
+def request_bot_action(kind: str, payload: dict) -> None:
+    """「bot プロセスにしかできない処理」を依頼する（tool から呼ぶ）。
+
+    tool は Discord を持たない別プロセスなので、送信系は自分で実行できない。
+    ここへ積み、bot プロセスが take_bot_actions() で拾って実行する。
+
+    Args:
+        kind: 依頼の種類（broadcast_usage_guide / safety_setup_check）。
+        payload: 依頼ごとの引数。
+    """
+    with _LOCK, _dm_queue_lock():
+        try:
+            doc = json.loads(ACTION_QUEUE_PATH.read_text(encoding="utf-8")) \
+                if ACTION_QUEUE_PATH.exists() else []
+            if not isinstance(doc, list):
+                doc = []
+        except (OSError, json.JSONDecodeError):
+            doc = []
+        doc.append({"kind": str(kind), "payload": payload or {}, "ts": now_jst_iso()})
+        doc = doc[-20:]  # 溜まり続けないよう直近だけ残す
+        ACTION_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(ACTION_QUEUE_PATH.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            Path(tmp).replace(ACTION_QUEUE_PATH)
+        except Exception:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+
+def take_bot_actions() -> list[dict]:
+    """積まれた依頼を取り出してキューを空にする（bot プロセスが呼ぶ）。
+
+    Returns:
+        list[dict]: [{"kind": str, "payload": dict}, ...] 積まれた順。
+    """
+    with _LOCK, _dm_queue_lock():
+        try:
+            doc = json.loads(ACTION_QUEUE_PATH.read_text(encoding="utf-8")) \
+                if ACTION_QUEUE_PATH.exists() else []
+            if not isinstance(doc, list) or not doc:
+                return []
+        except (OSError, json.JSONDecodeError):
+            return []
+        try:
+            ACTION_QUEUE_PATH.write_text("[]\n", encoding="utf-8")
+        except OSError:
+            pass
+    return [x for x in doc if isinstance(x, dict) and x.get("kind")]
+
+
+def request_dm(discord_user_id: int, user_key: str, role: str) -> None:
+    """「この人へダッシュボードURLをDMして」と積む（tool から呼ぶ）。
+
+    tool は Discord を持たない別プロセスなので、自分では送れない。
+    bot プロセスが take_dm_requests() で拾って送る。
+
+    同じ人の要求が既にあれば上書きする（連打しても1通だけ届く）。
+
+    Args:
+        discord_user_id: 送り先の Discord ID。
+        user_key: どのダッシュボードか（child:test / parent:akira）。
+        role: child / parent。
+    """
+    with _LOCK, _dm_queue_lock():
+        try:
+            doc = json.loads(DM_QUEUE_PATH.read_text(encoding="utf-8")) \
+                if DM_QUEUE_PATH.exists() else {}
+            if not isinstance(doc, dict):
+                doc = {}
+        except (OSError, json.JSONDecodeError):
+            doc = {}
+        doc[str(int(discord_user_id))] = {
+            "user_key": user_key, "role": role, "ts": now_jst_iso(),
+        }
+        DM_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(DM_QUEUE_PATH.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            Path(tmp).replace(DM_QUEUE_PATH)
+        except Exception:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+
+def take_dm_requests() -> list[dict]:
+    """積まれたDM要求を取り出してキューを空にする（bot プロセスが呼ぶ）。
+
+    Returns:
+        list[dict]: [{"discord_user_id": int, "user_key": str, "role": str}, ...]
+    """
+    with _LOCK, _dm_queue_lock():
+        try:
+            doc = json.loads(DM_QUEUE_PATH.read_text(encoding="utf-8")) \
+                if DM_QUEUE_PATH.exists() else {}
+            if not isinstance(doc, dict) or not doc:
+                return []
+        except (OSError, json.JSONDecodeError):
+            return []
+        try:
+            DM_QUEUE_PATH.write_text("{}\n", encoding="utf-8")
+        except OSError:
+            pass
+    out = []
+    for uid, meta in doc.items():
+        if not isinstance(meta, dict):
+            continue
+        try:
+            out.append({
+                "discord_user_id": int(uid),
+                "user_key": str(meta.get("user_key", "")),
+                "role": str(meta.get("role", "")),
+            })
+        except (TypeError, ValueError):
+            continue
+    return out
