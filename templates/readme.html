@@ -99,6 +99,7 @@
     <a href="#settings">設定ファイル</a>
     <a href="#logs">ログと保存データ</a>
     <a href="#notes">注意点</a>
+    <a href="#license">ライセンス</a>
   </nav>
 
   <div class="doc-body">
@@ -805,6 +806,16 @@ sudo systemctl reload apache2</code></pre>
         <li><code>allow_channel_ids</code> を設定している場合、対象チャンネル以外では反応しません。</li>
         <li>個人情報を含む実設定（<code>settings/setting.json</code>, <code>settings/users/*.json</code>, <code>settings/users/parents/*.json</code>）は <code>.gitignore</code> で除外し、テンプレート（<code>*.example.json</code>）のみ共有します。</li>
       </ul>
+    </section>
+
+    <!-- ============ ライセンス ============ -->
+    <section id="license">
+      <h2>📄 ライセンス</h2>
+      <p><strong>MIT License</strong> — 自由に利用・改変・再配布できます。ただし<strong>無保証</strong>です。</p>
+      <p>このソフトウェアは子どものお金の記録を扱います。導入する場合は、
+      残高や履歴が失われても困らないよう各自でバックアップを取り、自己責任でご利用ください。</p>
+      <p>会話には Anthropic の <code>claude</code> CLI を外部プロセスとして呼び出します。
+      CLI 自体はこのリポジトリに含まれず、利用には Anthropic の利用規約が適用されます。</p>
     </section>
 
   </div>

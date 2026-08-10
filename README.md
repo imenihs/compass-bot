@@ -152,6 +152,30 @@ URL 方式なら覚えることがゼロで、期限もありません。
 
 ## 注意点
 
-- 個人情報を含む実設定（`settings/setting.json`, `settings/users/*.json`, `settings/users/parents/*.json`）は `.gitignore` で除外し、テンプレート（`*.example.json`）のみ共有します。
+- 個人情報を含む実設定（`settings/setting.json`, `settings/users/children/*.json`, `settings/users/parents/*.json`）は `.gitignore` で除外し、テンプレート（`*.example.json`）のみ共有します。
 - コード変更を本番へ反映するには、コミットだけでなく `sudo systemctl restart compass.service` が必要です。
 - 同じ Discord ユーザーIDを親と子の両方に登録しないでください（本人判定が壊れます）。
+
+## ライセンス
+
+MIT License — 詳細は [LICENSE](LICENSE) を参照してください。
+
+自由に利用・改変・再配布できます。ただし**無保証**です。
+このソフトウェアは子どものお金の記録を扱います。導入する場合は、
+残高や履歴が失われても困らないよう各自でバックアップを取り、
+自己責任でご利用ください。
+
+### 使っている主なライブラリ
+
+| ライブラリ | ライセンス |
+|---|---|
+| discord.py | MIT |
+| FastAPI / Starlette | MIT |
+| uvicorn | BSD-3-Clause |
+| python-dotenv | BSD-3-Clause |
+| httpx | BSD-3-Clause |
+| Jinja2 | BSD-3-Clause |
+| python-multipart | Apache-2.0 |
+
+会話には Anthropic の `claude` CLI を外部プロセスとして呼び出します。
+CLI 自体はこのリポジトリに含まれず、利用にはAnthropicの利用規約が適用されます。
