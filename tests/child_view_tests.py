@@ -213,6 +213,43 @@ def _test_history_counts_only_contributions():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_simulator_explains_itself():
+    """シミュレータが「何ができる画面か」を触る前に説明していること。
+
+    当初は見出し「どれくらいでとどく？」だけで、
+    ・何をする画面なのか
+    ・最初から入っている金額が何なのか
+    ・コピーした文をどう使うのか
+    が分からなかった（社長指摘）。子は説明が無いと触らない。
+    """
+    html = (ROOT / "templates" / "child.html").read_text(encoding="utf-8")
+
+    # 何ができるかの説明がある
+    _check("sim_has_lead", "sim-lead" in html, "")
+    _check("sim_explains_purpose",
+           "いつごろとどくか" in html and "計算できる" in html, "")
+    _check("sim_explains_tradeoff",
+           "かかる時間がどう変わる" in html,
+           "金額と時間の関係（教育上の狙い）が書かれていない")
+
+    # 最初から入っている金額の出どころを示す
+    _check("sim_explains_prefilled_value",
+           "のこりの金額が入ってるよ" in html,
+           "初期値がどこから来た数字か説明が無い")
+
+    # コピーした後どうなるかを書く
+    _check("sim_explains_next_step",
+           "チャットにはってね" in html, "")
+
+    # 見出しが「何をするか」を表している
+    _check("sim_heading_is_actionable",
+           "ためる計画をたててみよう" in html,
+           "見出しから動作が分からない")
+
+    # 目安であることを伝える（達成日を約束のように見せない）
+    _check("sim_says_estimate", "目やす" in html, "")
+
+
 def main():
     _test_operational_notes_are_hidden()
     _test_child_notes_are_shown()
@@ -221,6 +258,7 @@ def main():
     _test_calendar_survives_broken_rows()
     _test_goals_use_accumulated()
     _test_history_counts_only_contributions()
+    _test_simulator_explains_itself()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

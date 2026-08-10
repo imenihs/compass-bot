@@ -99,6 +99,10 @@
       border: 0; background: var(--save); color: #0b1020; font-weight: 700; font-size: .9rem;
     }
     .note { color: var(--muted); font-size: .75rem; margin-top: 8px; }
+    .sim-lead {
+      font-size: .85rem; color: var(--text); margin: 0 0 14px; line-height: 1.7;
+    }
+    .sim-hint { color: var(--muted); font-size: .72rem; font-weight: 400; }
   </style>
 </head>
 <body>
@@ -192,25 +196,40 @@
 
   <hr class="sep">
 
-  {# ── 下: シミュレータ ─────────────────────── #}
+  {# ── 下: シミュレータ ───────────────────────
+     何ができる画面かを、触る前に分かるようにする。
+     見出しだけ（旧「どれくらいでとどく？」）では
+     何が起きるのか・入っている数字が何なのかが伝わらなかった。 #}
   <section class="card sim">
-    <h2>どれくらいでとどく？</h2>
-    <label>もくひょうの金額（円）</label>
+    <h2>ためる計画をたててみよう</h2>
+    <p class="sim-lead">
+      「毎月いくらためたら、いつごろとどくか」を計算できるよ。<br>
+      金額をかえてみると、かかる時間がどう変わるか見られる。
+    </p>
+
+    <label>
+      いくらためる？（円）
+      {% if goals %}
+        <span class="sim-hint">← いまは「{{ goals[0].title }}」のこりの金額が入ってるよ</span>
+      {% endif %}
+    </label>
     <input type="number" id="target" value="{{ goals[0].remaining if goals else 10000 }}" min="1">
 
-    <label>けいさんのしかた</label>
+    <label>どっちから考える？</label>
     <select id="mode">
-      <option value="per">1回にためる金額から、なん回かかるか</option>
-      <option value="months">なんか月でためるか から、1回いくらか</option>
+      <option value="per">毎月いくらためるか →　なん回かかる？</option>
+      <option value="months">なん月でためたいか →　毎月いくら？</option>
     </select>
 
-    <label id="lbl">1回にためる金額（円）</label>
+    <label id="lbl">毎月ためる金額（円）</label>
     <input type="number" id="value" value="500" min="1">
 
     <div class="sim-result" id="result">—</div>
-    <button class="sim-copy" id="copy">この内よう をコピーする</button>
+    <button class="sim-copy" id="copy">この計画をコピーする</button>
     <p class="note">
-      コピーしてチャットにはると、目ひょうとして話せるよ。だいたいの目やすだからね。
+      コピーしたらチャットにはってね。「これでいい？」ってきいてくれるよ。<br>
+      ※ だいたいの目やすだよ。とちゅうでおこづかいがふえたり、
+      ほしいものが変わったりしてもだいじょうぶ。
     </p>
   </section>
 
