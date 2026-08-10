@@ -263,6 +263,27 @@ def _test_simulator_explains_itself():
            "まで あと" in html,
            "初期値がどの目標の残額か示されていない")
 
+    # 入力欄が画面いっぱいだと、数字と単位の対応が見えず入れにくい（社長指摘）
+    _check("sim_input_is_narrow",
+           "width: 9em" in html,
+           "数字の入力欄が広すぎる（数文字ぶんで足りる）")
+    _check("sim_unit_next_to_input",
+           'class="sim-unit"' in html,
+           "単位（円・か月）が入力の横に無い")
+    _check("page_has_max_width",
+           "max-width: 1100px" in html,
+           "本文が画面いっぱいに広がる（視線移動が大きい）")
+
+    # 結果は回数だけでなく**年数**で見せる。
+    # 「300回・2051年」だけでは遠すぎて実感が湧かない（社長指摘）
+    _check("sim_shows_span_in_years",
+           "function spanText" in html,
+           "回数を年・月に言い換えていない")
+    # 長すぎるときは金額を変えてみるよう促す（シミュレータの狙い）
+    _check("sim_advises_when_too_long",
+           "ちょっと長いね" in html and "金額をふやす" in html,
+           "長期になったときの声かけが無い")
+
 
 def main():
     _test_operational_notes_are_hidden()

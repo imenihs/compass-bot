@@ -25,8 +25,11 @@
     }
     * { box-sizing: border-box; }
     body {
-      margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+      margin: 0 auto; padding: 16px; background: var(--bg); color: var(--text);
       font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+      /* 画面いっぱいに広げない。横に長いと視線の移動が大きく、
+         どこを見ればいいのか分かりにくくなる */
+      max-width: 1100px;
     }
     h1 { font-size: 1.3rem; margin: 0 0 4px; }
     .balance { font-size: 2rem; font-weight: 700; margin: 0 0 16px; }
@@ -86,10 +89,23 @@
 
     /* シミュレータ */
     .sim label { display: block; font-size: .8rem; color: var(--muted); margin: 8px 0 3px; }
-    .sim input, .sim select {
-      width: 100%; padding: 8px; border-radius: 8px; border: 1px solid var(--line);
+    /* 入力は数字数文字ぶんの幅で足りる。横幅いっぱいだと単位との対応が見えず、
+       どこに何を入れるのか分かりにくい */
+    .sim-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+    .sim input {
+      width: 9em; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
       background: #12141c; color: var(--text); font-size: 1rem;
+      text-align: right; font-variant-numeric: tabular-nums;
     }
+    .sim select {
+      max-width: 26em; width: 100%; padding: 8px 10px; border-radius: 8px;
+      border: 1px solid var(--line); background: #12141c; color: var(--text);
+      font-size: .95rem;
+    }
+    .sim-unit { color: var(--muted); font-size: .9rem; }
+    .sim-result strong { font-size: 1.15rem; color: var(--save); }
+    .sim-when { color: var(--muted); font-size: .85rem; }
+    .sim-advice { color: var(--advance); font-size: .82rem; }
     .sim-result {
       margin-top: 12px; padding: 12px; background: #12141c;
       border: 1px solid var(--line); border-radius: 8px; font-size: .9rem;
@@ -213,7 +229,7 @@
     </p>
 
     <label>
-      いくらためる？（円）
+      いくらためる？
       {% if goals %}
         {# 目標がある子には、その目標の残額を初期値にする。
            どこから来た数字かを添えないと「なぜこの金額？」になる #}
@@ -225,10 +241,13 @@
         <span class="sim-hint">ほしいものの ねだんを入れてみてね</span>
       {% endif %}
     </label>
-    <input type="number" id="target"
-           value="{{ goals[0].remaining if goals else '' }}"
-           placeholder="れい: 3000"
-           min="1">
+    <div class="sim-row">
+      <input type="number" id="target"
+             value="{{ goals[0].remaining if goals else '' }}"
+             placeholder="3000"
+             min="1">
+      <span class="sim-unit">円</span>
+    </div>
 
     <label>どっちから考える？</label>
     <select id="mode">
@@ -236,8 +255,11 @@
       <option value="months">なん月でためたいか →　毎月いくら？</option>
     </select>
 
-    <label id="lbl">毎月ためる金額（円）</label>
-    <input type="number" id="value" value="500" min="1">
+    <label id="lbl">毎月ためる金額</label>
+    <div class="sim-row">
+      <input type="number" id="value" value="500" min="1">
+      <span class="sim-unit" id="unit">円</span>
+    </div>
 
     <div class="sim-result" id="result">—</div>
     <button class="sim-copy" id="copy">この計画をコピーする</button>
@@ -277,19 +299,42 @@
       if (!v) { result.textContent = "毎月ためる金額を入れてみてね"; return ""; }
 
       if (mode.value === "per") {
-        lbl.textContent = "1回にためる金額（円）";
+        lbl.textContent = "毎月ためる金額";
+        unit.textContent = "円";
         const times = Math.ceil(t / v);
-        const when = addMonths(times);
-        result.textContent =
-          `${v.toLocaleString()}円ずつなら ${times}回。だいたい ${when} ごろ。`;
+        result.innerHTML =
+          `<strong>${times}回</strong>（${spanText(times)}）でとどくよ。<br>` +
+          `<span class="sim-when">${addMonths(times)} ごろ</span>${adviceFor(times)}`;
         return `毎月${v}円ずつ、${times}回で ${t}円ためる`;
       }
-      lbl.textContent = "なん月でためる？（か月）";
+      lbl.textContent = "なん月でためる？";
+      unit.textContent = "か月";
       const per = Math.ceil(t / v);
-      const when = addMonths(v);
-      result.textContent =
-        `${v}か月なら 1回 ${per.toLocaleString()}円。だいたい ${when} ごろ。`;
+      result.innerHTML =
+        `毎月 <strong>${per.toLocaleString()}円</strong> ずつだよ。<br>` +
+        `<span class="sim-when">${addMonths(v)} ごろ</span>${adviceFor(v)}`;
       return `毎月${per}円ずつ、${v}回で ${t}円ためる`;
+    }
+
+    // 回数を「年・月」に言い換える。300回を「2051年」とだけ出すと、
+    // 子には遠すぎて実感が湧かず、数字の意味が伝わらない
+    function spanText(months) {
+      if (months < 12) return `${months}か月`;
+      const y = Math.floor(months / 12);
+      const m = months % 12;
+      return m ? `${y}年${m}か月` : `${y}年`;
+    }
+
+    // 長すぎるときは「金額を変えてみる」へ誘う。
+    // ここがシミュレータの狙い（金額と時間の関係を自分で発見する）
+    function adviceFor(months) {
+      if (months >= 60) {
+        return '<br><span class="sim-advice">ちょっと長いね。毎月の金額をふやすと、ぐっと近くなるよ。</span>';
+      }
+      if (months >= 24) {
+        return '<br><span class="sim-advice">けっこうかかるね。金額をかえて、くらべてみよう。</span>';
+      }
+      return '';
     }
 
     // 支給日(payday_day)を基準に、n回ぶん先の年月を出す。
