@@ -28,12 +28,14 @@ def _check(name: str, passed: bool, detail: str = "") -> None:
 def _setup(tmp: Path) -> None:
     """子2人(たろう・兼務くん)と親2人(純粋親・兼務くんと同ID)を隔離配置する。"""
     (tmp / "settings" / "users" / "parents").mkdir(parents=True, exist_ok=True)
+    # 子は children/ 配下に置く。config.CHILDREN_DIR の実配置に合わせる
+    (tmp / "settings" / "users" / "children").mkdir(parents=True, exist_ok=True)
     # 子: たろう(純粋な子, id=111)
-    (tmp / "settings" / "users" / "tarou.json").write_text(
+    (tmp / "settings" / "users" / "children" / "tarou.json").write_text(
         json.dumps({"name": "たろう", "age": 10, "discord_user_id": 111}, ensure_ascii=False), encoding="utf-8"
     )
     # 子: 兼務くん(子として登録, id=555) ← 親にも同IDが居る兼務アカウント
-    (tmp / "settings" / "users" / "kenmu.json").write_text(
+    (tmp / "settings" / "users" / "children" / "kenmu.json").write_text(
         json.dumps({"name": "兼務くん", "age": 11, "discord_user_id": 555}, ensure_ascii=False), encoding="utf-8"
     )
     # 親: 純粋な親(id=999) ← 子には居ない
@@ -47,9 +49,10 @@ def _setup(tmp: Path) -> None:
     config.SETTINGS_DIR = tmp / "settings"
     config.USERS_DIR = config.SETTINGS_DIR / "users"
     config.PARENTS_DIR = config.USERS_DIR / "parents"
+    config.CHILDREN_DIR = config.USERS_DIR / "children"
 
 
-def _run() -> None:
+def _run() -> bool:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         _setup(tmp)
@@ -110,7 +113,10 @@ def _run() -> None:
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))
     print(json.dumps({"summary": True, "passed": passed, "total": len(_results)}, ensure_ascii=False))
+    # **判定を終了コードへ返す**。返さないと落ちても PASS 扱いになり、
+    # 実際に9件落ちたまま「全スイートPASS」と報告していた（2026/08/10 に是正）
+    return passed == len(_results)
 
 
 if __name__ == "__main__":
-    _run()
+    sys.exit(0 if _run() else 1)

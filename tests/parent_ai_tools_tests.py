@@ -19,10 +19,12 @@ def _check(n, p, d=""): _results.append({"name": n, "passed": bool(p), "detail":
 
 def _setup(tmp: Path):
     (tmp / "settings" / "users" / "parents").mkdir(parents=True, exist_ok=True)
+    # 子は children/ 配下に置く。config.CHILDREN_DIR の実配置に合わせる
+    (tmp / "settings" / "users" / "children").mkdir(parents=True, exist_ok=True)
     (tmp / "data").mkdir(parents=True, exist_ok=True)
-    (tmp / "settings" / "users" / "tarou.json").write_text(
+    (tmp / "settings" / "users" / "children" / "tarou.json").write_text(
         json.dumps({"name": "たろう", "age": 10, "discord_user_id": 111, "fixed_increase_cap": 100}, ensure_ascii=False), encoding="utf-8")
-    (tmp / "settings" / "users" / "hana.json").write_text(
+    (tmp / "settings" / "users" / "children" / "hana.json").write_text(
         json.dumps({"name": "はな", "age": 8, "discord_user_id": 222, "fixed_increase_cap": 100}, ensure_ascii=False), encoding="utf-8")
     (tmp / "settings" / "users" / "parents" / "oya.json").write_text(
         json.dumps({"name": "とうちゃん", "discord_user_id": 999}, ensure_ascii=False), encoding="utf-8")
@@ -35,6 +37,7 @@ def _setup(tmp: Path):
     config.SETTINGS_DIR = tmp / "settings"
     config.USERS_DIR = config.SETTINGS_DIR / "users"
     config.PARENTS_DIR = config.USERS_DIR / "parents"
+    config.CHILDREN_DIR = config.USERS_DIR / "children"
     config.SYSTEM_PATH = config.SETTINGS_DIR / "system.json"
     config.SETTING_PATH = config.SETTINGS_DIR / "setting.json"
 
@@ -116,7 +119,10 @@ def _run():
     passed = sum(1 for x in _results if x["passed"])
     for x in _results: print(json.dumps(x, ensure_ascii=False))
     print(json.dumps({"summary": True, "passed": passed, "total": len(_results)}, ensure_ascii=False))
+    # **判定を終了コードへ返す**。返さないと落ちても PASS 扱いになり、
+    # 実際に9件落ちたまま「全スイートPASS」と報告していた（2026/08/10 に是正）
+    return passed == len(_results)
 
 
 if __name__ == "__main__":
-    _run()
+    sys.exit(0 if _run() else 1)

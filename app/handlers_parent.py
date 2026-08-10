@@ -11,27 +11,18 @@ import json
 
 import discord
 
-from app.bot_utils import (
-    _build_goal_achieved_message,
-    _load_jsonl,
-    _normalize_japanese_command,
-    _usage_guide_text,
-)
+from app.bot_utils import _usage_guide_text
 from app import config
 from app.config import (
-    find_user_by_name,
     find_child_user_by_name,
     get_allow_channel_ids,
     get_parent_ids,
     load_all_users,
     load_system,
     get_log_dir,
-    update_user_field,
     get_web_base_url,
 )
-from app.error_messages import operation_failure_message
-from app.message_parser import extract_input_from_mention
-from app.storage import JST, append_jsonl, now_jst_iso
+from app.storage import append_jsonl, now_jst_iso
 
 # モジュールレベルの依存オブジェクト — init() で bot.py から注入する
 _wallet_service = None
@@ -55,56 +46,6 @@ _FOLLOW_POLICY_FOCUS_LABELS = {
     "record_habit": "記録習慣",
     "income_balance": "収入と支出のバランス",
 }
-
-_FOLLOW_POLICY_FOCUS_ALIASES = {
-    "バランス": "balanced",
-    "全体": "balanced",
-    "満足度": "satisfaction_reflection",
-    "振り返り": "satisfaction_reflection",
-    "ふりかえり": "satisfaction_reflection",
-    "衝動": "impulse_spending",
-    "買う前": "impulse_spending",
-    "一度待つ": "impulse_spending",
-    "使いすぎ": "impulse_spending",
-    "貯金": "saving_goal",
-    "目標": "saving_goal",
-    "記録": "record_habit",
-    "記録習慣": "record_habit",
-    "収入": "income_balance",
-    "お小遣い増": "income_balance",
-    "行動プラン": "income_balance",
-}
-
-_FOLLOW_POLICY_STRENGTH_ALIASES = {
-    "軽め": "light",
-    "やさしく": "light",
-    "弱め": "light",
-    "普通": "normal",
-    "通常": "normal",
-    "しっかり": "normal",
-}
-
-_FOLLOW_POLICY_FREQUENCY_ALIASES = {
-    "必要なとき": "low",
-    "少なめ": "low",
-    "低め": "low",
-    "ふつう": "normal",
-    "普通": "normal",
-    "毎回": "normal",
-}
-
-_FOLLOW_POLICY_UNSAFE_WORDS = (
-    "兄弟と比べ",
-    "姉妹と比べ",
-    "比較して叱",
-    "厳しく叱",
-    "罰",
-    "ペナルティ",
-    "減額で脅",
-    "だらしない",
-    "浪費家",
-    "嘘つき",
-)
 
 
 def init(wallet_service, client, reminder_service, allowance_reminder_conf: dict) -> None:
@@ -140,39 +81,6 @@ def _log_parent_handler_error(message: discord.Message, event: str, error: Excep
         print(f"[parent_handler_diagnostics] log error: {type(log_error).__name__}: {log_error}")
 
 
-def _is_exact_command(content: str, *forms: str) -> bool:
-    """引数の無い固定コマンドを**完全一致**で判定する（N-11.17）。
-
-    従来は `"使い方の説明" in normalized` のような部分一致で判定しており、
-    ①文中にその語があるだけで発火する ②「使い方の説明」と「使い方の説明と初期設定」が
-    衝突するため否定条件（`"初期設定" not in ...`）で回避する、という状態だった。
-    後者は **bot.py の呼び出し順に依存する暗黙のルール**で、
-    並び順を変えると壊れる。順序依存を無くすには完全一致にするのが正しい。
-
-    引数を取るコマンド（支給・残高調整など）はここでは扱わない。
-    それらは言葉の解釈が要るため AI に構造化させる（A案）。
-
-    Args:
-        content: 生のメッセージ本文。
-        *forms: 許可する表記（漢字・ひらがな等の表記ゆれを列挙する）。
-
-    Returns:
-        bool: いずれかの表記と完全一致すれば True。
-    """
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    body = mention_body if mention_body is not None else (content or "")
-    normalized = _normalize_japanese_command(body).strip()
-    return any(normalized == f for f in forms)
-
-
-
-
-def _command_body(content: str) -> str:
-    """メンションあり/なしの親コマンド本文を返す"""
-    mention_body = extract_input_from_mention((content or "").strip(), _client.user)
-    return (mention_body if mention_body is not None else (content or "")).strip()
-
-
 def _normalize_follow_policy(raw_policy: dict | None) -> dict:
     """子ども別AIフォロー方針を保存可能な形にそろえる"""
     policy = dict(_FOLLOW_POLICY_DEFAULT)
@@ -187,10 +95,6 @@ def _normalize_follow_policy(raw_policy: dict | None) -> dict:
         policy["frequency"] = "low"
     policy["parent_note"] = str(policy.get("parent_note") or "").strip()[:300]
     return policy
-
-
-
-
 
 
 def _follow_policy_summary(name: str, policy: dict) -> str:
@@ -211,16 +115,6 @@ def _follow_policy_summary(name: str, policy: dict) -> str:
 # ------------------------------------------------------------------
 # 親専用コマンドハンドラ
 # ------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
 
 
 async def _resolve_child_channels_strict() -> tuple[dict, dict]:
@@ -314,8 +208,6 @@ async def _drive_assessment_feedback() -> None:
             pass
 
 
-
-
 async def _drive_dashboard_dm() -> None:
     """tool が積んだ「URLをDMして」を取り出し、本人へ DM で届ける。
 
@@ -373,13 +265,35 @@ async def _drive_bot_actions() -> None:
         actions = dashboard_token.take_bot_actions()
     except Exception:  # noqa: BLE001 - キューの不調で会話を止めない
         return
+    # 同じ種類の依頼は1回だけ実行する。
+    # 一斉送信は全チャンネルへ飛ぶうえ取り消せないため、
+    # 親が2回言っても2回配らない（request_dm が連打を畳むのと揃える）。
+    # 低残高アラートは子ごとに内容が違うので、名前まで含めて重複判定する
+    seen = set()
+    deduped = []
     for action in actions:
+        key = (str(action.get("kind", "")),
+               str((action.get("payload") or {}).get("name", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(action)
+
+    for action in deduped:
         kind = str(action.get("kind", ""))
         try:
             if kind == "broadcast_usage_guide":
                 await _broadcast_usage_guide()
             elif kind == "safety_setup_check":
                 await _run_safety_setup_check()
+            elif kind == "low_balance_alert":
+                # 閾値の判定は依頼を積む側で済んでいる。ここは送るだけ
+                from app import handlers_child
+                payload = action.get("payload", {}) or {}
+                await handlers_child.send_low_balance_alert(
+                    str(payload.get("name", "")),
+                    int(payload.get("balance", 0) or 0),
+                    int(payload.get("threshold", 0) or 0))
         except Exception as exc:  # noqa: BLE001 - 1件失敗しても他を止めない
             _log_dashboard_event("bot_action_failed",
                                  {"kind": kind, "error": f"{type(exc).__name__}: {exc}"})
@@ -548,7 +462,4 @@ def _log_dashboard_event(event: str, detail: dict) -> None:
         })
     except Exception as log_error:  # noqa: BLE001 - ログ失敗は標準出力へ逃がす
         print(f"[handlers_parent] log failed: {type(log_error).__name__}: {log_error}")
-
-
-
 

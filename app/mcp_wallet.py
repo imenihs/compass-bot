@@ -687,10 +687,41 @@ def _do_record_expense(args: dict) -> str:
         delta=-amount, action="spending_record", note=item,
         operation_key=eff_key, aux_operation_keys=[dup_key], aux_dedup_window_sec=DEDUP_WINDOW_SEC,
     )
+    # 残高が閾値を割ったら親へ知らせるよう依頼する（Feature 2）。
+    # 旧経路（handlers_child の到達不能ハンドラ）から呼ばれていたため長らく死んでいた。
+    # tool は Discord を持たないのでキューへ積み、bot プロセスが送る
+    _request_low_balance_alert_if_needed(name, after)
     return (
         f"支出を記録したよ。\n- 金額: {amount}円\n- 何に: {item if item else 'なし'}\n"
         f"残高: {before}円 → {after}円"
     )
+
+
+def _request_low_balance_alert_if_needed(name: str, balance: int) -> None:
+    """残高が閾値を下回っていれば、親への通知を bot へ依頼する。
+
+    設定が無効なら何もしない。判定も送信要否もここに閉じ込め、
+    呼ぶ側（各 tool）は残高を渡すだけにする。
+
+    Args:
+        name: 子どもの名前。
+        balance: 支出後の残高。
+    """
+    try:
+        from app import config as _config
+        from app import dashboard_token as _dt
+
+        cfg = _config.get_low_balance_alert_setting() or {}
+        if not cfg.get("enabled"):
+            return
+        threshold = int(cfg.get("threshold", 0) or 0)
+        if threshold <= 0 or int(balance) >= threshold:
+            return
+        _dt.request_bot_action("low_balance_alert",
+                               {"name": str(name), "balance": int(balance),
+                                "threshold": threshold})
+    except Exception:  # noqa: BLE001 - 通知の失敗で記録処理を落とさない
+        pass
 
 
 def _do_record_income(args: dict) -> str:
@@ -1045,12 +1076,18 @@ def _dashboard_url_flow(args: dict, reissue: bool) -> str:
 
     user_key = _dt.build_user_key(role, stem)
     if reissue:
-        # 作り直し。issue() が同 user_key の旧トークンを失効させるので、前のURLは即使えなくなる
+        # **先に DM 要求を積んでから失効させる**。
+        # 逆順だと、積む処理が失敗したときに「前のURLは死んだのに新しいURLは届かない」
+        # となり、本人がダッシュボードから完全に締め出される。
+        # 先に積んでおけば、失効に失敗しても古いURLで入れる（安全側に倒れる）。
+        _dt.request_dm(target_id, user_key, role)
+        # issue() が同 user_key の旧トークンを失効させるので、前のURLは即使えなくなる
         _dt.issue(user_key, role, issued_by="chat")
-        ok_msg = ("あたらしいダッシュボードのURLをDMでおくったよ。まえのURLはもう使えないよ。"
-                  if not PARENT_MODE else
-                  "あたらしいダッシュボードのURLをDMで送りました。前のURLはもう使えません。")
-    elif _dt.find_active_token(user_key) is None:
+        return ("あたらしいダッシュボードのURLをDMでおくったよ。まえのURLはもう使えないよ。"
+                if not PARENT_MODE else
+                "あたらしいダッシュボードのURLをDMで送りました。前のURLはもう使えません。")
+
+    if _dt.find_active_token(user_key) is None:
         # まだ発行されていないときだけ作る（見るたびに作り直さない）
         _dt.issue(user_key, role, issued_by="chat")
     # bot プロセスへ「DMを送って」と積む
@@ -1976,7 +2013,14 @@ def _do_parent_broadcast_usage_guide(args: dict) -> str:
     """
     if not PARENT_MODE:
         return "この操作は親だけができるよ。"
+    from app import config as _config
     from app import dashboard_token as _dt
+
+    # 親チャンネルが未設定だと結果報告の宛先が無い。
+    # 「報告します」と言って永久に黙るのは、今回直した事故と同じ形なので先に伝える
+    if not _config.get_parent_channel_id():
+        return ("親チャンネル（parent_channel_id）が未設定のため、送信結果を報告できません。\n"
+                "設定してから、もう一度たのんでください。")
     _dt.request_bot_action("broadcast_usage_guide", {})
     return "使い方の説明を全チャンネルへ送ります。結果はこのあと報告します。"
 
@@ -1991,7 +2035,14 @@ def _do_parent_safety_setup_check(args: dict) -> str:
     """
     if not PARENT_MODE:
         return "この操作は親だけができるよ。"
+    from app import config as _config
     from app import dashboard_token as _dt
+
+    # 判定結果は親チャンネルへ返す。未設定だと最も重要な警告
+    # （「通知先が未設定＝危険信号がどこにも届かない」）が誰にも届かない
+    if not _config.get_parent_channel_id():
+        return ("親チャンネル（parent_channel_id）が未設定のため、チェック結果を報告できません。\n"
+                "設定してから、もう一度たのんでください。")
     _dt.request_bot_action("safety_setup_check", {})
     return "安全設定のチェックを始めます。確認用のメッセージを送るので、届いた場所を見てください。"
 
@@ -2011,7 +2062,8 @@ def _do_parent_get_settings_info(args: dict) -> str:
     if not PARENT_MODE:
         return "この操作は親だけができるよ。"
     from app.config import load_all_users, get_web_base_url
-    from app.handlers_parent import _normalize_follow_policy, _follow_policy_summary
+    from app.handlers_parent import (_FOLLOW_POLICY_FOCUS_LABELS,
+                                     _follow_policy_summary, _normalize_follow_policy)
 
     base_url = get_web_base_url().rstrip("/")
     target = str(args.get("name", "") or "").strip()
@@ -2025,7 +2077,7 @@ def _do_parent_get_settings_info(args: dict) -> str:
         return (
             f"【{target} の設定】\n"
             f"・固定お小遣い: {int(conf.get('fixed_allowance', 0) or 0)}円\n"
-            f"・臨時上限: {int(conf.get('temporary_allowance_max', 0) or 0)}円\n"
+            f"・臨時上限: {int(conf.get('temporary_max', 0) or 0)}円\n"
             + _follow_policy_summary(target, policy)
             + f"\n\n変更は Web から → {base_url}"
         )
@@ -2035,8 +2087,14 @@ def _do_parent_get_settings_info(args: dict) -> str:
         name = str(u.get("name", ""))
         if not name:
             continue
+        # フォロー方針も1行で添える。description が「フォロー方針の現在値を返す」と
+        # 宣言している以上、一覧で欠けていると AI が tool を選び損ねる
+        policy = _normalize_follow_policy(u.get("ai_follow_policy"))
+        focus = _FOLLOW_POLICY_FOCUS_LABELS.get(policy.get("focus_area"), "バランス")
+        follow = focus if policy.get("enabled", True) else "オフ"
         lines.append(f"・{name}: 固定{int(u.get('fixed_allowance', 0) or 0)}円 / "
-                     f"臨時上限{int(u.get('temporary_allowance_max', 0) or 0)}円")
+                     f"臨時上限{int(u.get('temporary_max', 0) or 0)}円 / "
+                     f"フォロー{follow}")
     lines.append(f"\n変更は Web から → {base_url}")
     lines.append("（金額の設定はチャットでは受け付けていません。桁の取り違えに気づけないためです）")
     return "\n".join(lines)

@@ -517,26 +517,21 @@ def _parent_natural_management_guide(input_block: str) -> str | None:
     ):
         return None
 
+    # 案内先を Web と親チャンネルへ変えた（2026/08/10）。
+    # 以前はここで「設定変更 たろう 固定 300円」という形式を教えていたが、
+    # そのコマンドは廃止済みで、**存在しない呪文を教え続けていた**。
+    # 固定お小遣いの変更は Web（数値入力・一覧で見比べられる）、
+    # 支給や残高の調整は親チャンネルでの会話（AI が tool を呼ぶ）へ寄せる。
+    from app.config import get_web_base_url
+
     return (
-        "親向けの金額変更は、誤操作防止のため明示コマンドで実行してね。\n"
-        f"- 固定お小遣い変更: `設定変更 {child_name} 固定 300円`\n"
-        f"- 臨時上限変更: `設定変更 {child_name} 臨時 1000円`\n"
-        f"- 残高を直接増減: `残高調整 {child_name} +500円` / `残高調整 {child_name} -300円`"
+        f"{child_name}さんの金額の設定は、ここでは変えられないよ。\n"
+        f"・固定お小遣い・臨時上限を変える → Web から {get_web_base_url().rstrip('/')}\n"
+        "・お金を渡す、残高を直す → 親チャンネルでそのまま話しかけてね\n"
+        "（子のチャンネルで金額を動かすと、本人に見えてしまうため分けています）"
     )
 
 
-def _looks_like_parent_only_command(input_block: str) -> bool:
-    """子どもの入力を親専用コマンドとして誤って査定/雑談へ流さないための判定"""
-    body = (input_block or "").strip()
-    if not body:
-        return False
-    # 引数なしの固定コマンドだけを挙げる。
-    # 「支給」「残高調整」は AI 経路へ畳んだため外した（コマンドとして存在しない）。
-    # これらは子も日常会話で使う言葉なので、残すと子の発話を誤って弾く。
-    parent_prefixes = [
-        "設定変更", "全体確認",
-    ]
-    return any(body.lower().startswith(prefix.lower()) for prefix in parent_prefixes)
 
 
 def _short_log_text(value, limit: int = 1200) -> str:
@@ -918,12 +913,15 @@ async def _on_message_impl(message: discord.Message):
             from app.conv.ai_conversation import handle_parent_conversation
             from app.config import load_all_users
             child_names = [str(u.get("name", "")) for u in load_all_users() if u.get("name")]
-            await handle_parent_conversation(message.channel, message.author.id, input_block, child_names)
+            try:
+                await handle_parent_conversation(
+                    message.channel, message.author.id, input_block, child_names)
+            finally:
+                # tool は別プロセスで Discord を持たないため、送信系は「依頼」だけ積んでいる。
+                # **会話が落ちても必ず消化する**（tool は先に完了していることがある）。
+                # AI の応答は必ずチャンネルへ出るので、URL は tool に返させず必ずDMで届ける
+                await _drive_queued_bot_work()
             _mark_thinking_sent(message, True)
-            # tool は別プロセスで Discord を持たないため、送信系は「依頼」だけ積んでいる。
-            # ここで消化する（URLのDM送信・一斉通知・安全設定チェック）。
-            # AI の応答は必ずチャンネルへ出るので、URL は tool に返させず必ずDMで届ける
-            await _drive_queued_bot_work()
             # 親 AI 会話で承認/却下された場合、mcp_wallet が feedback_pending へ積む。bot 側で取り出して
             # 子へ opener を届ける（入口差を作らない・テキストコマンドと同じ driver）。
             try:
@@ -995,14 +993,6 @@ async def _on_message_impl(message: discord.Message):
         await message.channel.send("設定にあなたのDiscord IDが登録されてないみたい。親に `settings/users/*.json` を追加してもらってね。")
         return
 
-    if not is_parent(message.author.id) and _looks_like_parent_only_command(input_block):
-        await message.channel.send("その操作は親のみできるよ。")
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "parent_only_command_rejected",
-            {"selected_user_source": selected_user_source},
-        )
-        return
 
     _log_runtime_event(
         system_conf=system_conf,
@@ -1113,10 +1103,11 @@ async def _on_message_impl(message: discord.Message):
         if safety_task is not None:
             with contextlib.suppress(Exception):
                 await safety_task
+        # **必ず finally で消化する**。会話が例外・タイムアウトで落ちても、
+        # tool は先に完了して依頼を積んでいることがある。ここを try の外に置くと
+        # 「頼んだのにDMが来ない」が再発する（今回直したのと同じ形の事故）
+        await _drive_queued_bot_work()
     _mark_thinking_sent(message, True)
-
-    # 子も tool 経由でダッシュボードURLを要求するため、同じくここで消化する
-    await _drive_queued_bot_work()
 
     # 査定提案が出ていたら「親チャンネルのみ」へ通知する（是正設計①・N-11.14）。
     # 以前は発話チャンネル（＝子のチャンネル）へ送っており、提案額・理由・承認/却下コマンド等の

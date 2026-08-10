@@ -326,6 +326,124 @@ def _test_dm_is_requested_not_returned():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_dm_queue_keeps_dual_role_requests():
+    """兼務アカウントで、子と親の DM 要求が両方とも残ること。
+
+    キーを Discord ID だけにしていたため、同じ人が子としても親としても
+    要求すると**先の要求が上書きされて消えていた**。
+    実データに兼務アカウントが存在するので、これは仮定の話ではない。
+    キーを (Discord ID, user_key) の組にして両方残す。
+    同じ組の連打は畳んでよい（1通だけ届く）。
+    """
+    from app import dashboard_token as dt
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dt.DM_QUEUE_PATH = tmp / "dm_queue.json"
+        dt.request_dm(_PARENT_ID, "child:test", "child")
+        dt.request_dm(_PARENT_ID, "parent:toucyan", "parent")
+        dt.request_dm(_PARENT_ID, "child:test", "child")  # 連打は畳む
+
+        reqs = dt.take_dm_requests()
+        keys = sorted(r["user_key"] for r in reqs)
+        _check("dual_role_both_survive", keys == ["child:test", "parent:toucyan"], keys)
+        _check("same_key_repeat_collapses", len(reqs) == 2, len(reqs))
+        _check("dm_queue_drained", dt.take_dm_requests() == [], "not drained")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_bot_actions_are_deduped():
+    """同じ種類の依頼が2回積まれても、1回しか実行されないこと。
+
+    一斉送信は全チャンネルへ飛ぶうえ取り消せない。
+    親が2回言っても2回配らない（request_dm が連打を畳むのと揃える）。
+    低残高アラートは子ごとに内容が違うので、名前まで含めて重複判定する。
+    """
+    import asyncio
+
+    from app import dashboard_token as dt, handlers_parent as H
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dt.ACTION_QUEUE_PATH = tmp / "actions.json"
+        dt.request_bot_action("broadcast_usage_guide", {})
+        dt.request_bot_action("broadcast_usage_guide", {})
+        dt.request_bot_action("low_balance_alert", {"name": "たろう", "balance": 100})
+        dt.request_bot_action("low_balance_alert", {"name": "はな", "balance": 50})
+
+        executed = []
+        orig_bc, orig_safety = H._broadcast_usage_guide, H._run_safety_setup_check
+
+        async def _fake_bc():
+            executed.append("broadcast")
+
+        H._broadcast_usage_guide = _fake_bc
+        # 低残高は handlers_child 側を差し替える
+        from app import handlers_child as C
+        orig_low = C.send_low_balance_alert
+
+        async def _fake_low(name, balance, threshold):
+            executed.append(f"low:{name}")
+
+        C.send_low_balance_alert = _fake_low
+        try:
+            asyncio.new_event_loop().run_until_complete(H._drive_bot_actions())
+        finally:
+            H._broadcast_usage_guide, H._run_safety_setup_check = orig_bc, orig_safety
+            C.send_low_balance_alert = orig_low
+
+        _check("broadcast_runs_once", executed.count("broadcast") == 1, executed)
+        _check("low_balance_per_child",
+               sorted(x for x in executed if x.startswith("low:")) == ["low:たろう", "low:はな"],
+               executed)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_reissue_queues_dm_before_revoking():
+    """作り直しは、**DM要求を積んでから**古いトークンを失効させること。
+
+    逆順だと、積む処理が失敗したときに「前のURLは死んだのに新しいURLは届かない」
+    となり、本人がダッシュボードから完全に締め出される。
+    ここでは request_dm を失敗させ、古いトークンが生き残る（安全側に倒れる）ことを見る。
+    """
+    from app import dashboard_token as dt, mcp_wallet as m
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dt.TOKENS_PATH = tmp / "tokens.json"
+        dt.DM_QUEUE_PATH = tmp / "dm_queue.json"
+        orig_dirs = _sandbox_users(tmp)
+        key = dt.build_user_key(dt.ROLE_CHILD, "test")
+
+        orig_resolve, orig_mode, orig_req = m._resolve_child, m.PARENT_MODE, dt.request_dm
+        m._resolve_child = lambda n=None: {"name": "テスト"}
+        m.PARENT_MODE = False
+        try:
+            m._do_get_dashboard_url({"name": "テスト"})
+            old_token = dt.find_active_token(key)
+
+            # DM 要求が失敗する状況を作る
+            def _boom(*a, **kw):
+                raise OSError("queue write failed")
+
+            dt.request_dm = _boom
+            try:
+                m._do_reissue_dashboard_url({"name": "テスト"})
+            except OSError:
+                pass
+            # 古いトークンがまだ生きている（＝締め出されていない）
+            _check("old_token_survives_when_dm_fails",
+                   dt.resolve(old_token) is not None, old_token)
+        finally:
+            m._resolve_child, m.PARENT_MODE = orig_resolve, orig_mode
+            dt.request_dm = orig_req
+            _restore_users(orig_dirs)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _test_bot_action_queue_roundtrip():
     """bot にしかできない依頼（一斉通知・安全設定チェック）が積んで取り出せること。
 
@@ -558,6 +676,9 @@ def main():
     _test_money_ops_notify_discord()
     _test_dm_is_requested_not_returned()
     _test_bot_action_queue_roundtrip()
+    _test_dm_queue_keeps_dual_role_requests()
+    _test_bot_actions_are_deduped()
+    _test_reissue_queues_dm_before_revoking()
     _test_dashboard_url_tool_does_not_reissue()
     _test_url_never_posted_to_channel()
 

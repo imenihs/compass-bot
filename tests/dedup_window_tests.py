@@ -50,5 +50,8 @@ def _run():
     passed=sum(1 for x in _results if x["passed"])
     for x in _results: print(json.dumps(x,ensure_ascii=False))
     print(json.dumps({"summary":True,"passed":passed,"total":len(_results)},ensure_ascii=False))
+    # 判定を終了コードへ返す（返さないと落ちても PASS 扱いになる・2026/08/10 是正）
+    return passed == len(_results)
 
-if __name__=="__main__": _run()
+if __name__=="__main__":
+    raise SystemExit(0 if _run() else 1)

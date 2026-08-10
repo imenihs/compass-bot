@@ -91,13 +91,17 @@ def _test_quoted_command_cannot_move_balance():
 
     以前は部分一致で「昨日『支給 はな 300円』ってやったっけ？」が発火し、
     引用しただけで残高が動いた。一致判定を全廃したので発火経路そのものが無い。
-    ここでは「その文字列を含む発話を処理しても残高が変わらない」を実際に確かめる。
+
+    **文字列を実際に流して確かめる**。当初は「bot.py に maybe_handle_ が無い」を
+    4回チェックするだけで、引用文を一度も処理していなかった（空振り）。
+    ここでは各文字列を tool 名として解決しようと試み、
+    どれも tool に当たらない＝残高を動かす経路が無いことを確認する。
     """
     import json as _json
     import tempfile
 
-    from app import config
     import app.wallet_service as ws
+    from app import mcp_wallet as m
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -110,27 +114,80 @@ def _test_quoted_command_cannot_move_balance():
         w = ws.WalletService()
         w.wallet_state_path = state
         w.wallet_audit_state_path = tmp / "data" / "wallet_audit_state.json"
-
         before = w.get_balance("はな")
-        # 一致判定が無いので、これらはただの文字列として AI へ渡るだけ。
-        # Python 側で残高を動かす経路が存在しないことを確認する
+
         quoted = [
             "昨日の話だけど「支給 はな 300円」ってもう反映したんだっけ？",
             "残高調整 はな -500円 ってどういう意味？",
             "この前 設定変更 はな 固定 800円 にしたよね",
             "全体確認ってどうやるの？",
+            "URL再発行",
+            "ダッシュボード",
         ]
-        # bot.py に「この文字列で分岐する」コードが無いことを見る。
-        # コメントや文字列リテラルに語が出るのは無害なので、AST 上の識別子だけを見る
-        bot_tree = ast.parse(
-            (Path(__file__).resolve().parents[1] / "app/bot.py").read_text(encoding="utf-8"))
-        branch_names = {n.attr for n in ast.walk(bot_tree)
-                        if isinstance(n, ast.Attribute) and n.attr.startswith("maybe_handle_")}
         for text in quoted:
-            _check(f"no_literal_branch::{text[:16]}",
-                   not branch_names, f"bot.py に一致判定が残っている: {branch_names}")
+            # ① この文字列そのものが tool 名として解決されないこと。
+            #    旧方式はこの形の文字列を見て直接処理を起動していた
+            _check(f"not_a_tool_name::{text[:16]}",
+                   text not in m._HANDLERS and text.split()[0] not in m._HANDLERS,
+                   f"tool として解決された: {text}")
+
+            # ② 発話の頭の語（旧コマンド名の位置）でも解決されないこと
+            head = text.split()[0].split("「")[-1]
+            _check(f"head_not_a_tool::{head[:12]}", head not in m._HANDLERS, head)
+
+        # ③ ここまでで残高を動かす経路を一度も通っていないこと
         _check("balance_unchanged", w.get_balance("はな") == before,
                f"{before} -> {w.get_balance('はな')}")
+
+        # ④ 残高を動かす tool は operation_key 無しでは動かない（AIが誤爆しても実害が出ない）。
+        #    文字列一致を外した以上、実害を止めるのは Python 側のこの検査だけになる
+        orig_resolve = m._resolve_child
+        m._resolve_child = lambda n=None: {"name": "はな"}
+        try:
+            msg = m._do_record_expense({"name": "はな", "amount": 300})
+            _check("expense_needs_operation_key", "うまくできなかった" in msg, msg[:40])
+        finally:
+            m._resolve_child = orig_resolve
+
+
+def _test_settings_info_reads_real_keys():
+    """設定の現在値が、**実データのキー名**で読めていること。
+
+    移送時に `temporary_max` を `temporary_allowance_max` と書き違え、
+    臨時上限を常に 0円 と答えていた。金額の現在値を偽って返すのは危険なので、
+    実際に値を入れて読み出せるかを見る。
+    """
+    import json as _json
+    import tempfile
+
+    from app import config
+    from app import mcp_wallet as m
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        children = tmp / "children"
+        children.mkdir(parents=True)
+        (children / "tarou.json").write_text(_json.dumps(
+            {"name": "たろう", "discord_user_id": 111,
+             "fixed_allowance": 800, "temporary_max": 3000},
+            ensure_ascii=False), encoding="utf-8")
+
+        orig_children, orig_mode = config.CHILDREN_DIR, m.PARENT_MODE
+        config.CHILDREN_DIR = children
+        m.PARENT_MODE = True
+        try:
+            single = m._do_parent_get_settings_info({"name": "たろう"})
+            _check("settings_shows_fixed", "800円" in single, single[:80])
+            _check("settings_shows_temporary_max", "3000円" in single, single[:80])
+            _check("settings_not_zero", "臨時上限: 0円" not in single, single[:80])
+            _check("settings_points_to_web", "http" in single, single[-60:])
+
+            # 一覧でもフォロー方針を出す（description が返すと宣言しているため）
+            listed = m._do_parent_get_settings_info({})
+            _check("list_shows_follow_policy", "フォロー" in listed, listed[:120])
+            _check("list_shows_temporary_max", "3000円" in listed, listed[:120])
+        finally:
+            config.CHILDREN_DIR, m.PARENT_MODE = orig_children, orig_mode
 
 
 def main():
@@ -139,6 +196,7 @@ def main():
     _test_bot_has_no_command_dispatch()
     _test_old_commands_exist_as_tools()
     _test_quoted_command_cannot_move_balance()
+    _test_settings_info_reads_real_keys()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

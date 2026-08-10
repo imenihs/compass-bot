@@ -188,12 +188,25 @@ def split_user_key(user_key: str) -> tuple[str, str]:
 DM_QUEUE_PATH = ROOT / "data" / "dashboard_dm_queue.json"
 # bot プロセスにしかできない送信処理（一斉通知・安全設定チェック）の依頼キュー
 ACTION_QUEUE_PATH = ROOT / "data" / "bot_action_queue.json"
+# 依頼キューの上限。毎ターン消化するので通常は数件。異常時の暴走を止めるためだけの値
+_ACTION_QUEUE_MAX = 50
 
 
-def _dm_queue_lock():
-    """DMキュー用のプロセス間ロック。"""
+def _queue_lock(path: Path):
+    """キュー用のプロセス間ロック。**キューごとに別のロックを取る**。
+
+    当初は1つのロックを DM とアクションで共用していた。壊れはしないが、
+    ロック名が実態と食い違い（DM 用のロックがアクションを守っている）、
+    後から片方に専用ロックを足された瞬間に無防備になる。名前と対象を一致させる。
+
+    Args:
+        path: 守るキューファイルのパス。
+
+    Returns:
+        プロセス間ロックのコンテキストマネージャ。
+    """
     from app.wallet_service import _interprocess_lock as _lk
-    return _lk(DM_QUEUE_PATH.with_suffix(".json.lock"))
+    return _lk(path.with_suffix(".json.lock"))
 
 
 def request_bot_action(kind: str, payload: dict) -> None:
@@ -206,7 +219,7 @@ def request_bot_action(kind: str, payload: dict) -> None:
         kind: 依頼の種類（broadcast_usage_guide / safety_setup_check）。
         payload: 依頼ごとの引数。
     """
-    with _LOCK, _dm_queue_lock():
+    with _LOCK, _queue_lock(ACTION_QUEUE_PATH):
         try:
             doc = json.loads(ACTION_QUEUE_PATH.read_text(encoding="utf-8")) \
                 if ACTION_QUEUE_PATH.exists() else []
@@ -215,7 +228,13 @@ def request_bot_action(kind: str, payload: dict) -> None:
         except (OSError, json.JSONDecodeError):
             doc = []
         doc.append({"kind": str(kind), "payload": payload or {}, "ts": now_jst_iso()})
-        doc = doc[-20:]  # 溜まり続けないよう直近だけ残す
+        # 暴走時の歯止めとして上限を持つが、**捨てたことは必ず残す**。
+        # 毎ターン消化するので通常は数件で、ここに引っかかるのは異常時だけ。
+        # 無言で正当な依頼を落とすと「頼んだのに何も起きない」になる
+        if len(doc) > _ACTION_QUEUE_MAX:
+            dropped = len(doc) - _ACTION_QUEUE_MAX
+            doc = doc[-_ACTION_QUEUE_MAX:]
+            print(f"[dashboard_token] action queue overflow: dropped {dropped} request(s)")
         ACTION_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(ACTION_QUEUE_PATH.parent), suffix=".tmp")
         try:
@@ -234,7 +253,7 @@ def take_bot_actions() -> list[dict]:
     Returns:
         list[dict]: [{"kind": str, "payload": dict}, ...] 積まれた順。
     """
-    with _LOCK, _dm_queue_lock():
+    with _LOCK, _queue_lock(ACTION_QUEUE_PATH):
         try:
             doc = json.loads(ACTION_QUEUE_PATH.read_text(encoding="utf-8")) \
                 if ACTION_QUEUE_PATH.exists() else []
@@ -262,7 +281,7 @@ def request_dm(discord_user_id: int, user_key: str, role: str) -> None:
         user_key: どのダッシュボードか（child:test / parent:akira）。
         role: child / parent。
     """
-    with _LOCK, _dm_queue_lock():
+    with _LOCK, _queue_lock(DM_QUEUE_PATH):
         try:
             doc = json.loads(DM_QUEUE_PATH.read_text(encoding="utf-8")) \
                 if DM_QUEUE_PATH.exists() else {}
@@ -270,7 +289,12 @@ def request_dm(discord_user_id: int, user_key: str, role: str) -> None:
                 doc = {}
         except (OSError, json.JSONDecodeError):
             doc = {}
-        doc[str(int(discord_user_id))] = {
+        # **キーは (Discord ID, user_key) の組**。ID だけにすると兼務アカウント
+        # （同じ人が親としても子としても登録されている。実データに存在する）で
+        # 子の要求が親の要求に上書きされ、子のURLが永久に届かなくなる。
+        # 同じ組の連打は上書きしてよい（1通だけ届く）。
+        doc[f"{int(discord_user_id)}\t{user_key}"] = {
+            "discord_user_id": int(discord_user_id),
             "user_key": user_key, "role": role, "ts": now_jst_iso(),
         }
         DM_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -291,7 +315,7 @@ def take_dm_requests() -> list[dict]:
     Returns:
         list[dict]: [{"discord_user_id": int, "user_key": str, "role": str}, ...]
     """
-    with _LOCK, _dm_queue_lock():
+    with _LOCK, _queue_lock(DM_QUEUE_PATH):
         try:
             doc = json.loads(DM_QUEUE_PATH.read_text(encoding="utf-8")) \
                 if DM_QUEUE_PATH.exists() else {}
@@ -304,10 +328,13 @@ def take_dm_requests() -> list[dict]:
         except OSError:
             pass
     out = []
-    for uid, meta in doc.items():
+    for key, meta in doc.items():
         if not isinstance(meta, dict):
             continue
         try:
+            # 旧形式（キーが ID だけ・値に discord_user_id が無い）も読めるようにする。
+            # 移行時にキューへ残っていた依頼を落とさないため
+            uid = meta.get("discord_user_id", str(key).split("\t")[0])
             out.append({
                 "discord_user_id": int(uid),
                 "user_key": str(meta.get("user_key", "")),
