@@ -337,6 +337,40 @@ def _tool_defs() -> list[dict]:
             },
         },
         {
+            "name": "add_expense_detail",
+            "description": (
+                "**買ったあとの気持ち**を記録する。残高は動かさない。\n"
+                "子が「買ってよかった」「思ったよりイマイチだった」のように"
+                "**使ってみた感想**を話したときに呼ぶ。"
+                "満足度は 0〜10 で、本人が数字で言わなければ会話から読み取ってよい"
+                "（すごく満足=9、まあまあ=5、後悔してる=2 くらいの目安）。\n"
+                "直前に記録した買い物へ自動でひもづくので、どの買い物かを指定しなくてよい。"
+                "**買った直後に無理に聞かないこと。**次に話しかけてきたときや、"
+                "話の流れで自然に出たときに拾えばよい。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "子どもの名前"},
+                    "item": {
+                        "type": "string",
+                        "description": (
+                            "**何についての感想か**（例: マンガ、おかし）。"
+                            "直前に記録した買い物と同じ言葉にすること。"
+                            "これが合っていないと、その買い物にひもづかない"
+                        ),
+                    },
+                    "reason": {"type": "string", "description": "なぜ買ったか・使ってみてどうだったか"},
+                    "satisfaction": {
+                        "type": "integer",
+                        "description": "満足度 0〜10。分からなければ省略する",
+                    },
+                    "operation_key": op_key,
+                },
+                "required": ["item", "operation_key"],
+            },
+        },
+        {
             "name": "report_wallet_balance",
             "description": (
                 "**財布チェック**。子が実際に財布を数えて「今いくら入っていたか」を報告したときに呼ぶ。"
@@ -1101,6 +1135,140 @@ def _do_contribute_to_goal(args: dict) -> str:
                 f"\n{applied}円{verb}。残高は {balance}円。{extra}")
     return (f"{applied}円{verb}よ。「{title}」は {accumulated}/{target}円になった。"
             f"\n残高は {balance}円。")
+
+
+def _latest_purchase_item(journal_path) -> str:
+    """お小遣い帳の直近の買い物から品目を1つ返す。無ければ空文字。
+
+    感想の tool で品目が省略されたときの保険。
+    learning_insights は品目の一致で突合するため、空のままだと紐づかない。
+
+    Args:
+        journal_path: pocket_journal のパス。
+
+    Returns:
+        str: 直近の買い物の品目。
+    """
+    try:
+        if not journal_path.exists():
+            return ""
+        lines = [x for x in journal_path.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()]
+        for line in reversed(lines[-30:]):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # 補足行ではなく、実際の買い物の行から拾う
+            if str(row.get("action", "")) == "expense_supplement":
+                continue
+            item = str(row.get("item", "") or "").strip()
+            if item:
+                return item
+    except OSError:
+        pass
+    return ""
+
+
+def _do_add_expense_detail(args: dict) -> str:
+    """買ったあとの理由・満足度を記録する。**残高は動かさない**。
+
+    **この機能は一度失われていた**（2026/08/11 復旧）。
+    旧 `_write_expense_optional` が文字列一致ハンドラの一部で、
+    intent 方式への移行で到達不能になったあと削除された。
+    読む側（learning_insights の SUPPLEMENT_ACTIONS と突合ロジック）は
+    完成したまま残っており、**書き手だけが無い**状態だった。
+
+    そのため満足度が永久に null のままで、
+    `low_satisfaction_high_amount`（高い買い物なのに満足度が低かった）の会話カードが出ず、
+    AI フォロー方針「満足度の振り返り」が実質機能していなかった。
+
+    どの買い物に紐づくかは指定しない。learning_insights が
+    **36時間以内の支出**へ自動で突合する（`_merge_supplement_into_purchase`）。
+    会話の中で自然に出た感想を、そのまま置いておけばよい設計になっている。
+
+    Args:
+        args: name / item（任意）/ reason（任意）/ satisfaction（0〜10・任意）/ operation_key。
+
+    Returns:
+        str: 子への短い返し。
+    """
+    conf = _resolve_child(str(args.get("name", "")))
+    if conf is None:
+        return "ごめん、うまく記録できなかったよ。"
+    op_key = str(args.get("operation_key") or "").strip()
+    if not op_key:
+        return "ちょっとうまくできなかったよ。もう一度ゆっくり教えてくれる？"
+
+    reason = str(args.get("reason", "") or "").strip()
+    raw_sat = args.get("satisfaction")
+    satisfaction = None
+    if raw_sat is not None:
+        try:
+            satisfaction = int(raw_sat)
+        except (TypeError, ValueError):
+            satisfaction = None
+        # 0〜10 の外は「読み取れなかった」として捨てる。範囲外を入れると分析が歪む
+        if satisfaction is not None and not (0 <= satisfaction <= 10):
+            satisfaction = None
+
+    # 理由も満足度も無ければ書く意味が無い
+    if not reason and satisfaction is None:
+        return "うんうん、教えてくれてありがとう。"
+
+    name = str(conf.get("name", ""))
+    journal = config.get_log_dir(_system_conf()) / f"{name}_pocket_journal.jsonl"
+
+    # **item は突合の鍵**。learning_insights は「品目が一致する36時間以内の支出」へ
+    # 紐づける（_find_supplement_target）ため、ここが空だと永久にマージされない。
+    # AI が省略したときは直近の支出から補う。
+    item = str(args.get("item", "") or "").strip()
+    if not item:
+        item = _latest_purchase_item(journal)
+
+    # 残高を動かさない tool なので applied_operation_keys は使わない
+    # （あれを消費すると、同じキーで残高操作が来たとき弾いてしまう）。
+    # 代わりに**直近の supplement 行と内容が同じか**で二重記録を防ぐ。
+    # AI が言い直しで2回呼んでも、同じ感想が2行並ぶことはない。
+    try:
+        if journal.exists():
+            tail = [x for x in journal.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()][-5:]
+            for line in tail:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(row.get("action", "")) != "expense_supplement":
+                    continue
+                if str(row.get("reason", "")) == reason and row.get("satisfaction") == satisfaction:
+                    return "それはさっき教えてくれたね。おぼえてるよ。"
+    except OSError:
+        pass
+
+    try:
+        from app.storage import append_jsonl, now_jst_iso
+        from app.bot_utils import _rough_word_count
+
+        append_jsonl(journal, {
+            "ts": now_jst_iso(),
+            "name": name,
+            # learning_insights の SUPPLEMENT_ACTIONS が拾う目印
+            "action": "expense_supplement",
+            "source": "supplement",
+            "item": item,
+            "reason": reason,
+            "reason_word_count": _rough_word_count(reason),
+            "satisfaction": satisfaction,
+            # 補足行なので金額は持たない（元の支出行が持っている）
+            "amount": None,
+        })
+    except Exception:  # noqa: BLE001 - 記録の失敗で会話を止めない
+        return "うんうん、教えてくれてありがとう。"
+
+    if satisfaction is not None and satisfaction <= 3:
+        return "そっか、思ってたのとちがったんだね。それも大事な発見だよ。おぼえておくね。"
+    if satisfaction is not None and satisfaction >= 8:
+        return "いい買いものだったんだね！おぼえておくね。"
+    return "教えてくれてありがとう。おぼえておくね。"
 
 
 def _do_report_wallet_balance(args: dict) -> str:
@@ -2392,6 +2560,7 @@ _HANDLERS = {
     "get_savings_goals": _do_get_savings_goals,
     "get_dashboard_url": _do_get_dashboard_url,
     "reissue_dashboard_url": _do_reissue_dashboard_url,
+    "add_expense_detail": _do_add_expense_detail,
     "report_wallet_balance": _do_report_wallet_balance,
     "get_hotlines": _do_get_hotlines,
     "record_money_safety_concern": _do_record_money_safety_concern,

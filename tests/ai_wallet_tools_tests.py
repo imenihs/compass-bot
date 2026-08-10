@@ -227,6 +227,97 @@ def _test_wallet_check_clears_pending():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_expense_detail_feeds_insight_cards():
+    """買ったあとの感想が、会話カードまで届くこと（2026/08/11 の回帰）。
+
+    旧 `_write_expense_optional` が消えており、**書き手だけが無い**状態だった。
+    読む側（learning_insights の SUPPLEMENT_ACTIONS と突合ロジック）は完成していたため、
+    満足度が永久に null のままで `low_satisfaction_high_amount` のカードが出ず、
+    AI フォロー方針「満足度の振り返り」が実質機能していなかった。
+
+    ここでは「支出 → あとで感想」の実際の流れを作り、
+    親向けの会話カードが出るところまで通しで確認する。
+    """
+    import datetime
+    import tempfile
+
+    from app import config, learning_insights as li, mcp_wallet as m
+    import app.wallet_service as ws
+
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "logs").mkdir()
+    (tmp / "settings").mkdir()
+    (tmp / "settings" / "system.json").write_text(
+        json.dumps({"log_dir": str(tmp / "logs")}), encoding="utf-8")
+    (tmp / "settings" / "setting.json").write_text("{}", encoding="utf-8")
+    (tmp / "w.json").write_text(json.dumps(
+        {"users": {"たろう": {"expected_balance": 20000}}, "applied_operation_keys": {}},
+        ensure_ascii=False), encoding="utf-8")
+
+    orig = (config.SYSTEM_PATH, config.SETTING_PATH, m._wallet, m._resolve_child)
+    config.SYSTEM_PATH = tmp / "settings" / "system.json"
+    config.SETTING_PATH = tmp / "settings" / "setting.json"
+    w = ws.WalletService()
+    w.wallet_state_path = tmp / "w.json"
+    w.wallet_audit_state_path = tmp / "a.json"
+    m._wallet = w
+    m._resolve_child = lambda n=None: {"name": "たろう"}
+    try:
+        # 小さい買い物をいくつか（比較の母数）＋高額の1件
+        for i, (amt, item) in enumerate([(150, "おかし"), (200, "ジュース"), (180, "アイス")]):
+            m._do_record_expense({"name": "たろう", "amount": amt, "item": item,
+                                  "operation_key": f"e{i}"})
+        m._do_record_expense({"name": "たろう", "amount": 2500, "item": "マンガ",
+                              "operation_key": "e9"})
+        before = w.get_balance("たろう")
+
+        # あとから感想を足す（残高は動かない）
+        msg = m._do_add_expense_detail({
+            "name": "たろう", "item": "マンガ",
+            "reason": "思ったより早く読み終わった", "satisfaction": 2,
+            "operation_key": "s1"})
+        _check("detail_does_not_move_balance", w.get_balance("たろう") == before,
+               w.get_balance("たろう"))
+        _check("detail_replies_to_low_satisfaction", "ちがった" in msg, msg[:40])
+
+        # 同じ感想を二度書かない
+        again = m._do_add_expense_detail({
+            "name": "たろう", "item": "マンガ",
+            "reason": "思ったより早く読み終わった", "satisfaction": 2,
+            "operation_key": "s2"})
+        _check("detail_is_deduped", "さっき教えてくれた" in again, again[:40])
+
+        # 0〜10 の外は捨てる（分析が歪むため）
+        rows_before = len((tmp / "logs" / "たろう_pocket_journal.jsonl").read_text(
+            encoding="utf-8").splitlines())
+        m._do_add_expense_detail({"name": "たろう", "item": "マンガ",
+                                  "satisfaction": 99, "operation_key": "s3"})
+        rows_after = len((tmp / "logs" / "たろう_pocket_journal.jsonl").read_text(
+            encoding="utf-8").splitlines())
+        _check("detail_rejects_out_of_range", rows_after == rows_before,
+               f"{rows_before} -> {rows_after}")
+
+        # learning_insights が突合し、満足度カードを出すところまで通す
+        res = li.build_learning_insights(
+            {"name": "たろう", "age": 11, "fixed_allowance": 1000,
+             "ai_follow_policy": {"enabled": True, "focus_area": "satisfaction_reflection"}},
+            {"log_dir": str(tmp / "logs")}, {}, days=90)
+        merged = [n for n in res.get("source_notes", []) if "補足" in n]
+        _check("insights_merged_supplement", bool(merged), res.get("source_notes"))
+
+        types = [c.get("type") for c in res.get("insight_cards", [])]
+        _check("insights_emits_satisfaction_card",
+               "low_satisfaction_high_amount" in types, types)
+        card = next((c for c in res.get("insight_cards", [])
+                     if c.get("type") == "low_satisfaction_high_amount"), {})
+        ev = card.get("evidence", {})
+        _check("card_uses_merged_satisfaction", ev.get("satisfaction") == 2, ev.get("satisfaction"))
+        _check("card_uses_merged_amount", ev.get("amount") == 2500, ev.get("amount"))
+    finally:
+        config.SYSTEM_PATH, config.SETTING_PATH, m._wallet, m._resolve_child = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> None:
     tmp = Path(tempfile.mkdtemp())
     _setup(tmp)
@@ -373,6 +464,7 @@ def main() -> None:
     _test_expense_writes_pocket_journal()
 
     _test_wallet_check_clears_pending()
+    _test_expense_detail_feeds_insight_cards()
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
         print(json.dumps(x, ensure_ascii=False))

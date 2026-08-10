@@ -95,6 +95,8 @@ ALLOWED_WALLET_TOOLS = [
     "mcp__wallet__record_income",
     # 財布チェック（実際に数えた金額の報告）。帳簿をそれに合わせる
     "mcp__wallet__report_wallet_balance",
+    # 買ったあとの感想（理由・満足度）。残高は動かさない
+    "mcp__wallet__add_expense_detail",
     "mcp__wallet__get_savings_goals",
     "mcp__wallet__set_savings_goal",
     # 目標への積立・立て替えの返済（貯金と返済は同じ構造なので同じtool）
@@ -373,7 +375,10 @@ def _build_system_prompt(user_conf: dict, current_balance: int | None = None) ->
         "get_savings_goals で一覧を見せて「どれに？」と聞き返すこと。勝手に選ばない。\n"
         "- 残高を聞かれたら、必ず get_balance を呼ぶこと（記憶や推測で答えない）。\n"        "- 「さいふに◯円あった」「数えたら◯円だった」と**実際に数えた金額**を言われたら、"
         "必ず report_wallet_balance を呼ぶこと。帳簿とちがっていたら、ちゃんと合わせるよ。\n"
-        "  ただし「いまいくら？」と聞かれただけのときは get_balance を使う（report のほうは呼ばない）。\n"
+        "  ただし「いまいくら？」と聞かれただけのときは get_balance を使う（report のほうは呼ばない）。\n"        "- 「買ってよかった」「思ったよりイマイチだった」のように**使ってみた感想**が出たら、"
+        "add_expense_detail で残しておくこと。あとで自分の買いものを振り返る材料になる。\n"
+        "  **買った直後に無理に聞かないこと。**次に話しかけてきたときや、"
+        "話の流れで自然に出たときに拾えばいい。\n"
         "【じぶんのダッシュボードのURL】\n"
         "- 「ダッシュボードが見たい」「URLおしえて」のように**見たいだけ**なら get_dashboard_url を呼ぶ。\n"
         "- 「URLを作りなおして」「まえのを使えなくして」と**言われたときだけ** reissue_dashboard_url を呼ぶ。"
