@@ -313,14 +313,14 @@ def _tool_defs() -> list[dict]:
         {
             "name": "get_dashboard_url",
             "description": (
-                "**自分の**ダッシュボードのURLを教える。"
-                "親が聞いたら親のまとめページ（全員の残高・設定・立て替えの登録）、"
-                "子が聞いたらその子のページ（カレンダー・目標のグラフ・シミュレータ）を返す。"
+                "ダッシュボードの**受け取り方**を案内する。"
                 "『ダッシュボード見たい』『URL教えて』『じぶんのページある？』"
                 "『グラフ見たい』のように聞かれたら呼ぶ。"
-                "**誰のを出すか聞き返す必要はない**（呼んだ本人のものが返る）。"
-                "**再発行はしない**（見たいだけなのに作り直すと、ほかの端末で開いていた"
-                "URLが使えなくなる）。作り直したいときは『URL再発行』と打つよう案内すること。"
+                "**この tool は URL を返さない**。URL は DM で届く仕組みなので、"
+                "戻り値の案内文をそのまま伝えること。"
+                "**自分で URL を組み立てて答えてはいけない**"
+                "（チャンネルに出すと、もう一人の親に自分専用URLが見えてしまう）。"
+                "誰のを出すか聞き返す必要もない（本人のものが届く）。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -891,72 +891,34 @@ def _do_contribute_to_goal(args: dict) -> str:
 
 
 def _do_get_dashboard_url(args: dict) -> str:
-    """自分のダッシュボードURLを教える。**再発行はしない**。
+    """ダッシュボードの見方を案内する。**URL 自体はここでは返さない**。
 
-    親モードなら親のまとめページ、子モードならその子のページを返す。
-    どちらも「見たい」だけなので作り直さない
-    （他の端末で開いていた古いURLが無効になり困る）。
+    **なぜ URL を返さないのか**（2026/08/10・実機で発覚）:
+    AI の応答は必ずチャンネルへ出る。親チャンネルは夫婦2人が見ているため、
+    ここで URL を返すと**相手にも自分専用 URL が見えてしまう**。
+    1人1UUID にした意味（片方だけ失効できる・誰が操作したか分かる）が失われる。
+
+    URL の配布は **DM を使うコマンド経路**（handlers_parent の
+    maybe_handle_url_reissue → _send_dashboard_url）に任せる。
+    この tool は「どうやって受け取るか」を伝えるだけにする。
 
     Args:
-        args: name（子モードのときの子の名前。親モードでは無視される）。
+        args: 使わない（互換のため受ける）。
 
     Returns:
-        str: URL を含む案内文。
+        str: 受け取り方の案内文。**URL は含まない**。
     """
-    from app import config as _config
-    from app import dashboard_token as _dt
-
     if PARENT_MODE:
-        # 親のまとめページ。**どの親か**は環境変数の Discord ID から引く
-        parent_id = int(os.environ.get("COMPASS_PARENT_DISCORD_ID", "0") or 0)
-        if parent_id <= 0:
-            return "ダッシュボードのURLは、親チャンネルで「ダッシュボード」と送ると届くよ。"
-        stem = None
-        for path in sorted(_config.PARENTS_DIR.glob("*.json")):
-            if path.name.endswith(".example.json"):
-                continue
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    if int(json.load(f).get("discord_user_id", 0) or 0) == parent_id:
-                        stem = path.stem
-                        break
-            except (OSError, json.JSONDecodeError, TypeError, ValueError):
-                continue
-        if stem is None:
-            return "あなたの登録が見つかりませんでした。設定ファイルを確認してください。"
-        role, user_key = _dt.ROLE_PARENT, _dt.build_user_key(_dt.ROLE_PARENT, stem)
-        head = "あなたのダッシュボードだよ。全員の残高・設定・立て替えの登録ができる。"
-    else:
-        conf = _resolve_child(str(args.get("name", "")))
-        if conf is None:
-            return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
-        name = str(conf.get("name", ""))
-        stem = None
-        for path in sorted(_config.CHILDREN_DIR.glob("*.json")):
-            if path.name.endswith(".example.json"):
-                continue
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    if str(json.load(f).get("name", "")).strip() == name:
-                        stem = path.stem
-                        break
-            except (OSError, json.JSONDecodeError):
-                continue
-        if stem is None:
-            return "ごめん、きみの登録が見つからなかったよ。おうちの人に聞いてみてね。"
-        role, user_key = _dt.ROLE_CHILD, _dt.build_user_key(_dt.ROLE_CHILD, stem)
-        head = "きみのダッシュボードだよ。ひらいてブックマークしてね。"
-
-    token = _dt.find_active_token(user_key)
-    if token is None:
-        # まだ発行されていないときだけ作る（見るたびに作り直さない）
-        token = _dt.issue(user_key, role, issued_by="chat")
-    base_url = _config.get_web_base_url().rstrip("/")
-    # 山括弧で囲んで Discord のリンクプレビューを抑止する（UUIDがDiscord側ログに残るのを防ぐ）
+        return (
+            "ダッシュボードのURLは、**DMで**お送りします。\n"
+            "このチャンネルに出すと、もう一人の親にも自分専用URLが見えてしまうためです。\n"
+            "「ダッシュボード」とだけ送ってください。DMで届きます。\n"
+            "（作り直したいときは「URL再発行」と送ってください）"
+        )
     return (
-        f"{head}\n"
-        f"<{base_url}/compass-bot/d/{token}>\n"
-        "（このURLは自分専用だよ。ほかの人に見せないでね）"
+        "ダッシュボードのURLは、じぶんだけに見えるように**DMでおくるね**。\n"
+        "「ダッシュボード」とだけ送ってみて。\n"
+        "（あたらしくしたいときは「URL再発行」だよ）"
     )
 
 def _do_get_savings_goals(args: dict) -> str:

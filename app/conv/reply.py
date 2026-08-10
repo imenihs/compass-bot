@@ -16,6 +16,7 @@
 """
 
 import json
+import re
 from typing import Any
 
 from app import storage
@@ -117,6 +118,49 @@ def record_incoming(
     _rotate_conversation(path)
 
 
+# ダッシュボードURLの形。`/compass-bot/d/<uuid>` を含むものを検出する。
+# AI がこの形を応答に書いても、**チャンネルへは出さない**（下記 _strip_dashboard_url）
+_DASHBOARD_URL_RE = re.compile(r"\S*/compass-bot/d/[0-9a-fA-F-]{8,}\S*")
+
+
+def _strip_dashboard_url(text: str) -> str:
+    """応答からダッシュボードURLを取り除く（Python 側の最後の砦）。
+
+    URL は **DM でしか配らない**（docs/設計_UUID認証方式.md）。
+    親チャンネルは夫婦2人が見ているため、ここに出ると
+    相手にも自分専用URLが見え、1人1UUID にした意味
+    （片方だけ失効できる・誰が操作したか分かる）が失われる。
+
+    プロンプトと tool の説明でも禁じているが、**AI は指示を読み飛ばしうる**ので、
+    出口である send_reply で機械的に落とす。子経路も同じ扱いにする
+    （子チャンネルは親も見ており、他の子には見えないが、
+    そもそも URL を会話へ流さない運用に揃える）。
+
+    Args:
+        text: 送ろうとしている応答本文。
+
+    Returns:
+        str: URL を案内文へ置き換えた本文。
+    """
+    if "/compass-bot/d/" not in text:
+        return text
+    replaced = _DASHBOARD_URL_RE.sub("（URLはDMで送るね）", text)
+    try:
+        # 落としたことを診断ログへ残す。プロンプトが効いていない兆候として追える
+        storage.append_jsonl(
+            deps.get_log_dir() / "runtime_diagnostics.jsonl",
+            {
+                "ts": storage.now_jst_iso(),
+                "event": "dashboard_url_stripped",
+                "details": {"reason": "AI応答にダッシュボードURLが含まれていた"},
+            },
+        )
+    except Exception:
+        # 記録の失敗で応答を止めない
+        pass
+    return replaced
+
+
 async def send_reply(
     channel: Any,
     content: str,
@@ -141,6 +185,9 @@ async def send_reply(
     Returns:
         str: 送った応答の完全な内容（分割前）。空応答なら空文字。
     """
+    # **URL は会話へ出さない**（DM でのみ配る）。AI が書いても出口で落とす
+    content = _strip_dashboard_url(content or "")
+
     # 空応答は送信も記録もしない。空行で会話ログを埋めない
     if not content:
         return ""

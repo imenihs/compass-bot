@@ -479,33 +479,79 @@ def _test_parent_gets_own_dashboard_url():
 
 
 def _test_dashboard_url_tool_does_not_reissue():
-    """AI 経由（tool）でURLを聞いても再発行されないこと。"""
+    """AI 経由（tool）でURLを聞いても、**再発行されない**こと。
+
+    tool は URL を返さない仕様に変えた（会話へURLを出さないため）。
+    ここでは「呼んでもトークンが作り直されない」ことだけを見る。
+    """
     from app import dashboard_token as dt, mcp_wallet as m
 
     tmp = Path(tempfile.mkdtemp())
     try:
         dt.TOKENS_PATH = tmp / "tokens.json"
-        orig_resolve = m._resolve_child
-        m._resolve_child = lambda n=None: {"name": "テスト"}
-        try:
-            first = m._do_get_dashboard_url({"name": "テスト"})
-            token_after_first = dt.find_active_token(
-                dt.build_user_key(dt.ROLE_CHILD, "test"))
-            second = m._do_get_dashboard_url({"name": "テスト"})
-            token_after_second = dt.find_active_token(
-                dt.build_user_key(dt.ROLE_CHILD, "test"))
+        key = dt.build_user_key(dt.ROLE_CHILD, "test")
+        issued = dt.issue(key, dt.ROLE_CHILD)
 
-            _check("tool_returns_url", "/compass-bot/d/" in first, first[:80])
-            _check("tool_same_url_twice", first == second, (first[:40], second[:40]))
-            _check("tool_does_not_reissue",
-                   token_after_first == token_after_second,
-                   (token_after_first, token_after_second))
-            # リンクプレビュー抑止（UUIDがDiscord側ログに残るのを防ぐ）
-            _check("tool_suppresses_preview", "<http" in first, first[:60])
+        orig_resolve, orig_mode = m._resolve_child, m.PARENT_MODE
+        m._resolve_child = lambda n=None: {"name": "テスト"}
+        m.PARENT_MODE = False
+        try:
+            m._do_get_dashboard_url({"name": "テスト"})
+            m._do_get_dashboard_url({"name": "テスト"})
         finally:
-            m._resolve_child = orig_resolve
+            m._resolve_child, m.PARENT_MODE = orig_resolve, orig_mode
+
+        _check("tool_does_not_reissue", dt.find_active_token(key) == issued,
+               (issued[:8], dt.find_active_token(key)))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+def _test_url_never_posted_to_channel():
+    """ダッシュボードURLが**会話へ出ない**こと（Python 側の最後の砦）。
+
+    実機で、親が「ダッシュボードを見たい」と言ったとき
+    AI が親チャンネルへURLをそのまま投稿してしまった。
+    親チャンネルは夫婦2人が見ているため、相手にも自分専用URLが見え、
+    1人1UUID にした意味（片方だけ失効できる）が失われる。
+
+    URL は **DM でしか配らない**。プロンプトと tool の説明でも禁じているが、
+    **AI は指示を読み飛ばしうる**ので、応答の唯一の出口で機械的に落とす。
+    """
+    from app.conv.reply import _strip_dashboard_url
+
+    leaked = ("親用のまとめページ、これ:\n"
+              "https://example.com/compass-bot/d/8e00177896144db4bdf23bc573e657cb\n"
+              "全員の残高が見られる。")
+    stripped = _strip_dashboard_url(leaked)
+    _check("strips_plain_url", "/compass-bot/d/" not in stripped, stripped[:80])
+    _check("keeps_surrounding_text", "全員の残高が見られる" in stripped, stripped[:80])
+
+    # 山括弧つき（プレビュー抑止の形）も落とす
+    bracketed = "<https://example.com/compass-bot/d/abc123def456789>"
+    _check("strips_bracketed_url",
+           "/compass-bot/d/" not in _strip_dashboard_url(bracketed),
+           _strip_dashboard_url(bracketed))
+
+    # URL が無い応答は変えない
+    normal = "残高は37,700円だよ。"
+    _check("keeps_normal_text", _strip_dashboard_url(normal) == normal, normal)
+
+    # tool 自体も URL を返さない（返すと出口で落とされ、案内が壊れるため）
+    from app import mcp_wallet as m
+
+    orig_mode = m.PARENT_MODE
+    try:
+        m.PARENT_MODE = True
+        parent_msg = m._do_get_dashboard_url({})
+        _check("tool_returns_no_url", "/compass-bot/d/" not in parent_msg,
+               parent_msg[:60])
+        _check("tool_explains_dm", "DM" in parent_msg, parent_msg[:60])
+        m.PARENT_MODE = False
+        child_msg = m._do_get_dashboard_url({})
+        _check("tool_child_returns_no_url", "/compass-bot/d/" not in child_msg,
+               child_msg[:60])
+    finally:
+        m.PARENT_MODE = orig_mode
 
 
 def main():
@@ -522,7 +568,7 @@ def main():
     _test_money_ops_notify_discord()
     _test_show_url_does_not_reissue()
     _test_dashboard_url_tool_does_not_reissue()
-    _test_parent_gets_own_dashboard_url()
+    _test_url_never_posted_to_channel()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
