@@ -704,14 +704,6 @@ def _tool_defs() -> list[dict]:
                 "inputSchema": {"type": "object", "properties": {}, "required": []},
             },
             {
-                "name": "parent_safety_setup_check",
-                "description": (
-                    "危険信号（自傷・いじめ等）の通知先が正しく親だけに届くかを、実際に確認メッセージを送って確かめる。"
-                    "親が『安全設定を確認したい』『通知先が合ってるか見て』等と言ったら呼ぶ。残高は変えない。"
-                ),
-                "inputSchema": {"type": "object", "properties": {}, "required": []},
-            },
-            {
                 "name": "parent_get_settings_info",
                 "description": (
                     "固定お小遣い・臨時上限・AIフォロー方針の**現在値**と、変更用のWebダッシュボードの案内を返す。"
@@ -2477,26 +2469,6 @@ def _do_parent_broadcast_usage_guide(args: dict) -> str:
     return "使い方の説明を全チャンネルへ送ります。結果はこのあと報告します。"
 
 
-def _do_parent_safety_setup_check(args: dict) -> str:
-    """危険信号の通知先を実際に送って確かめるよう bot へ依頼する。
-
-    設定ミスはコードでは防げず、送ってみて初めて「子に見えている」が分かる。
-
-    Returns:
-        str: 受け付けた旨の案内。
-    """
-    if not PARENT_MODE:
-        return "この操作は親だけができるよ。"
-    from app import config as _config
-    from app import dashboard_token as _dt
-
-    # 判定結果は親チャンネルへ返す。未設定だと最も重要な警告
-    # （「通知先が未設定＝危険信号がどこにも届かない」）が誰にも届かない
-    if not _config.get_parent_channel_id():
-        return ("親チャンネル（parent_channel_id）が未設定のため、チェック結果を報告できません。\n"
-                "設定してから、もう一度たのんでください。")
-    _dt.request_bot_action("safety_setup_check", {})
-    return "安全設定のチェックを始めます。確認用のメッセージを送るので、届いた場所を見てください。"
 
 
 def _do_parent_get_settings_info(args: dict) -> str:
@@ -2583,7 +2555,6 @@ _HANDLERS = {
     "parent_list_overview": _do_parent_list_overview,
     "parent_get_usage_guide": _do_parent_get_usage_guide,
     "parent_broadcast_usage_guide": _do_parent_broadcast_usage_guide,
-    "parent_safety_setup_check": _do_parent_safety_setup_check,
     "parent_get_settings_info": _do_parent_get_settings_info,
 }
 

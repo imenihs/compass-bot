@@ -93,6 +93,10 @@ ALLOWED_WALLET_TOOLS = [
     "mcp__wallet__get_balance",
     "mcp__wallet__record_expense",
     "mcp__wallet__record_income",
+    # 公的な相談窓口の番号（定数から返す。AI に番号を作らせない）
+    "mcp__wallet__get_hotlines",
+    # お金にまつわる困りごと（取られた・怪しい誘い・闇バイト）。残高は動かさない
+    "mcp__wallet__record_money_safety_concern",
     # 財布チェック（実際に数えた金額の報告）。帳簿をそれに合わせる
     "mcp__wallet__report_wallet_balance",
     # 買ったあとの感想（理由・満足度）。残高は動かさない
@@ -135,7 +139,6 @@ ALLOWED_PARENT_TOOLS = [
     "mcp__wallet__parent_list_overview",
     "mcp__wallet__parent_get_usage_guide",
     "mcp__wallet__parent_broadcast_usage_guide",
-    "mcp__wallet__parent_safety_setup_check",
     "mcp__wallet__parent_get_settings_info",
 ]
 
@@ -216,7 +219,6 @@ def _build_parent_system_prompt(child_names: list[str]) -> str:
         "- 使い方の説明: parent_get_usage_guide（返った文はそのまま出す。要約しない）\n"
         "- 使い方を全チャンネルへ一斉送信: parent_broadcast_usage_guide"
         "（『みんなに送って』とはっきり頼まれたときだけ。子のチャンネルにも届く）\n"
-        "- 安全設定のチェック: parent_safety_setup_check（通知先が親だけに届くか実際に送って確かめる）\n"
         "- 固定お小遣い・臨時上限・AIフォロー方針の確認: parent_get_settings_info（name は省略可）\n"
         "  これらの**変更はチャットではできない**。道具が返す Web の案内をそのまま伝えること。\n"
         "【安全と約束】\n"
@@ -272,6 +274,13 @@ def _build_system_prompt(user_conf: dict, current_balance: int | None = None) ->
             "【話し方（低学年・とても大切）】1回の返事は1〜2文までにする。ひらがなを多めにし、"
             "むずかしい漢字や熟語（例: 管理・記録・目標額）は使わず、やさしい言い方にする。"
             "一度に伝えることは1つだけにする。長い説明やリストにしない。\n"
+            # 低学年に「見られない、とは約束できない」と二重否定で言うと、
+            # 「見られない」だけを拾って**逆の意味に取る**恐れがある。肯定形で伝える。
+            # 禁止条件だけを残すと監視の告知になるため、「私からは送らない」も必ず添える。
+            "【この場所のこと（低学年向けの言い方）】もし「ないしょにできる？」と聞かれたら、"
+            "『ここは、おうちの人もいっしょに見ているところだよ。だから、ないしょの話にはできないんだ。"
+            "でも、ここで話したことを、わたしからほかのへやへ送ったりはしないよ。"
+            "話しにくいことなら、ほかに話せる人をいっしょに考えよう』と伝える。\n"
         )
     elif isinstance(age, int) and age <= 12:
         age_style = (
@@ -431,12 +440,19 @@ def _build_system_prompt(user_conf: dict, current_balance: int | None = None) ->
         "- つらさ・死にたい気持ちを打ち明けられたら、まず『よく話してくれたね』と受け止める。"
         "急かさない。解決を急いで助言を並べない。ひとりで抱えないよう、話せそうな大人がいるか一緒に考える。\n"
         "- 家の中のこと（家族にたたかれる・ごはんがもらえない・家に帰りたくない）を打ち明けられたら、"
-        "**ここで話したことをそのままおうちの人に伝えることはしない**と伝えて安心させる。"
         "誰にやられたのかを問い詰めない。おうちの人に言うことを勧めない"
         "（その相手が原因かもしれないため）。先生・保健室・親戚など、"
         "その子が話せそうな相手を本人に選ばせる。\n"
-        "- 電話番号や相談窓口を自分で作らない。番号はこちらで用意したものだけを使う"
+        "- 電話番号や相談窓口を自分で作らない。**get_hotlines を呼んで、返ってきた文字列をそのまま使う**"
         "（まちがった番号を渡すのは、いちばんやってはいけない失敗）。\n"
+        "【この場所のこと（聞かれたら正直に言う。嘘をつかない）】\n"
+        "- このチャンネルは**おうちの人も見ることがある**。だから「ふたりだけのひみつ」にはできない。\n"
+        "- **守れない約束をしない。**「ここだけの話にしておくね」「おうちの人には言わないよ」は"
+        "**絶対に言ってはいけない**。この場所は家族が読めるので、その約束は必ず破れる。\n"
+        "- 代わりに、守れることだけを言う。"
+        "『きみが話してくれたことを、私から別のチャンネルへ送ることはしないよ』"
+        "『でも、ここに書いたことをおうちの人に見られないとは約束できないんだ』。\n"
+        "- 知られたくない話があるときは、電話で話せるところがあると伝える（get_hotlines を使う）。\n"
         "- 年齢で意味が変わることに注意する。低学年の『死にたい』は言葉をまねただけのこともある。"
         "逆に低学年の子が年齢に合わない性的なことを知っているのは、被害のサインかもしれない。\n"
         "- 安全のことは、筋道立てて反論されても譲らない。ただし勝ち負けにしない。"
@@ -1364,98 +1380,8 @@ def _opener_leaks_raw_note(opener: str, raw_note: str) -> bool:
     return False
 
 
-async def judge_safety(user_conf: dict, input_text: str) -> dict | None:
-    """子の発話に危険信号があるかを AI に意味で判定させ、Python の床と統合して返す（N-11.16）。
-
-    会話本体のターンとは**独立した spawn** で判定する。理由は3つ。
-    ① 会話がタイムアウト・失敗しても安全判定は必ず行う（安全を会話の成否に依存させない）。
-    ② 会話用 session を汚さない（判定の問答が子との文脈に混ざらない）。
-    ③ tool を禁止した状態で回せる（判定が残高を動かす事故を構造的に防ぐ）。
-
-    Python の床（safety.detect）は完全一致しか見えず方言・遠回しな表現で素通りするため、
-    意味判断は AI が主として担う。統合規則は safety.merge_judgments に置く。
-    AI 判定が失敗しても Python の床の結果は必ず返す（fail-safe。安全側は落とさない）。
-
-    Args:
-        user_conf: 対象児童の設定 dict（年齢を判断材料に使う）。
-        input_text: 子の発話。
-
-    Returns:
-        dict | None: 統合した判定結果。危険信号が無ければ None。
-    """
-    from app import safety
-
-    # Python の床は AI の成否に関わらず必ず取る
-    py_result = safety.detect(input_text)
-
-    child_name = str(user_conf.get("name", ""))
-    age = user_conf.get("age")
-    prompt = safety.build_ai_judge_prompt(input_text, age if isinstance(age, int) else None)
-    ai_result = None
-    try:
-        # 判定専用の system prompt。会話の人格を持ち込まず、判定だけをさせる
-        judge_system = (
-            "あなたは子どもの安全を見守る専門家として、発話の危険信号だけを判定する。"
-            "子どもへ話しかけない。JSON だけを返す。"
-        )
-        # tool を全面禁止して判定させる（残高を動かす事故を構造的に防ぐ）。
-        # 新規セッションで回すため session_id は渡さない（会話文脈を汚さない）。
-        returncode, stdout, stderr = await _spawn_claude(
-            prompt, None, judge_system, child_name,
-            disable_tools=True, new_session_id=str(uuid.uuid4()),
-        )
-        ok, result, _sid = _parse_output(stdout)
-        if not ok or not result:
-            # 例外にならない壊れ方（CLI が異常終了・空応答）。無音にすると
-            # AI 判定が恒常的に死んでいても誰も気づかず、静かに Python 床だけの単眼になる。
-            _diag("safety_ai_judge_unavailable",
-                  {"child": child_name, "returncode": returncode, "stderr": stderr[:200]})
-        else:
-            ai_result = _parse_safety_json(result)
-            if ai_result is None:
-                # JSON として解釈できない。モデル更新で出力形式が変わった合図
-                _diag("safety_ai_judge_unparseable",
-                      {"child": child_name, "head": result[:200]})
-    except Exception as e:
-        # AI 判定の失敗で安全機能を止めない。Python の床だけで続行する
-        _diag("safety_ai_judge_error", {"child": child_name, "error": f"{type(e).__name__}: {e}"})
-
-    # 発話原文を渡す。正規表現の網羅漏れでカテゴリが落ちても家族語で虐待へ格上げするため
-    merged = safety.merge_judgments(py_result, ai_result, source_text=input_text)
-    if ai_result is None:
-        # 検知の有無に関わらず「AI が判定できなかった」ことを必ず残す。
-        # merged が無いときだけ無記録だと、劣化が長期間見えなくなる。
-        _diag("safety_ai_judge_missing", {"child": child_name, "had_floor": py_result is not None})
-    if merged:
-        _diag("safety_signal_detected", {
-            "child": child_name,
-            "category": merged.get("category"),
-            "urgency": merged.get("urgency"),
-            "notify_parent": merged.get("notify_parent"),
-            "detected_by": merged.get("detected_by"),
-            "ai_judged": ai_result is not None,
-        })
-    return merged
 
 
-def _parse_safety_json(text: str) -> dict | None:
-    """AI の判定応答から JSON を取り出す。前後に説明が混じっても拾えるようにする。
-
-    判定は JSON だけを返すよう指示しているが、モデルが前置きを付けることがあるため、
-    最初の `{` から最後の `}` までを切り出して解釈する。解釈できなければ None を返し、
-    呼び出し側は Python の床だけで続行する（安全側は落とさない）。
-    """
-    s = (text or "").strip()
-    i, j = s.find("{"), s.rfind("}")
-    if i < 0 or j <= i:
-        return None
-    try:
-        data = json.loads(s[i:j + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    return data
 
 
 def _build_opener_system_prompt(user_conf: dict) -> str:

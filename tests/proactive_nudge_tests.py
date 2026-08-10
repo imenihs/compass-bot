@@ -610,11 +610,16 @@ async def test_wallet_audit_uses_channel_name_when_member_cache_empty() -> None:
 
 
 async def test_safety_signal_blocks_proactive_nudge() -> None:
-    """直近に危険信号を出した子へは、こちらから催促しないこと（N-11.16 連携）。
+    """直近にお金の困りごとを打ち明けた子へは、こちらから催促しないこと。
 
-    安全は【処理の優先順位】1) に属しナッジより上位である。
-    つらさを訴えた子へ翌朝スケジューラが「チャレンジどう？」と送るのは害になる。
-    ナッジ経路には安全判定が繋がっていなかったため結線した。
+    つらいことを話した翌朝にスケジューラが「チャレンジどう？」と送るのは害になる。
+
+    **2026/08/11 に読み取り元を変えた。**
+    旧: runtime_diagnostics.jsonl の safety_signal_detected
+        → 書き手が `selected_user` を出しておらず**一度も一致しなかった**（既存バグ）。
+          さらに Python の危険信号判定を全廃したのでイベント自体が出なくなった。
+    新: record_money_safety_concern tool が書く money_safety_concern.jsonl。
+        原文は持たず、kind と対象児だけを持つ。
     """
     import shutil as _shutil
     import tempfile as _tempfile
@@ -625,14 +630,14 @@ async def test_safety_signal_blocks_proactive_nudge() -> None:
     tmp = Path(_tempfile.mkdtemp())
     now = datetime.now(JST)
     recs = [
-        # 2日前に危険信号（猶予3日以内 → 送らない）
-        {"ts": (now - _td(days=2)).isoformat(), "event": "safety_signal_detected",
-         "selected_user": "たろう", "details": {"category": "self_harm"}},
+        # 2日前に「お金を取られた」（猶予3日以内 → 送らない）
+        {"ts": (now - _td(days=2)).isoformat(), "child": "たろう",
+         "kind": "money_taken", "op_hash": "aaaa"},
         # 10日前（猶予外 → 通常どおり送る）
-        {"ts": (now - _td(days=10)).isoformat(), "event": "safety_signal_detected",
-         "selected_user": "はな", "details": {"category": "bullying"}},
+        {"ts": (now - _td(days=10)).isoformat(), "child": "はな",
+         "kind": "suspicious_offer", "op_hash": "bbbb"},
     ]
-    with open(tmp / "runtime_diagnostics.jsonl", "w", encoding="utf-8") as f:
+    with open(tmp / "money_safety_concern.jsonl", "w", encoding="utf-8") as f:
         for r in recs:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
@@ -640,7 +645,7 @@ async def test_safety_signal_blocks_proactive_nudge() -> None:
         client=None, allowance_reminder_conf={}, wallet_audit_conf={},
         load_all_users_fn=lambda: [], wallet_service=None, allow_channel_ids=set(),
     )
-    assert service._has_recent_safety_signal(tmp, "たろう", now) is True, "直近の危険信号がある子には送らない"
+    assert service._has_recent_safety_signal(tmp, "たろう", now) is True, "直近に困りごとを話した子には送らない"
     assert service._has_recent_safety_signal(tmp, "はな", now) is False, "猶予を過ぎたら通常どおり送る"
     assert service._has_recent_safety_signal(tmp, "みらい", now) is False, "検知の無い子は通常どおり送る"
 

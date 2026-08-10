@@ -373,7 +373,7 @@ def _test_bot_actions_are_deduped():
         dt.request_bot_action("low_balance_alert", {"name": "はな", "balance": 50})
 
         executed = []
-        orig_bc, orig_safety = H._broadcast_usage_guide, H._run_safety_setup_check
+        orig_bc = H._broadcast_usage_guide
 
         async def _fake_bc():
             executed.append("broadcast")
@@ -390,7 +390,7 @@ def _test_bot_actions_are_deduped():
         try:
             asyncio.new_event_loop().run_until_complete(H._drive_bot_actions())
         finally:
-            H._broadcast_usage_guide, H._run_safety_setup_check = orig_bc, orig_safety
+            H._broadcast_usage_guide = orig_bc
             C.send_low_balance_alert = orig_low
 
         _check("broadcast_runs_once", executed.count("broadcast") == 1, executed)

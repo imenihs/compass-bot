@@ -67,10 +67,10 @@ def _test_old_commands_exist_as_tools():
 
     # 旧コマンド名 → 置き換えた tool 名
     mapping = {
+        # 「安全設定チェック」は 2026/08/11 に機能ごと廃止した（通知経路が無くなったため）
         "全体確認": "parent_list_overview",
         "使い方の説明": "parent_get_usage_guide",
         "使い方の説明と初期設定": "parent_broadcast_usage_guide",
-        "安全設定チェック": "parent_safety_setup_check",
         "設定変更": "parent_get_settings_info",
         "フォロー方針": "parent_get_settings_info",
         "URL再発行": "reissue_dashboard_url",

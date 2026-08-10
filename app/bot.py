@@ -45,7 +45,6 @@ from app.config import (
     get_allowance_reminder_setting,
     get_chat_setting,
     get_child_income_report_setting,
-    get_safety_alert_setting,
     get_force_assess_test_keyword,
     get_log_dir,
     get_low_balance_alert_setting,
@@ -92,9 +91,6 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 PARENT_IDS = get_parent_ids()
 ALLOW_CHANNEL_IDS = get_allow_channel_ids()
 ALLOWANCE_REMINDER = get_allowance_reminder_setting()
-# 危険信号の通知先（N-11.16）。査定通知に相乗りさせず専用キーで持つ。
-# 未設定なら親チャンネル（allowance_reminder）へフォールバックし、安全通知を落とさない
-SAFETY_ALERT = get_safety_alert_setting()
 WALLET_AUDIT = get_wallet_audit_setting()
 CHAT_SETTING = get_chat_setting()
 ASSESS_KEYWORD = get_assess_keyword()
@@ -131,10 +127,6 @@ def _child_income_over_limit_message(amount: int, limit: int, user_name: str) ->
 # 貯金目標の補完入力で受け付ける上限。通常の子供向け目標として十分な範囲にする。
 MAX_GOAL_INPUT_AMOUNT = 10_000_000
 _thinking_sent_message_keys: set[tuple[str, int]] = set()
-# 走行中の安全判定タスクへの強参照。asyncio はタスクへの参照が無くなると
-# 実行途中でも GC 対象になりうる（CPython の既知の挙動）。安全通知が黙って消えるのは
-# 最も避けるべき失敗なので、完了までここで参照を保持する。
-_safety_tasks: set = set()
 
 
 wallet_service = WalletService()
@@ -148,223 +140,9 @@ def _safe_get_balance(name: str):
         return None
 
 
-def _load_safety_history(child_name: str, days: int = 30) -> list:
-    """診断ログから、その子の過去の危険信号検知を読み出す（長期シグナルの材料）。
-
-    検知の記録は既に runtime_diagnostics.jsonl へ出ているため、新たな蓄積先を作らず再利用する。
-    読み取り失敗で通知本体を止めない（材料が無ければ長期シグナル無しとして続行する）。
-
-    Args:
-        child_name: 対象児童。
-        days: さかのぼる日数。
-
-    Returns:
-        list: [{"ts_sec": float, "category": str, "urgency": str}, ...]
-    """
-    import time as _t
-    from datetime import datetime as _dt
-
-    out = []
-    try:
-        system_conf = load_system()
-        path = get_log_dir(system_conf) / "runtime_diagnostics.jsonl"
-        if not path.exists():
-            return out
-        cutoff = _t.time() - days * 86400
-        name = str(child_name or "")
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if "safety_signal_detected" not in line and "safety_alert_sent" not in line:
-                continue
-            try:
-                d = json.loads(line)
-            except Exception:
-                continue
-            if str(d.get("selected_user") or "") != name:
-                continue
-            det = d.get("details") or {}
-            cat = str(det.get("category") or "")
-            if not cat:
-                continue
-            try:
-                ts = _dt.fromisoformat(str(d.get("ts") or "")).timestamp()
-            except Exception:
-                continue
-            if ts < cutoff:
-                continue
-            out.append({"ts_sec": ts, "category": cat, "urgency": str(det.get("urgency") or "")})
-    except Exception:
-        # 材料が読めなくても通知は止めない
-        return out
-    return out
 
 
 
-async def _handle_safety_signal(system_conf, message, user_conf, input_block, judgment: dict) -> None:
-    """危険信号を検知したときの送信を担う（N-11.16）。
-
-    経路はカテゴリで分ける。
-      ・虐待の疑い → **親チャンネルへ送らない**。子へ直接、公的窓口を渡す。
-        加害者は同居の実親であることが多く、親へ流すと加害者への情報還流になるため。
-      ・それ以外   → 親チャンネルへ通知する（要約→背景→原文の構成）。
-
-    AI が高い確信で否定した誤検知（suppressed_by_ai）は送信せず診断だけ残す。
-    送信の失敗は silent drop しない。必ず診断へ残し、後から追えるようにする。
-
-    Args:
-        system_conf: システム設定。
-        message: 元の Discord メッセージ。
-        user_conf: 対象児童の設定。
-        input_block: 子の発話原文。
-        judgment: safety.merge_judgments の結果。
-    """
-    import time as _time
-
-    from app import safety
-
-    child_name = str(user_conf.get("name", ""))
-    category = str(judgment.get("category", ""))
-    # AI が高い確信で否定した誤検知は送らない。記録だけ残して後から検証できるようにする
-    if judgment.get("suppressed_by_ai"):
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_signal_suppressed",
-            {"category": category, "confidence": judgment.get("confidence"),
-             "ai_reason": str(judgment.get("ai_reason", ""))[:200]},
-        )
-        return
-
-    # 虐待の疑いは親へ送らず、子へ外部窓口を渡す（本モジュール最重要の分岐）
-    if not judgment.get("notify_parent"):
-        try:
-            if category == "abuse":
-                await message.channel.send(safety.build_child_hotline_message(judgment))
-        except Exception as e:
-            _log_runtime_event(
-                system_conf, message, user_conf, input_block,
-                "safety_child_hotline_send_failed", {"error": f"{type(e).__name__}: {e}"},
-            )
-        # 親へ送らない判断も必ず記録する。運用者が後から確認できる状態を保つ
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_signal_not_notified_to_parent",
-            {"category": category, "urgency": judgment.get("urgency"),
-             "perpetrator": judgment.get("perpetrator"),
-             "uncertain": judgment.get("uncertain"),
-             "ai_reason": str(judgment.get("ai_reason", ""))[:200]},
-        )
-        return
-
-    # ここから親チャンネルへの通知。宛先は安全専用設定（査定に相乗りさせない）
-    conf = SAFETY_ALERT or {}
-    if not conf.get("enabled", True):
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_alert_disabled", {"category": category},
-        )
-        return
-    channel_id = conf.get("channel_id") or (ALLOWANCE_REMINDER or {}).get("channel_id")
-    parent_channel = None
-    try:
-        if channel_id:
-            parent_channel = client.get_channel(int(channel_id))
-            if parent_channel is None:
-                parent_channel = await client.fetch_channel(int(channel_id))
-    except Exception as e:
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_alert_channel_error", {"error": f"{type(e).__name__}: {e}"},
-        )
-    if parent_channel is None:
-        # 送信先が無いことを絶対に握り潰さない。安全通知の silent drop は最も避けるべき失敗
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_alert_channel_unset",
-            {"category": category, "urgency": judgment.get("urgency")},
-        )
-        return
-
-    # この子への初回だけ、安全方針を予告する（事後に知られると裏切りになる）。
-    # 全会話で出すとうるさいので、危険信号を検知して通知する直前に一度だけ出す。
-    if safety.needs_safety_notice(child_name):
-        try:
-            await message.channel.send(safety.SAFETY_NOTICE)
-            safety.mark_safety_notice_done(child_name)
-        except Exception as e:
-            _log_runtime_event(
-                system_conf, message, user_conf, input_block,
-                "safety_notice_send_failed", {"error": f"{type(e).__name__}: {e}"},
-            )
-
-    # 長期の傾向を判定へ添える。1ターンだけでは「数週間かけて悪化している」が見えないため、
-    # 過去の検知履歴を集計して通知に載せる（親が緊急性を測る材料になる）。
-    try:
-        judgment["long_term"] = safety.summarize_long_term_signals(
-            _load_safety_history(child_name), _time.time(),
-        )
-    except Exception as e:
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_long_term_failed", {"error": f"{type(e).__name__}: {e}"},
-        )
-
-    # 子へ「伝えてもいいかな」と先に尋ねる（事後報告にしない）。
-    # ただし返事は待たない。沈黙・離脱でも通知は確定させる（怖くて逃げた子ほど通知されない逆相関の防止）。
-    # 短い猶予の間に返事があれば、その意向を通知へ添える。
-    try:
-        await message.channel.send(safety.build_consent_question(judgment))
-        safety.mark_consent_pending(child_name, category, _time.time())
-    except Exception as e:
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_consent_question_failed", {"error": f"{type(e).__name__}: {e}"},
-        )
-    # 猶予の間だけ待つ。この待ちで通知が止まることはない（待った後に必ず送る）
-    await asyncio.sleep(safety.CONSENT_WAIT_SEC)
-    child_consent = safety.take_consent(child_name)
-
-    # 同じ子・同じカテゴリの短時間の繰り返しは集約する（毎ターン送ると親が麻痺し狼少年化する）。
-    # 抑制ではなく集約なので、窓を越えた次の通知で「他に N 回ありました」と件数を伝える。
-    ok_to_send, repeated = safety.should_send_alert(child_name, category, _time.time())
-    if not ok_to_send:
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_alert_aggregated",
-            {"category": category, "suppressed_count": repeated},
-        )
-        return
-
-    # 子の同意はこの時点では取れていない（会話の中で確認するのは AI 側の役割）。
-    # 返事を待たずに送るのが原則であり、確認できていない旨を通知に明記する。
-    body = safety.build_parent_notification(
-        child_name, judgment, input_block, child_consent=child_consent,
-        repeated_count=repeated,
-    )
-    mention = " ".join(f"<@{pid}>" for pid in sorted(get_parent_ids())) or ""
-    try:
-        await parent_channel.send(f"{mention}\n{body}" if mention else body)
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_alert_sent",
-            {"category": category, "urgency": judgment.get("urgency"),
-             "confidence": judgment.get("confidence"),
-             "child_consent": child_consent},
-        )
-        # 伝えた後に子を放り出さない。伝えた事実を認め、ここで話し続けてよいと示す。
-        # 黙っていると後で発覚したとき裏切りになり、「言ったからね」と突き放すのも最悪である。
-        try:
-            care = safety.build_post_notification_care(judgment, child_consent)
-            care += safety.build_urgency_guidance(judgment)
-            await message.channel.send(care)
-        except Exception as e:
-            _log_runtime_event(
-                system_conf, message, user_conf, input_block,
-                "safety_care_send_failed", {"error": f"{type(e).__name__}: {e}"},
-            )
-    except Exception as e:
-        _log_runtime_event(
-            system_conf, message, user_conf, input_block,
-            "safety_alert_send_failed", {"error": f"{type(e).__name__}: {e}", "category": category},
-        )
 
 
 intents = discord.Intents.default()
@@ -944,50 +722,10 @@ async def _on_message_impl(message: discord.Message):
     # タスク自身が判定から通知までを完結させる。呼び出し側が await しなくても通知が出る形にする。
     # 上流で起動しても、手前の return（空入力・未登録・コマンド誤ヒット等）で await されなければ
     # 通知は出ない。安全は「どの経路を通っても必ず届く」ことが要件なので、自己完結型にする。
-    # 直前に「おうちの人に伝えていいかな」と尋ねていれば、この発話を返事として取り込む。
-    # 取り込みは通知の可否を変えない（拒否でも送る）。親への伝え方だけが変わる。
-    if user_conf is not None and input_block:
-        try:
-            import time as _t
-            from app import safety as _safety
-            _safety.record_consent_reply(str(user_conf.get("name", "")), input_block, _t.time())
-        except Exception:
-            # 同意の取り込み失敗で会話も安全判定も止めない
-            pass
-
-    safety_task = None
-    if user_conf is not None and input_block:
-        async def _judge_and_notify(_conf=user_conf, _text=input_block, _sys=system_conf):
-            try:
-                from app.conv.ai_conversation import judge_safety
-                judgment = await judge_safety(_conf, _text)
-            except Exception as e:
-                _log_runtime_event(
-                    _sys, message, _conf, _text,
-                    "safety_judge_failed", {"error": f"{type(e).__name__}: {e}"},
-                )
-                return None
-            if judgment:
-                try:
-                    await _handle_safety_signal(_sys, message, _conf, _text, judgment)
-                except Exception as e:
-                    # 通知の失敗は絶対に握り潰さない
-                    _log_runtime_event(
-                        _sys, message, _conf, _text,
-                        "safety_notify_failed", {"error": f"{type(e).__name__}: {e}"},
-                    )
-            return judgment
-
-        try:
-            safety_task = asyncio.create_task(_judge_and_notify())
-            # 完了まで強参照を保持する（await されない経路でも GC で消えないようにする）
-            _safety_tasks.add(safety_task)
-            safety_task.add_done_callback(_safety_tasks.discard)
-        except Exception as e:
-            _log_runtime_event(
-                system_conf, message, user_conf, input_block,
-                "safety_judge_spawn_failed", {"error": f"{type(e).__name__}: {e}"},
-            )
+    # 【2026/08/11】ここにあった安全判定の spawn と同意の取り込みは廃止した。
+    # Python の正規表現で日本語の危険度を判定する仕組みは、直球しか拾えず日常語に誤爆し、
+    # 語を足しても収束しないことが実測で分かったため（docs/設計_安全機能の再設計.md）。
+    # つらい話は会話 AI が受け止め、必要なら get_hotlines tool で公的窓口を渡す。
 
     if user_conf is None:
         await message.channel.send("設定にあなたのDiscord IDが登録されてないみたい。親に `settings/users/*.json` を追加してもらってね。")
@@ -1100,9 +838,6 @@ async def _on_message_impl(message: discord.Message):
     finally:
         # 通知はタスク側で完結済み。ここでは完了を待つだけにする
         # （待たずに関数を抜けるとタスクが宙に浮くため、会話経路では必ず回収する）
-        if safety_task is not None:
-            with contextlib.suppress(Exception):
-                await safety_task
         # **必ず finally で消化する**。会話が例外・タイムアウトで落ちても、
         # tool は先に完了して依頼を積んでいることがある。ここを try の外に置くと
         # 「頼んだのにDMが来ない」が再発する（今回直したのと同じ形の事故）

@@ -797,7 +797,7 @@ class ReminderService:
 
     def _has_recent_safety_signal(self, log_dir: Path, user_name: str,
                                   now: datetime, days: int = 3) -> bool:
-        """直近に危険信号（つらさ・いじめ・虐待の訴え等）が検知された子かを見る（N-11.16 連携）。
+        """直近に**お金の困りごと**を打ち明けた子かを見る（ナッジ抑止）。
 
         安全は【処理の優先順位】1) に属し、伴走ナッジより上位である。
         つらさを訴えた子へ、翌朝スケジューラが一方的に「チャレンジどう？」「記録してね」と
@@ -817,18 +817,25 @@ class ReminderService:
             bool: 直近に危険信号があれば True（ナッジを送らない）。
         """
         path = log_dir / "runtime_diagnostics.jsonl"
+        # 【2026/08/11】読み取り元を変えた。
+        # 旧: runtime_diagnostics.jsonl の safety_signal_detected を見ていたが、
+        #     ①書き手が `selected_user` を出しておらず**一度も一致しなかった**（既存バグ）
+        #     ②Python の危険信号判定そのものを廃止したのでイベントが二度と出ない
+        # 新: 金銭の困りごと tool（record_money_safety_concern）が書く
+        #     money_safety_concern.jsonl を見る。原文は持たず kind と対象児だけ。
         try:
-            if not path.exists():
+            concern_path = path.parent / "money_safety_concern.jsonl"
+            if not concern_path.exists():
                 return False
             cutoff = now.timestamp() - days * 86400
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if "safety_signal_detected" not in line and "safety_alert_sent" not in line:
+            for line in concern_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
                     continue
                 try:
                     d = json.loads(line)
                 except Exception:
                     continue
-                if str(d.get("selected_user") or "") != user_name:
+                if str(d.get("child") or "") != user_name:
                     continue
                 try:
                     ts = datetime.fromisoformat(str(d.get("ts") or "")).timestamp()
