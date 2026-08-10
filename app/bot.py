@@ -807,7 +807,8 @@ async def _on_message_impl(message: discord.Message):
             and not author_is_this_channel_child and looks_like_money_record):
         await message.channel.send(
             "そのまま書くと、お子さんの記録として登録されちゃうよ。\n"
-            "お金を動かすときは明示コマンドか `お子さんの名前の代理 〜` で話しかけてね。\n"
+            "お金を動かすときは、親チャンネルで話しかけてください。\n"
+            "このチャンネルで代わりに書くなら `お子さんの名前の代理 〜` を頭に付けてください。\n"
             "（お子さんとのふつうの会話は、そのまま話しかけて大丈夫だよ）"
         )
         _log_runtime_event(

@@ -313,11 +313,20 @@ def get_wallet_audit_setting() -> dict:
     if penalty_rate < 0:
         penalty_rate = 0.0
 
+    # 未報告の子へ何日おきに催促するか（2026/08/11 追加）。
+    # 月1回の案内だけだと、その日に見逃した子は翌月まで言われない。
+    # 0 以下なら催促しない（初回の案内だけ）。
+    remind_interval_days = _safe_int(audit.get("remind_interval_days"), 3)
+    if remind_interval_days is None or remind_interval_days < 0:
+        remind_interval_days = 3
+    remind_interval_days = min(15, remind_interval_days)
+
     return {
         "enabled": enabled,
         "channel_id": channel_id,
         "check_day": check_day,
         "check_time": check_time,
+        "remind_interval_days": remind_interval_days,
         "penalty_rate": penalty_rate,
     }
 

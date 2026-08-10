@@ -32,7 +32,8 @@
     "enabled": true,
     "check_day": 1,
     "check_time": "20:00",
-    "penalty_rate": 1.0
+    "penalty_rate": 1.0,
+    "remind_interval_days": 3
   },
   "child_income_report": {
     "max_amount": 5000

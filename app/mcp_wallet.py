@@ -1674,7 +1674,7 @@ def _dashboard_url_flow(args: dict, reissue: bool) -> str:
         match = lambda data: int(data.get("discord_user_id", 0) or 0) == target_id
         ok_msg = ("ダッシュボードのURLをDMで送りました。\n"
                   "全員の残高・設定・立て替えの登録ができます。\n"
-                  "（作り直したいときは「URL再発行」と送ってください）")
+                  "（人に見られたときは、作り直したいと伝えてください）")
         ng_msg = "あなたの登録が見つかりませんでした。設定ファイルを確認してください。"
     else:
         conf = _resolve_child(str(args.get("name", "")))
@@ -1685,7 +1685,7 @@ def _dashboard_url_flow(args: dict, reissue: bool) -> str:
         base_dir, role = _config.CHILDREN_DIR, _dt.ROLE_CHILD
         match = lambda data: str(data.get("name", "")).strip() == child_name
         ok_msg = ("ダッシュボードのURLをDMでおくったよ。ひらいてブックマークしてね。\n"
-                  "（あたらしくしたいときは「URL再発行」だよ）")
+                  "（人に見られちゃったときは、作りなおしたいって教えてね）")
         ng_msg = "ごめん、きみの登録が見つからなかったよ。おうちの人に聞いてみてね。"
 
     stem = None

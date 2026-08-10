@@ -361,20 +361,24 @@ class ReminderService:
         state["last_request_key"] = f"{month_key}_{cfg['check_time']}"
         self.wallet_service.save_audit_state(state)
 
+        # 【2026/08/11】案内文から**決まった形式**を消した。
+        # 「@compass-bot 残高報告 1234円」と教えていたが、その形式は全廃済みで、
+        # **その通りに打っても動かない**状態だった。
+        # 子は言われたとおりにして反応が無く、諦めていた可能性がある。
+        # いまは AI が意味を汲むので、金額さえ伝えてもらえればよい。
         def make_audit_message() -> str:
             return "\n".join([
-                f"毎月の残高チェックです（{month_key}）。",
-                "次の形式で残高を報告してね:",
-                "@compass-bot 残高報告 1234円",
-                # 実際には減額処理を行わないため、罰の予告ではなく記録確認の案内にする
-                "帳簿と差があったら、記録の抜けを一緒に確認しようね。",
+                f"おさいふチェックの日だよ（{month_key}）。",
+                "いま手もとにいくらあるか、数えて教えてくれる？",
+                "言い方は決まってないよ。「いま○○円あった」でも「数えたら○○円」でもいい。",
+                "帳簿とちがっていたら、記録のぬけを一緒にさがそうね。",
             ])
 
         def make_setup_message() -> str:
             return "\n".join([
-                f"毎月の残高チェックです（{month_key}）。",
-                "まだウォレットの初期設定が完了していないよ。",
-                "「初期設定」と送って始めよう！",
+                f"おさいふチェックの日だよ（{month_key}）。",
+                "まだ、さいしょの残高を教えてもらっていないんだ。",
+                "いま手もとにいくらあるか、数えて教えてくれる？",
             ])
 
         user_by_discord_id = {
@@ -412,22 +416,104 @@ class ReminderService:
                         {"channel_id": channel_id, "user_name": ""},
                     )
 
+    async def send_wallet_audit_nudge(self, remaining: list, month_key: str) -> None:
+        """まだ残高を報告していない子にだけ、やわらかく催促する。
+
+        **報告した子には送らない。**真面目に出した子が催促され続けるのは理不尽なため。
+        文面は初回の案内より短くし、責める言い方にしない
+        （忘れているだけで、悪いことをしているわけではない）。
+
+        Args:
+            remaining: 未報告の子の名前一覧。
+            month_key: 対象月（YYYY-MM）。
+        """
+        if not self.allow_channel_ids or not remaining:
+            return
+
+        users = [u for u in self.load_all_users()
+                 if str(u.get("name", "")) in set(remaining)]
+        if not users:
+            return
+        user_by_discord_id = {
+            int(u["discord_user_id"]): u for u in users if u.get("discord_user_id")
+        }
+
+        for channel_id in self.allow_channel_ids:
+            try:
+                channel = self.client.get_channel(channel_id)
+                if channel is None:
+                    channel = await self.client.fetch_channel(channel_id)
+            except Exception as e:  # noqa: BLE001 - 1チャンネル失敗で他を止めない
+                self._log_reminder_delivery_error(
+                    "wallet_audit_nudge", e, {"channel_id": channel_id, "user_name": ""})
+                continue
+
+            # そのチャンネルにいる未報告の子だけへ送る
+            channel_users = self._channel_users(channel, users, user_by_discord_id)
+            if not channel_users:
+                continue
+            try:
+                await channel.send("\n".join([
+                    "おさいふチェック、まだだったよね。",
+                    "いま手もとにいくらあるか、数えて教えてくれる？",
+                    "ぴったり合ってるか見るだけだから、ちがっててもだいじょうぶ。",
+                ]))
+            except Exception as e:  # noqa: BLE001
+                self._log_reminder_delivery_error(
+                    "wallet_audit_nudge", e,
+                    {"channel_id": channel_id,
+                     "user_name": ",".join(str(u.get("name", "")) for u in channel_users)})
+
     async def maybe_request_wallet_audit(self) -> None:
+        """毎月の残高チェックを案内する。**未報告の子には数日おきに催促する。**
+
+        【2026/08/11 変更】以前は check_day（既定1日）の1回きりだった。
+        子がその日の通知を見逃すと、次に言われるのは翌月。
+        大人でも忘れるものを、月1回の1発勝負で子に求めるのは無理がある。
+
+        いまは2段構え:
+          ・check_day に全員へ案内（従来どおり）
+          ・以降、**まだ報告していない子だけ**へ remind_interval_days おきに催促
+        報告した子には送らないので、真面目に出した子が催促され続けることはない。
+        """
         cfg = self.wallet_audit_conf
         if not cfg.get("enabled"):
             return
 
         now = datetime.now(JST)
-        if now.day != int(cfg["check_day"]) or not self._scheduled_time_reached(now, cfg["check_time"]):
+        if not self._scheduled_time_reached(now, cfg["check_time"]):
             return
 
         month_key = now.strftime("%Y-%m")
         state = self.wallet_service.load_audit_state()
-        request_key = f"{month_key}_{cfg['check_time']}"
-        if state.get("last_request_key") == request_key:
+
+        # ① 初回（check_day）は全員へ
+        if now.day == int(cfg["check_day"]):
+            request_key = f"{month_key}_{cfg['check_time']}"
+            if state.get("last_request_key") != request_key:
+                await self.send_wallet_audit()
+                return
+
+        # ② 以降は未報告の子だけへ催促する
+        interval = int(cfg.get("remind_interval_days", 3) or 0)
+        if interval <= 0:
+            return
+        # check_day から interval 日ごとの日にだけ動く（毎日は送らない）
+        days_since = now.day - int(cfg["check_day"])
+        if days_since <= 0 or days_since % interval != 0:
             return
 
-        await self.send_wallet_audit()
+        pending = state.get("pending_by_user", {})
+        remaining = [n for n, mk in pending.items() if str(mk) == month_key]
+        if not remaining:
+            return
+        # 同じ日に二度送らない
+        nudge_key = f"{month_key}_d{now.day}"
+        if state.get("last_audit_nudge_key") == nudge_key:
+            return
+        state["last_audit_nudge_key"] = nudge_key
+        self.wallet_service.save_audit_state(state)
+        await self.send_wallet_audit_nudge(remaining, month_key)
 
     def _load_jsonl(self, path: Path) -> list[dict]:
         if not path.exists():

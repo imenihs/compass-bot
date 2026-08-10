@@ -604,8 +604,14 @@ async def test_wallet_audit_uses_channel_name_when_member_cache_empty() -> None:
         await service.send_wallet_audit()
 
         assert len(channel.outputs) == 1
-        assert "残高チェック" in channel.outputs[0]
-        assert "初期設定" not in channel.outputs[0]
+        body = channel.outputs[0]
+        assert "おさいふチェック" in body, body
+        # 【2026/08/11】案内文から決まった形式を消した。
+        # 「@compass-bot 残高報告 1234円」「『初期設定』と送って」と教えていたが、
+        # どちらも全廃済みの形式で、その通りに打っても動かなかった。
+        assert "初期設定" not in body, body
+        assert "残高報告 " not in body, f"廃止済みの形式を教えている: {body}"
+        assert "と送っ" not in body, f"決まった言い方を強要している: {body}"
 
 
 
@@ -656,6 +662,88 @@ async def test_safety_signal_blocks_proactive_nudge() -> None:
     _shutil.rmtree(empty, ignore_errors=True)
 
 
+async def test_wallet_audit_nudges_only_unreported() -> None:
+    """残高チェックの催促が、**未報告の子にだけ数日おきに**飛ぶこと。
+
+    【2026/08/11 追加】以前は check_day（既定1日）の1回きりだった。
+    子がその日の通知を見逃すと、次に言われるのは翌月。
+    大人でも忘れるものを、月1回の1発勝負で子に求めるのは無理がある。
+
+    ただし報告した子には送らない。真面目に出した子が催促され続けるのは理不尽なため。
+    """
+    import json as _json
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    import app.reminder_service as rs
+    from app.reminder_service import ReminderService
+
+    _JST = _tz(_td(hours=9))
+    sent = []
+
+    class _Ch:
+        def __init__(self, i): self.id = i; self.name = "c"; self.members = []
+        async def send(self, m): sent.append(m)
+
+    class _Client:
+        def get_channel(self, i): return _Ch(i)
+        async def fetch_channel(self, i): return _Ch(i)
+
+    class _Wallet:
+        def __init__(self, pending):
+            self.state = {"pending_by_user": pending, "last_request_key": "2026-08_00:00"}
+        def load_audit_state(self): return _json.loads(_json.dumps(self.state))
+        def save_audit_state(self, st): self.state = st
+        def has_wallet(self, n): return True
+
+    def _build(pending, captured):
+        svc = ReminderService(
+            client=_Client(), allowance_reminder_conf={},
+            wallet_audit_conf={"enabled": True, "check_day": 1,
+                               "check_time": "00:00", "remind_interval_days": 3},
+            load_all_users_fn=lambda: [{"name": "たろう", "discord_user_id": 111},
+                                       {"name": "はな", "discord_user_id": 222}],
+            wallet_service=_Wallet(pending), allow_channel_ids={901})
+        def _cu(ch, users, by_id):
+            captured.extend([u["name"] for u in users]); return users
+        svc._channel_users = _cu
+        return svc
+
+    orig = rs.datetime
+    try:
+        # --- 3日おきの日にだけ動く ---
+        for day, should_send in [(2, False), (3, False), (4, True), (5, False), (7, True), (10, True)]:
+            rs.datetime = type("D", (), {
+                "now": staticmethod(lambda tz=None, _d=day: _dt(2026, 8, _d, 21, 0, tzinfo=_JST))})
+            sent.clear()
+            svc = _build({"たろう": "2026-08"}, [])
+            await svc.maybe_request_wallet_audit()
+            assert bool(sent) is should_send, f"{day}日: 送信={bool(sent)} 期待={should_send}"
+
+        rs.datetime = type("D", (), {
+            "now": staticmethod(lambda tz=None: _dt(2026, 8, 4, 21, 0, tzinfo=_JST))})
+
+        # --- 未報告の子だけが対象 ---
+        captured = []
+        sent.clear()
+        await _build({"たろう": "2026-08"}, captured).maybe_request_wallet_audit()
+        assert captured == ["たろう"], f"未報告の子だけのはず: {captured}"
+
+        # --- 全員報告済みなら送らない ---
+        captured = []
+        sent.clear()
+        await _build({}, captured).maybe_request_wallet_audit()
+        assert not sent, "報告済みなのに催促が飛んだ"
+
+        # --- 催促の文面が、決まった言い方を強要していないこと ---
+        sent.clear()
+        await _build({"たろう": "2026-08"}, []).maybe_request_wallet_audit()
+        body = sent[0] if sent else ""
+        assert "残高報告" not in body, f"廃止済みの形式を教えている: {body}"
+        assert "と送っ" not in body, f"決まった言い方を強要している: {body}"
+    finally:
+        rs.datetime = orig
+
+
 async def _run_all() -> int:
     tests = [
         test_no_recent_record_sends_gentle_nudge,
@@ -675,6 +763,7 @@ async def _run_all() -> int:
         test_proactive_send_failure_continues_to_next_user,
         test_wallet_audit_uses_channel_name_when_member_cache_empty,
         test_safety_signal_blocks_proactive_nudge,
+        test_wallet_audit_nudges_only_unreported,
     ]
     failures = []
     for test in tests:
