@@ -131,13 +131,13 @@
         <li>残高・支出・入金・目標・査定などお金を動かす処理は AI が直接計算せず、Bot 側で厳密に実行します（金額の誤りが残高に反映されない設計）。</li>
         <li>増額の相談には、AI が突き放さず一緒に計画を考え、正当な理由があれば査定額を「提案」します。実際の支給は親の承認で確定します（子どもが自分でお金を増やせない）。</li>
         <li>支給できる金額には上限があり、Bot 側で必ず守られます。</li>
-        <li>親は <code>名前の代理</code> で子どもに代わって投稿できます。</li>
+        <li>親は「たろうの代理」と添えて、子どもに代わって投稿できます。</li>
       </ul>
 
       <h3>お小遣い帳</h3>
       <ul>
         <li><code>使った物</code> / <code>理由</code> / <code>満足度（0〜10）</code> / <code>金額（任意）</code> を記録します。</li>
-        <li>ラベル形式でも簡易形式でも入力でき、<code>支出 500円 お菓子</code> のように残高を減らしつつ同時に記録することもできます。</li>
+        <li>「300円でおかし買った」のように話しかけるだけで、残高を減らしつつ記録します。決まった書き方は不要です。</li>
       </ul>
 
       <h3>ウォレット（残高管理）</h3>
@@ -248,212 +248,141 @@
     <!-- ============ 子ども向けコマンド ============ -->
     <section id="child-commands">
       <h2>💬 子ども向けの使い方</h2>
-      <p class="doc-intro">Discord で Bot に話しかけて使います。基本は自然な言葉で大丈夫です。下は決まった形で打ちたいときの一覧です。</p>
+      <p class="doc-intro"><strong>決まった言い方はありません。</strong>ふつうの日本語で話しかけてください。
+      以前は「残高おしえて」「貯金目標 ゲーム機 30000円」のように決まった形で打つ必要がありましたが、
+      <strong>2026/08/10 に廃止しました</strong>。言い方を覚える必要はありません。</p>
 
-      <h3>1. 査定（お小遣いの相談）</h3>
+      <h3>お金の記録</h3>
       <div class="cmd-block">
-        <div class="cmd-desc">買いたいものを理由と一緒に相談する。AI が計画を一緒に考え、正当な理由があれば金額を提案する（支給は親の承認で確定）。</div>
+        <div class="cmd-desc">使ったお金・もらったお金を伝えると記録します。金額と、何に使ったかが分かれば大丈夫です。</div>
+        <pre><code>300円でおかし買った
+きのう文房具に120円つかったよ
+お年玉で3000円もらった</code></pre>
+      </div>
+
+      <h3>残高を知りたいとき</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">いまいくら持っているかを答えます。</div>
+        <pre><code>いまいくらある？
+のこりいくら？</code></pre>
+      </div>
+
+      <h3>ためる目標をつくる・積む</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">ほしいものと金額を伝えると目標をつくります（最大5件）。
+        「ためた」と伝えると残高から目標へ積みます。おうちの人に立て替えてもらった分を返すときも同じです。</div>
+        <pre><code>ゲーム機がほしい、30000円
+今月は500円ためた
+立て替えてもらった分、1000円かえした</code></pre>
+        <p class="note">目標が2つ以上あるときは「どれに？」と聞き返します。勝手に選びません。</p>
+      </div>
+
+      <h3>買いたいものを相談する（査定）</h3>
+      <div class="cmd-block">
+        <div class="cmd-desc">理由や予算と一緒に相談すると、AI が計画を一緒に考えます。
+        金額の提案が出た場合、実際に渡されるのは<strong>おうちの人が承認したとき</strong>です。</div>
         <pre><code>@compass-bot 3Dプリンタ買いたい
 理由: 工作したい
 予算: 3万円</code></pre>
       </div>
 
-      <h3>2. 使い方の説明</h3>
+      <h3>ふりかえり・履歴</h3>
       <div class="cmd-block">
-        <pre><code>@compass-bot 使い方</code></pre>
+        <div class="cmd-desc">今月の使い方や、これまでの記録を振り返れます。</div>
+        <pre><code>今月どうだった？
+これまでの記録みせて</code></pre>
       </div>
 
-      <h3>3. 初期設定（ウォレット初期残高）</h3>
+      <h3>じぶんのダッシュボード</h3>
       <div class="cmd-block">
-        <div class="cmd-desc">いま持っているお金を最初に登録する。</div>
-        <pre><code>@compass-bot 初期設定
-@compass-bot 1200円</code></pre>
+        <div class="cmd-desc">カレンダー・目標の進みぐあい・シミュレータが見られるページです。
+        <strong>URL は DM で届きます</strong>。開いてブックマークすれば、次からはそれだけで入れます。</div>
+        <pre><code>ダッシュボードが見たい
+マイページのURL教えて</code></pre>
+        <p class="note">URL を人に見られたときは「URL を作り直して」と伝えてください。前の URL は使えなくなります。
+        見たいだけのときに作り直すと、他の端末で開いていた URL が使えなくなるので分けています。</p>
       </div>
 
-      <h3>4. 支出記録（お小遣い帳）</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">案内を起動する:</div>
-        <pre><code>@compass-bot 支出記録</code></pre>
-        <div class="cmd-desc">ラベル形式で記録する:</div>
-        <pre><code>@compass-bot 使った物: ノート
-理由: 英語 の テスト 対策
-満足度: 8
-金額: 300円</code></pre>
-        <div class="cmd-desc">簡易形式で記録する（金額は任意）:</div>
-        <pre><code>@compass-bot ノート / 英語のテスト対策で必要だった / 8
-@compass-bot ノート / 英語のテスト対策で必要だった / 8 / 300円</code></pre>
-      </div>
-
-      <h3>5. 現在残高確認</h3>
-      <div class="cmd-block">
-        <pre><code>@compass-bot 残高確認</code></pre>
-      </div>
-      <div class="doc-note">
-        親が子ども用チャンネルで <code>残高おしえて</code> と送った場合は、親本人ではなく<strong>そのチャンネルの子ども</strong>の残高を返します。親は <code>はなの残高おしえて</code> のように名前を明示して確認することもできます。
-      </div>
-
-      <h3>6. 残高報告</h3>
-      <div class="cmd-block">
-        <pre><code>@compass-bot 残高報告 1200円</code></pre>
-      </div>
-      <div class="doc-note warn">
-        残高報告・初期設定・財布チェック中の金額入力は、誤入力防止のため <strong><code>円</code> まで書いてください</strong>。Discord ID のような巨大な数字列や、現実的な上限を超える金額は反映せず再入力待ちにします。
-      </div>
-
-      <h3>7. 手動支出（残高から差し引く）</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">残高を減らして、お小遣い帳にも同時に記録する。</div>
-        <pre><code>@compass-bot 支出 500円 お菓子</code></pre>
-      </div>
-
-      <h3>8. 臨時収入（残高に加算）</h3>
-      <div class="cmd-block">
-        <pre><code>@compass-bot 入金 3000円 お年玉</code></pre>
-      </div>
-
-      <h3>9. 入出金台帳確認</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">直近10件の入出金履歴を表示する。</div>
-        <pre><code>@compass-bot 入出金履歴
-@compass-bot 台帳確認</code></pre>
-      </div>
-
-      <h3>10. 今月の振り返り</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">当月の支出件数・合計額・満足度平均・Top3品目・現在残高を表示する。</div>
-        <pre><code>@compass-bot 振り返り</code></pre>
-      </div>
-
-      <h3>11. 査定履歴確認</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">直近5件の査定金額（固定・臨時・合計）を一覧表示する。</div>
-        <pre><code>@compass-bot 査定履歴</code></pre>
-      </div>
-
-      <h3>12. 目標貯金（最大5件）</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">目標を設定する（同名タイトルなら金額を上書き更新）:</div>
-        <pre><code>貯金目標 ゲーム機 30000円
-貯金目標 旅行費 10000円</code></pre>
-        <div class="cmd-desc">進捗を確認する（全目標のプログレスバー表示）:</div>
-        <pre><code>目標確認</code></pre>
-        <div class="cmd-desc">特定の目標を削除する:</div>
-        <pre><code>目標削除 ゲーム機</code></pre>
-        <div class="cmd-desc">タイトル未指定で削除する（一覧を表示してタイトルを案内）:</div>
-        <pre><code>目標削除</code></pre>
-        <div class="cmd-desc">全目標を一括削除する:</div>
-        <pre><code>目標全削除</code></pre>
-      </div>
-      <div class="doc-note">
-        目標設定の補完入力でも金額は <code>円</code> 必須です。金額だけ先に入力した後に <code>残高おしえて</code> など別コマンドらしい文が来た場合は、目標名として保存せず再入力を促します。
-      </div>
+      <h3>うまく伝わらないとき</h3>
+      <p>言い方を変えて、もう一度伝えてください。金額や日付があいまいなときは、AI が聞き返します。</p>
     </section>
 
-    <!-- ============ 親向けコマンド ============ -->
+    <!-- ============ 親向けの使い方 ============ -->
     <section id="parent-commands">
       <h2>👪 親向けの使い方</h2>
-      <p class="doc-intro">親として登録された Discord ユーザーだけが使えるコマンドです。</p>
+      <p class="doc-intro"><strong>決まったコマンドはありません。</strong>親チャンネルでふつうに話しかけてください。
+      「設定変更 たろう 固定 800円」のような形式は <strong>2026/08/10 に廃止しました</strong>。</p>
 
-      <h3>13. 親による代理投稿</h3>
+      <h3>お金を渡す・直す</h3>
       <div class="cmd-block">
-        <div class="cmd-desc">子どもに代わって投稿する。</div>
-        <pre><code>@compass-bot たろうの代理 参考書を買いたい</code></pre>
-      </div>
-
-      <h3>14. 全体確認ダッシュボード</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">全ユーザーの残高・残高報告状況・最終支出日を一覧表示する。</div>
-        <pre><code>全体確認</code></pre>
+        <div class="cmd-desc">誰に・いくら をはっきり伝えてください。
+        <strong>あいまいなときは実行せず聞き返します</strong>（AI が金額や相手を推測することはありません）。</div>
+        <pre><code>たろうに500円あげて
+はなの残高を300円減らして（数え間違いの修正）</code></pre>
+        <p class="note">実行の前に確認文が出ます。対象や金額が違っていれば、そこで気づけます。</p>
       </div>
 
-      <h3>15. 支出傾向分析</h3>
+      <h3>子どもの査定を承認・却下する</h3>
       <div class="cmd-block">
-        <div class="cmd-desc">過去3ヶ月の月別件数・満足度平均・Top5品目を表示する。</div>
-        <pre><code>たろうの分析
-全員の分析</code></pre>
+        <div class="cmd-desc">子どもからの相談で提案が出ると、親チャンネルへ通知が届きます。</div>
+        <pre><code>承認待ちある？
+たろうのを承認して
+今回は見送りで</code></pre>
       </div>
 
-      <h3>16. 手動支給</h3>
+      <h3>全体の状況を見る</h3>
       <div class="cmd-block">
-        <pre><code>支給 たろう 700円</code></pre>
+        <div class="cmd-desc">全員の固定お小遣い・残高・残高報告の有無・最終支出日を一覧で出します。</div>
+        <pre><code>みんなの状況は？
+全体を見たい</code></pre>
       </div>
 
-      <h3>17. 残高調整（加算・減算）</h3>
+      <h3>設定を確認する（変更は Web から）</h3>
       <div class="cmd-block">
-        <pre><code>残高調整 たろう +500円
-残高調整 たろう -300円</code></pre>
+        <div class="cmd-desc">固定お小遣い・臨時上限・AI フォロー方針の<strong>現在値</strong>を答えます。</div>
+        <pre><code>たろうの設定は？
+みんなの設定を見たい</code></pre>
+        <p class="note"><strong>金額の変更はチャットでは受け付けていません。</strong>
+        固定お小遣いは毎月効き続ける設定で、桁を間違えても気づきにくいためです。
+        Web ダッシュボードには数値入力のフォームがあり、一覧で見比べられます。</p>
       </div>
 
-      <h3>18. 設定変更（固定お小遣い・臨時上限）</h3>
+      <h3>親のダッシュボード</h3>
       <div class="cmd-block">
-        <pre><code>設定変更 たろう 固定 800円
-設定変更 たろう 臨時 5000円</code></pre>
-      </div>
-      <div class="doc-note warn">
-        支給・残高調整・設定変更は、<strong>コマンド全体がこの形式のときだけ</strong>実行されます。<code>はなのお小遣い金額を変えたい</code> のような自然文や、<code>昨日 支給 はな 300円 ってやった?</code> のような文中に含まれる形では実行されません（誤操作で実残高が動くのを防ぐため）。この場合は明示コマンド形式を案内します。
+        <div class="cmd-desc">全員の残高・設定・立て替えの登録ができる管理画面です。<strong>URL は DM で届きます</strong>。</div>
+        <pre><code>ダッシュボードを見たい</code></pre>
+        <p class="note">親チャンネルは複数人で見るため、URL をチャンネルへは出しません。
+        自分専用の URL が相手に見えると、片方だけ無効にできる意味がなくなるためです。
+        人に見られたときは「URL を作り直して」と伝えてください。</p>
       </div>
 
-      <h3>19. 一括支給（全員の固定お小遣いを加算）</h3>
+      <h3>安全設定を確かめる</h3>
       <div class="cmd-block">
-        <pre><code>一括支給</code></pre>
+        <div class="cmd-desc">危険信号（いじめ・つらい気持ちの訴えなど）の通知先が
+        <strong>本当に大人だけに見えているか</strong>を、実際に確認メッセージを送って確かめます。
+        設定ミスは表示を見るだけでは分からないため、送ってみるのが確実です。</div>
+        <pre><code>安全設定を確認したい
+通知先が合ってるか見て</code></pre>
+        <p class="note">結果は親チャンネルへ報告します。<strong>運用開始前に必ず一度実行してください。</strong></p>
       </div>
 
-      <h3>20. 他ユーザーの台帳確認</h3>
+      <h3>使い方を子どもへ知らせる</h3>
       <div class="cmd-block">
-        <pre><code>@compass-bot たろうの台帳</code></pre>
+        <div class="cmd-desc">使い方の説明をこの場で出すか、全チャンネルへ一斉送信します。
+        一斉送信は<strong>子どものチャンネルにも届き、取り消せません</strong>。</div>
+        <pre><code>使い方を教えて          … この場に出します
+みんなに使い方を送って   … 全チャンネルへ配ります</code></pre>
       </div>
 
-      <h3>21. 全チャンネルへの一斉アナウンス</h3>
+      <h3>子どもの代わりに投稿する</h3>
       <div class="cmd-block">
-        <div class="cmd-desc"><code>allow_channel_ids</code> の全チャンネルに任意のメッセージを送信する。</div>
-        <pre><code>アナウンス 今月の支給日は5日です</code></pre>
+        <div class="cmd-desc">子どもが自分で書けないときに、親が代わりに相談を出せます。</div>
+        <pre><code>@compass-bot たろうの代理 3Dプリンタ買いたい</code></pre>
       </div>
 
-      <h3>22. 使い方の送信（単体チャンネル）</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">コマンドを送ったチャンネル1つだけに使い方を送信する。</div>
-        <pre><code>使い方の説明</code></pre>
-      </div>
-
-      <h3>23. 使い方の一斉通知（全チャンネル）</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc"><code>allow_channel_ids</code> の全チャンネルへ使い方と初期設定を通知する。</div>
-        <pre><code>使い方の説明と初期設定</code></pre>
-      </div>
-
-      <h3>24. 残高チェック案内の即時送信</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">各チャンネルに今月の残高チェック案内を即時送信する。</div>
-        <pre><code>@compass-bot 残高チェック送信
-@compass-bot 月頭案内送信</code></pre>
-      </div>
-
-      <h3>25. リマインダーテスト</h3>
-      <div class="cmd-block">
-        <pre><code>@compass-bot reminder test</code></pre>
-      </div>
-
-      <h3>26. ダッシュボードのURL</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc"><strong>今のURLを教えてもらう。</strong>何度聞いても同じURLが届く（作り直さない）。<br>
-        「ダッシュボード見たい」のような自然な言い方でも、AI が同じ案内をする。<br>
-        子は自分のチャンネルで、親は親チャンネルで送ること（どのチャンネルで打ったかで親用・子用が決まる）。親には DM で届く。</div>
-        <pre><code>ダッシュボード</code></pre>
-      </div>
-
-      <h3>27. ダッシュボードのURL再発行</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc"><strong>新しいURLを作りなおす。</strong>古いURLはその場で使えなくなる。URLを人に見られたときに使う。<br>
-        見たいだけのときに使うと、ほかの端末で開いていたURLが使えなくなるので注意。<br>
-        <strong>打った本人のURLだけ</strong>が再発行される。</div>
-        <pre><code>URL再発行</code></pre>
-      </div>
-
-      <h3>28. 安全設定チェック</h3>
-      <div class="cmd-block">
-        <div class="cmd-desc">危険信号の通知先が正しいか、実際にメッセージを送って確かめる。詳細は<a href="#safety">子の安全を守るしくみ</a>を参照。</div>
-        <pre><code>安全設定チェック</code></pre>
-      </div>
+      <h3>子どものチャンネルで話しかけたとき</h3>
+      <p>そのチャンネルの子どもとして扱われます。金額の設定を変えたい場合は、
+      子どもに見えてしまわないよう <strong>親チャンネルか Web</strong> へ案内します。</p>
     </section>
 
     <!-- ============ Webダッシュボード ============ -->
