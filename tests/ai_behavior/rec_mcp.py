@@ -22,6 +22,8 @@ from app import config
 config.SETTINGS_DIR = _ROOT / "settings"
 config.USERS_DIR = config.SETTINGS_DIR / "users"
 config.PARENTS_DIR = config.USERS_DIR / "parents"
+# 子は children/ 配下が実配置。ここを設定しないと発話者を解決できない
+config.CHILDREN_DIR = config.USERS_DIR / "children"
 config.SYSTEM_PATH = config.SETTINGS_DIR / "system.json"
 config.SETTING_PATH = config.SETTINGS_DIR / "setting.json"
 

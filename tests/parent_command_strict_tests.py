@@ -251,6 +251,54 @@ def _test_tools_say_what_to_do_when_unsure():
            "聞き返し方の具体例がプロンプトに無い")
 
 
+def _test_no_phrase_matching_anywhere():
+    """**コード全体**に「決まった言い方で判断する」箇所が無いこと。
+
+    今日1日で同じ構造の問題が3回出た（2026/08/10-11）:
+      ① Python の maybe_handle_*（文字列の完全一致）→ 全廃
+      ② tool の description の発話例（「『財布に3000円あった』のように」）→ 判断基準へ
+      ③ プロンプトの判断条件（「『◯円つかった』と言ったら」）→ 判断基準へ
+
+    どれも「利用者が決まった言い方をする」前提で、言い方が増えるたびに壊れる。
+    Python でも AI でも同じなので、**両方まとめて**検査する。
+
+    ただし次は問題ではないので除外する:
+      ・応答の書き方の見本（「『パソコンほしいんだね』のように共感する」）
+      ・禁止の具体例（「『お世話になった家族へお礼』のように美化するな」）
+      ・境界の定義（「『取られた』は支出ではない」）
+    判断の条件になっているものだけを見る。
+    """
+    import re
+
+    from app import mcp_wallet as m
+
+    # ① Python 側: 発話を文字列一致で振り分けるハンドラが復活していないこと
+    for path in ("app/handlers_parent.py", "app/handlers_child.py", "app/bot.py"):
+        src = (Path(__file__).resolve().parents[1] / path).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        handlers = [n.name for n in ast.walk(tree)
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and n.name.startswith("maybe_handle_")]
+        _check(f"no_string_handler::{Path(path).name}", not handlers, handlers)
+
+    # ② tool の description: 「〜と言ったら呼ぶ」形が無いこと
+    phrase_call = re.compile(r"[」』]の?ように(聞かれ|言われ)|[」』]と言ったら")
+    for d in m._tool_defs():
+        _check(f"tool_desc_no_phrase::{d.get('name','')}",
+               not phrase_call.search(d.get("description", "")), d.get("description", "")[:70])
+
+    # ③ プロンプト: tool を呼ぶ条件が発話例になっていないこと
+    prompt = (Path(__file__).resolve().parents[1] / "app/conv/ai_conversation.py").read_text(encoding="utf-8")
+    bad_lines = []
+    for i, line in enumerate(prompt.split("\n"), 1):
+        if not re.search(r"[「『][^」』]{2,25}[」』]\s*(のように|と言ったら)", line):
+            continue
+        # tool を呼ぶ条件になっている行だけ拾う（応答の見本・禁止例は除く）
+        if re.search(r"(を呼ぶ|呼ぶこと|tool を呼)", line):
+            bad_lines.append(f"L{i}: {line.strip()[:60]}")
+    _check("prompt_no_phrase_condition", not bad_lines, bad_lines[:3])
+
+
 def main():
     """全テストを走らせて結果を出す。"""
     _test_no_string_match_handlers()
@@ -260,6 +308,7 @@ def main():
     _test_settings_info_reads_real_keys()
     _test_tool_descriptions_use_criteria_not_phrases()
     _test_tools_say_what_to_do_when_unsure()
+    _test_no_phrase_matching_anywhere()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
