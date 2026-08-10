@@ -190,6 +190,31 @@ def _test_settings_info_reads_real_keys():
             config.CHILDREN_DIR, m.PARENT_MODE = orig_children, orig_mode
 
 
+def _test_tool_descriptions_use_criteria_not_phrases():
+    """tool の description が「決まった言い方」で判断させていないこと。
+
+    実際に事故が起きた（2026/08/11）。財布チェックの description が
+    「『財布に3000円あった』『数えたら1200円だった』のように」と例を並べていたため、
+    子が「今のお金56563」と書いても AI が tool を呼ばず、
+    残高報告が永久に未報告のままだった。
+
+    Python の文字列一致を全廃したのに、**プロンプト側で同じことをやっていた**。
+    語彙を足しても収束しないのは Python でも AI でも同じなので、
+    description には「判断の基準」を書き、当てはめは AI にさせる。
+    """
+    import re
+
+    from app import mcp_wallet as m
+
+    # 「〜と言ったら呼ぶ」「〜のように聞かれたら呼ぶ」は発話例への依存
+    phrase_driven = re.compile(r"[」』]の?ように(聞かれ|言われ)|[」』]と言ったら")
+    for d in m._tool_defs():
+        name = d.get("name", "")
+        desc = d.get("description", "")
+        _check(f"criteria_not_phrases::{name}",
+               not phrase_driven.search(desc), desc[:80])
+
+
 def main():
     """全テストを走らせて結果を出す。"""
     _test_no_string_match_handlers()
@@ -197,6 +222,7 @@ def main():
     _test_old_commands_exist_as_tools()
     _test_quoted_command_cannot_move_balance()
     _test_settings_info_reads_real_keys()
+    _test_tool_descriptions_use_criteria_not_phrases()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:
