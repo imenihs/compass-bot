@@ -420,6 +420,64 @@ def _test_show_url_does_not_reissue():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_parent_gets_own_dashboard_url():
+    """**親**が「ダッシュボード見たい」と言ったとき、親のURLが返ること。
+
+    当初 tool を子経路にしか渡しておらず、実装も子専用だったため、
+    親が聞くと AI が「ダッシュボードURLは子ども1人ずつなんだ。誰のを出す？」
+    「親用のまとめページはこの道具にはないよ」と答えてしまっていた（実機で発覚）。
+    親にも自分のダッシュボードがあるのに、案内できていなかった。
+    """
+    import os
+
+    from app import dashboard_token as dt, mcp_wallet as m
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dt.TOKENS_PATH = tmp / "tokens.json"
+        orig_mode = m.PARENT_MODE
+        orig_env = os.environ.get("COMPASS_PARENT_DISCORD_ID")
+        try:
+            # 実データの親（兼務IDでもある）で試す
+            m.PARENT_MODE = True
+            os.environ["COMPASS_PARENT_DISCORD_ID"] = "111"
+            parent_msg = m._do_get_dashboard_url({})
+            _check("parent_gets_url", "/compass-bot/d/" in parent_msg, parent_msg[:80])
+            _check("parent_msg_is_for_parent",
+                   "全員の残高" in parent_msg, parent_msg[:60])
+            _check("parent_does_not_ask_which_child",
+                   "誰の" not in parent_msg, parent_msg[:60])
+
+            token = parent_msg.split("/d/")[1].split(">")[0]
+            resolved = dt.resolve(token)
+            _check("parent_token_is_parent_role",
+                   resolved and resolved["role"] == dt.ROLE_PARENT, resolved)
+
+            # 同じ Discord ID の子として聞くと、**子の**URLが返る（兼務の解決）
+            m.PARENT_MODE = False
+            orig_resolve = m._resolve_child
+            m._resolve_child = lambda n=None: {"name": "テスト"}
+            try:
+                child_msg = m._do_get_dashboard_url({"name": "テスト"})
+                child_token = child_msg.split("/d/")[1].split(">")[0]
+                child_resolved = dt.resolve(child_token)
+                _check("child_token_is_child_role",
+                       child_resolved and child_resolved["role"] == dt.ROLE_CHILD,
+                       child_resolved)
+                _check("dual_role_gets_different_urls", token != child_token,
+                       (token[:8], child_token[:8]))
+            finally:
+                m._resolve_child = orig_resolve
+        finally:
+            m.PARENT_MODE = orig_mode
+            if orig_env is None:
+                os.environ.pop("COMPASS_PARENT_DISCORD_ID", None)
+            else:
+                os.environ["COMPASS_PARENT_DISCORD_ID"] = orig_env
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _test_dashboard_url_tool_does_not_reissue():
     """AI 経由（tool）でURLを聞いても再発行されないこと。"""
     from app import dashboard_token as dt, mcp_wallet as m
@@ -464,6 +522,7 @@ def main():
     _test_money_ops_notify_discord()
     _test_show_url_does_not_reissue()
     _test_dashboard_url_tool_does_not_reissue()
+    _test_parent_gets_own_dashboard_url()
 
     passed = sum(1 for x in _results if x["passed"])
     for x in _results:

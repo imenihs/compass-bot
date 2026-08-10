@@ -313,9 +313,12 @@ def _tool_defs() -> list[dict]:
         {
             "name": "get_dashboard_url",
             "description": (
-                "自分のダッシュボード（カレンダー・目標のグラフ・シミュレータが見られるページ）の"
-                "URLを教える。子が『ダッシュボード見たい』『じぶんのページある？』"
-                "『グラフ見たい』のように聞いたら呼ぶ。"
+                "**自分の**ダッシュボードのURLを教える。"
+                "親が聞いたら親のまとめページ（全員の残高・設定・立て替えの登録）、"
+                "子が聞いたらその子のページ（カレンダー・目標のグラフ・シミュレータ）を返す。"
+                "『ダッシュボード見たい』『URL教えて』『じぶんのページある？』"
+                "『グラフ見たい』のように聞かれたら呼ぶ。"
+                "**誰のを出すか聞き返す必要はない**（呼んだ本人のものが返る）。"
                 "**再発行はしない**（見たいだけなのに作り直すと、ほかの端末で開いていた"
                 "URLが使えなくなる）。作り直したいときは『URL再発行』と打つよう案内すること。"
             ),
@@ -890,55 +893,71 @@ def _do_contribute_to_goal(args: dict) -> str:
 def _do_get_dashboard_url(args: dict) -> str:
     """自分のダッシュボードURLを教える。**再発行はしない**。
 
-    子が「ダッシュボード見たい」「じぶんのページある？」のように
-    自然な言い方で聞いたときに使う。固定コマンドを覚えなくても案内できるようにする。
-
-    **見たいだけなのに再発行してはいけない**。
-    他の端末で開いていた古いURLが無効になり、子が困る。
-    作り直したいときだけ「URL再発行」と打ってもらう。
+    親モードなら親のまとめページ、子モードならその子のページを返す。
+    どちらも「見たい」だけなので作り直さない
+    （他の端末で開いていた古いURLが無効になり困る）。
 
     Args:
-        args: name（子の名前）。
+        args: name（子モードのときの子の名前。親モードでは無視される）。
 
     Returns:
         str: URL を含む案内文。
     """
-    conf = _resolve_child(str(args.get("name", "")))
-    if conf is None:
-        return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
-    name = str(conf.get("name", ""))
-
     from app import config as _config
     from app import dashboard_token as _dt
 
-    # user_key は設定ファイル名。名前から引き直す
-    stem = None
-    for path in sorted(_config.CHILDREN_DIR.glob("*.json")):
-        if path.name.endswith(".example.json"):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                if str(json.load(f).get("name", "")).strip() == name:
-                    stem = path.stem
-                    break
-        except (OSError, json.JSONDecodeError):
-            continue
-    if stem is None:
-        return "ごめん、きみの登録が見つからなかったよ。おうちの人に聞いてみてね。"
+    if PARENT_MODE:
+        # 親のまとめページ。**どの親か**は環境変数の Discord ID から引く
+        parent_id = int(os.environ.get("COMPASS_PARENT_DISCORD_ID", "0") or 0)
+        if parent_id <= 0:
+            return "ダッシュボードのURLは、親チャンネルで「ダッシュボード」と送ると届くよ。"
+        stem = None
+        for path in sorted(_config.PARENTS_DIR.glob("*.json")):
+            if path.name.endswith(".example.json"):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    if int(json.load(f).get("discord_user_id", 0) or 0) == parent_id:
+                        stem = path.stem
+                        break
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+        if stem is None:
+            return "あなたの登録が見つかりませんでした。設定ファイルを確認してください。"
+        role, user_key = _dt.ROLE_PARENT, _dt.build_user_key(_dt.ROLE_PARENT, stem)
+        head = "あなたのダッシュボードだよ。全員の残高・設定・立て替えの登録ができる。"
+    else:
+        conf = _resolve_child(str(args.get("name", "")))
+        if conf is None:
+            return f"「{args.get('name')}」は登録された子どもに見つからなかったよ。"
+        name = str(conf.get("name", ""))
+        stem = None
+        for path in sorted(_config.CHILDREN_DIR.glob("*.json")):
+            if path.name.endswith(".example.json"):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    if str(json.load(f).get("name", "")).strip() == name:
+                        stem = path.stem
+                        break
+            except (OSError, json.JSONDecodeError):
+                continue
+        if stem is None:
+            return "ごめん、きみの登録が見つからなかったよ。おうちの人に聞いてみてね。"
+        role, user_key = _dt.ROLE_CHILD, _dt.build_user_key(_dt.ROLE_CHILD, stem)
+        head = "きみのダッシュボードだよ。ひらいてブックマークしてね。"
 
-    user_key = _dt.build_user_key(_dt.ROLE_CHILD, stem)
     token = _dt.find_active_token(user_key)
     if token is None:
         # まだ発行されていないときだけ作る（見るたびに作り直さない）
-        token = _dt.issue(user_key, _dt.ROLE_CHILD, issued_by="chat")
+        token = _dt.issue(user_key, role, issued_by="chat")
     base_url = _config.get_web_base_url().rstrip("/")
     # 山括弧で囲んで Discord のリンクプレビューを抑止する（UUIDがDiscord側ログに残るのを防ぐ）
     return (
-        f"きみのダッシュボードだよ。ひらいてブックマークしてね。\n"
+        f"{head}\n"
         f"<{base_url}/compass-bot/d/{token}>\n"
         "（このURLは自分専用だよ。ほかの人に見せないでね）"
     )
-
 
 def _do_get_savings_goals(args: dict) -> str:
     """貯金目標一覧。残高を変えない。"""

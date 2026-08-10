@@ -117,6 +117,8 @@ ALLOWED_PARENT_TOOLS = [
     "mcp__wallet__parent_reject_assessment",
     "mcp__wallet__parent_list_balances",
     "mcp__wallet__parent_get_pending",
+    # 自分のダッシュボードURLを教える（再発行はしない）
+    "mcp__wallet__get_dashboard_url",
     # 約束の承認・履行記録（N-11.18）。確定は親だけができる
     "mcp__wallet__parent_list_promises",
     "mcp__wallet__parent_approve_promise",
