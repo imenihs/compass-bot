@@ -2590,13 +2590,16 @@ def _do_parent_list_overview(args: dict) -> str:
     if not PARENT_MODE:
         return "この操作は親だけができるよ。"
     from datetime import datetime
-    from app import wallet_service as _ws
     from app.config import load_all_users, load_system, get_log_dir
 
     log_dir = get_log_dir(load_system())
     users = sorted(load_all_users(), key=lambda x: str(x.get("name", "")))
-    # 残高報告が未完了の子は pending_by_user に名前が入る
-    pending = _ws.load_audit_state().get("pending_by_user", {})
+    # 残高報告が未完了の子は pending_by_user に名前が入る。
+    # **モジュールではなくインスタンス（_wallet）を使う。**
+    # `from app import wallet_service as _ws` と書いてモジュールのまま
+    # load_audit_state を呼んでおり、親が「全体を見たい」と言うと必ず落ちていた
+    # （2026/08/11 発覚。他の tool と同じく _wallet を使えばよい）
+    pending = _wallet.load_audit_state().get("pending_by_user", {})
 
     lines = ["【全体の状況】"]
     for u in users:
@@ -2604,7 +2607,7 @@ def _do_parent_list_overview(args: dict) -> str:
         if not name:
             continue
         fixed = int(u.get("fixed_allowance", 0) or 0)
-        balance = _ws.get_balance(name)
+        balance = _wallet.get_balance(name)
         report = "未報告" if name in pending else "報告済"
         # 支出ログの最終行から最終支出日を取る（無ければ「なし」）
         last = "なし"

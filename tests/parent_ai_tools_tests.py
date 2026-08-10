@@ -42,6 +42,46 @@ def _setup(tmp: Path):
     config.SETTING_PATH = config.SETTINGS_DIR / "setting.json"
 
 
+def _test_all_parent_tools_execute():
+    """親用 tool が**実際に実行できる**こと（実行時エラーの検出）。
+
+    `parent_list_overview` が `from app import wallet_service as _ws` と書いて
+    **モジュールのまま** `_ws.load_audit_state()` を呼んでおり、
+    親が「全体を見たい」と言うと必ず AttributeError で落ちていた（2026/08/11 発覚）。
+
+    tool の登録有無を見るテストはあったが、**呼んでみるテストが無かった**ため
+    素通りしていた。登録されているかではなく、動くかを見る。
+    """
+    import app.mcp_wallet as m
+
+    orig = (m.PARENT_MODE, m.ALLOW_ADMIN_OPS)
+    m.PARENT_MODE = True
+    m.ALLOW_ADMIN_OPS = True
+    try:
+        # 引数なしで安全に呼べる参照系だけを対象にする（残高を動かすものは除く）
+        readonly = [
+            ("parent_list_overview", {}),
+            ("parent_list_balances", {}),
+            ("parent_get_pending", {}),
+            ("parent_get_usage_guide", {}),
+            ("parent_get_settings_info", {}),
+            ("parent_list_promises", {}),
+        ]
+        for name, args in readonly:
+            fn = m._HANDLERS.get(name)
+            if fn is None:
+                _check(f"parent_tool_runs::{name}", False, "未登録")
+                continue
+            try:
+                result = fn(args)
+                _check(f"parent_tool_runs::{name}", isinstance(result, str) and bool(result),
+                       str(result)[:60])
+            except Exception as exc:  # noqa: BLE001 - 実行時エラーを検出するのが目的
+                _check(f"parent_tool_runs::{name}", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        m.PARENT_MODE, m.ALLOW_ADMIN_OPS = orig
+
+
 def _run():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -116,6 +156,7 @@ def _run():
         names = [d["name"] for d in mcp._tool_defs()]
         _check("parent_tools_hidden_in_child_mode", not any(n.startswith("parent_") for n in names), str(names))
 
+    _test_all_parent_tools_execute()
     passed = sum(1 for x in _results if x["passed"])
     for x in _results: print(json.dumps(x, ensure_ascii=False))
     print(json.dumps({"summary": True, "passed": passed, "total": len(_results)}, ensure_ascii=False))
